@@ -4,3 +4,4 @@
 .direnv/
 *.log
 .DS_Store
+.claude/worktrees/
