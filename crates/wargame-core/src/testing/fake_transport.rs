@@ -25,11 +25,19 @@ pub enum TransportCall {
     },
 }
 
+/// A per-argv responder: given the exact argv passed to `exec`, returns the
+/// `ExecResult` to answer with. Consulted before the blanket
+/// `exec_status`/`fail_on` behavior so tests can script specific commands
+/// (e.g. a verify command's stderr) while leaving everything else on the
+/// simple defaults.
+pub type ExecResponder = dyn Fn(&[String]) -> ExecResult + Send + Sync;
+
 pub struct FakeTransport {
     pub ready: Mutex<bool>,
     calls: Mutex<Vec<TransportCall>>,
     fail_on: Mutex<Option<&'static str>>,
     exec_status: Mutex<i32>,
+    exec_responder: Mutex<Option<Box<ExecResponder>>>,
 }
 
 impl FakeTransport {
@@ -39,6 +47,7 @@ impl FakeTransport {
             calls: Mutex::new(Vec::new()),
             fail_on: Mutex::new(None),
             exec_status: Mutex::new(0),
+            exec_responder: Mutex::new(None),
         }
     }
 
@@ -57,6 +66,16 @@ impl FakeTransport {
 
     pub fn set_exec_status(&self, status: i32) {
         *self.exec_status.lock().unwrap() = status;
+    }
+
+    /// Installs a per-argv responder for `exec`, so different commands (e.g.
+    /// a specific provisioning script vs. a specific verify command) can be
+    /// made to return different statuses/stdout/stderr in one test.
+    pub fn set_exec_responder<F>(&self, responder: F)
+    where
+        F: Fn(&[String]) -> ExecResult + Send + Sync + 'static,
+    {
+        *self.exec_responder.lock().unwrap() = Some(Box::new(responder));
     }
 
     fn should_fail(&self, step: &str) -> bool {
@@ -92,6 +111,9 @@ impl GuestTransport for FakeTransport {
             return Err(WargameError::GuestBootstrapFailed(
                 "fake exec failure".to_string(),
             ));
+        }
+        if let Some(responder) = self.exec_responder.lock().unwrap().as_ref() {
+            return Ok(responder(argv));
         }
         Ok(ExecResult {
             status: *self.exec_status.lock().unwrap(),

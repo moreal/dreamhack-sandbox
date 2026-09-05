@@ -82,6 +82,13 @@ impl WargameError {
             WargameError::ProfileNotFound(_) => Some("Run: wargame profiles".to_string()),
             WargameError::SessionNotFound(_) => Some("Run: wargame sessions".to_string()),
             WargameError::Incompatible(_) => Some("Run: wargame profiles".to_string()),
+            WargameError::InvalidProfile { name, .. } => Some(format!(
+                "Check the provisioning log: $WARGAME_HOME/logs/provision-{name}.log"
+            )),
+            WargameError::GuestBootstrapFailed(_) => Some(
+                "Check the provisioning log: $WARGAME_HOME/logs/provision-<profile>.log"
+                    .to_string(),
+            ),
             _ => None,
         }
     }

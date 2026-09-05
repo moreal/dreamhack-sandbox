@@ -9,7 +9,9 @@
 //! and verification commands over that now-keyed SSH connection before
 //! stopping the VM and handing back its image name.
 
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -161,6 +163,9 @@ impl ProfileImageBuilder {
         progress("waiting for SSH to accept the new key".to_string());
         transport.wait_ready(ip, self.tart.boot_timeout()).await?;
 
+        let log_path = provision_log_path(opts, profile);
+        progress(format!("provisioning log: {}", log_path.display()));
+
         progress("copying provisioning scripts into the guest".to_string());
         // `~` is never expanded in `GuestTransport::exec` argv (every
         // argument is single-quoted before being sent to the guest shell),
@@ -188,13 +193,21 @@ impl ProfileImageBuilder {
         for script in &profile.provision.scripts {
             progress(format!("provisioning: {script}"));
             let remote_path = format!("wg-provision/{script}");
-            let out = transport
-                .exec(ip, &["bash".to_string(), remote_path])
-                .await?;
+            let argv = vec!["bash".to_string(), remote_path];
+            let command_desc = argv.join(" ");
+            let out = transport.exec(ip, &argv).await?;
+            log_exec(
+                &log_path,
+                &command_desc,
+                out.status,
+                &out.stdout,
+                &out.stderr,
+            );
             if out.status != 0 {
                 return Err(WargameError::GuestBootstrapFailed(format!(
                     "provisioning script {script} failed (exit {}): {}",
-                    out.status, out.stderr
+                    out.status,
+                    tail_lines(&combined_output(&out.stdout, &out.stderr), 15)
                 )));
             }
         }
@@ -205,11 +218,23 @@ impl ProfileImageBuilder {
             if argv.is_empty() {
                 continue;
             }
+            let command_desc = argv.join(" ");
             let out = transport.exec(ip, &argv).await?;
+            log_exec(
+                &log_path,
+                &command_desc,
+                out.status,
+                &out.stdout,
+                &out.stderr,
+            );
             if out.status != 0 {
                 return Err(WargameError::InvalidProfile {
                     name: profile.name.clone(),
-                    reason: format!("verify command {check:?} failed (exit {})", out.status),
+                    reason: format!(
+                        "verify command {check:?} failed (exit {}): {}",
+                        out.status,
+                        tail_lines(&combined_output(&out.stdout, &out.stderr), 15)
+                    ),
                 });
             }
         }
@@ -285,10 +310,91 @@ impl ProfileImageBuilder {
     }
 }
 
+/// Where provisioning output for `profile` is logged: `opts.log_path`'s
+/// directory (typically `$WARGAME_HOME/logs`), with the file name replaced
+/// by `provision-<profile name>.log` so it doesn't clobber
+/// `profile-build.log` (the Tart `start` console log) and survives across
+/// builds of different profiles.
+fn provision_log_path(opts: &BuildOptions, profile: &Profile) -> PathBuf {
+    let dir = opts
+        .log_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    dir.join(format!("provision-{}.log", profile.name))
+}
+
+/// Combines stdout and stderr into one blob for the "last N lines" shown in
+/// an error message -- interleaving isn't preserved (we only get each
+/// stream as a whole from `ExecResult`), but seeing both is more useful to a
+/// user debugging a failure than seeing neither.
+fn combined_output(stdout: &str, stderr: &str) -> String {
+    let mut combined = String::new();
+    combined.push_str(stdout);
+    if !stdout.is_empty() && !stderr.is_empty() && !stdout.ends_with('\n') {
+        combined.push('\n');
+    }
+    combined.push_str(stderr);
+    combined
+}
+
+/// The last `n` lines of `text` (fewer if it has fewer), for embedding a
+/// bounded amount of guest output directly in an error message.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// Appends one command's output to the provisioning log as a
+/// `==== <command> (exit N) ====` header followed by its stdout and stderr.
+/// Never fails the build: a log write failure is only `tracing::warn`.
+fn log_exec(log_path: &Path, command: &str, status: i32, stdout: &str, stderr: &str) {
+    let mut body = format!("==== {command} (exit {status}) ====\n");
+    if !stdout.is_empty() {
+        body.push_str(stdout);
+        if !stdout.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    if !stderr.is_empty() {
+        body.push_str(stderr);
+        if !stderr.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+
+    if let Some(parent) = log_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                "failed to create provisioning log directory {}: {err}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    let opened = OpenOptions::new().create(true).append(true).open(log_path);
+    match opened {
+        Ok(mut file) => {
+            if let Err(err) = file.write_all(body.as_bytes()) {
+                tracing::warn!(
+                    "failed to write provisioning log {}: {err}",
+                    log_path.display()
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                "failed to open provisioning log {}: {err}",
+                log_path.display()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     use wargame_core::domain::{
         GuestArch, GuestOs, GuestSpec, ImageSpec, ProvisionSpec, Resources, ToolsSpec,
@@ -367,6 +473,14 @@ mod tests {
             scripts_dir: PathBuf::from("/repo/profiles"),
             pubkey: "ssh-ed25519 AAAA... wargame-vm".to_string(),
             log_path: PathBuf::from("/tmp/build.log"),
+        }
+    }
+
+    fn opts_with_log_dir(log_dir: &Path) -> BuildOptions {
+        BuildOptions {
+            scripts_dir: PathBuf::from("/repo/profiles"),
+            pubkey: "ssh-ed25519 AAAA... wargame-vm".to_string(),
+            log_path: log_dir.join("profile-build.log"),
         }
     }
 
@@ -551,5 +665,86 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, WargameError::InvalidProfile { .. }));
         assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn happy_path_logs_every_provisioning_command_to_the_provision_log() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_responder(install_happy_responder);
+        let transport = Arc::new(FakeTransport::new());
+        let b = builder(runner, transport);
+        let profile = sample_profile();
+        let log_dir = tempfile::tempdir().unwrap();
+        let opts = opts_with_log_dir(log_dir.path());
+
+        b.build_profile(&profile, &opts, &mut |_| {}).await.unwrap();
+
+        let log_path = provision_log_path(&opts, &profile);
+        let log = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|e| panic!("expected a provisioning log at {log_path:?}: {e}"));
+
+        assert!(
+            log.contains("==== bash wg-provision/scripts/macos/common.sh (exit 0) ===="),
+            "log missing common.sh header: {log}"
+        );
+        assert!(
+            log.contains("==== bash wg-provision/scripts/macos/reversing.sh (exit 0) ===="),
+            "log missing reversing.sh header: {log}"
+        );
+        assert!(
+            log.contains("==== python3 --version (exit 0) ===="),
+            "log missing python3 verify header: {log}"
+        );
+        assert!(
+            log.contains("==== uv --version (exit 0) ===="),
+            "log missing uv verify header: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_verify_error_includes_the_guest_stderr() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_responder(install_happy_responder);
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_exec_responder(|argv| {
+            if argv == ["uv".to_string(), "--version".to_string()] {
+                wargame_core::ports::ExecResult {
+                    status: 127,
+                    stdout: String::new(),
+                    stderr: "zsh:1: command not found: uv".to_string(),
+                }
+            } else {
+                wargame_core::ports::ExecResult {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }
+            }
+        });
+        let log_dir = tempfile::tempdir().unwrap();
+        let b = builder(runner, transport);
+        let profile = sample_profile();
+        let opts = opts_with_log_dir(log_dir.path());
+
+        let err = b
+            .build_profile(&profile, &opts, &mut |_| {})
+            .await
+            .unwrap_err();
+
+        let WargameError::InvalidProfile { reason, .. } = err else {
+            panic!("expected InvalidProfile, got {err:?}");
+        };
+        assert!(
+            reason.contains("zsh:1: command not found: uv"),
+            "error reason should surface the guest's stderr: {reason}"
+        );
+
+        let log_path = provision_log_path(&opts, &profile);
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log.contains("==== uv --version (exit 127) ===="),
+            "log missing failing verify header: {log}"
+        );
+        assert!(log.contains("zsh:1: command not found: uv"));
     }
 }
