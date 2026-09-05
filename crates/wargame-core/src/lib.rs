@@ -2,6 +2,7 @@
 //!
 //! Module layout follows DESIGN.md §3. Modules are added task by task (see PLAN.md).
 
+pub mod app;
 pub mod config;
 pub mod domain;
 pub mod error;
