@@ -1,0 +1,30 @@
+# Next steps (handoff for a fresh session)
+
+State on 2026-09-05: the MVP is complete on branch `feat/mvp` and verified on real Tart VMs.
+Read, in order: `docs/verification.md` (what works, what was not tested live), `DESIGN.md`
+(architecture and verified external facts), `PLAN.md` (task map), `README.md` (user guide).
+
+## Quick re-verification
+
+```bash
+nix flake check                                   # fmt, clippy, build + unit tests
+nix develop -c scripts/e2e-smoke.sh macos-minimal-arm64   # real VM, needs the built profile image
+```
+
+## Open items, in suggested order
+
+1. **Merge** `feat/mvp` into `main` (25 commits; `main` only has docs + scaffold).
+2. **Real Dreamhack run**: `wargame auth login`, then `wargame launch dreamhack:<id> --profile macos-minimal-arm64 --network nat`.
+   The authenticated download response shape is unverified; if it differs, the adapter reports
+   `ProviderChanged` and the fix belongs in `crates/wargame-dreamhack/src/download.rs`.
+3. **Reversing image**: `wargame profile build macos-re-arm64` (Ghidra, LLVM; slow, uses NAT).
+4. **Isolated networking**: add the Softnet sudoers rule printed by `wargame doctor`, then confirm
+   `wargame launch … --network isolated` boots and SSH still works over the host-only bridge.
+5. **`wargame gui`**: try it once by hand; it re-runs the VM with a Tart window and has only unit tests.
+
+## Host facts that matter
+
+- Passwordless sudo is not configured, so isolated mode is refused in preflight until step 4.
+- The profile image `wargame-profile-macos-minimal-arm64` and the guest SSH key live under
+  `~/Library/Application Support/wargame-vm`; a fresh `WARGAME_HOME` will not have that key.
+- The user's own VM `kindle-vm` is unrelated to this project; never stop or delete it.
