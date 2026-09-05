@@ -11,6 +11,8 @@
 
 **Spec:** `DESIGN.md` (implements `MVP.md`). Executors read both.
 
+**Status (2026-09-05):** all nine tasks executed by `.claude/workflows/mvp-build.js` and merged on `feat/mvp`; real-VM verification and the fixes it forced are recorded in `docs/verification.md`.
+
 ## Global Constraints
 
 - Host: macOS on Apple Silicon (`aarch64-darwin`); tests (non-e2e) must also pass on `x86_64-linux` via `cargo test` so `nix flake check` is portable. Anything macOS-only (Keychain, Tart) is behind a trait with a fake used in tests.
