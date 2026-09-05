@@ -1,0 +1,66 @@
+{
+  "count": 1829,
+  "page_size": 2,
+  "next": "http://dreamhack.io/api/v1/wargame/challenges/?ordering=-id&page=2&page_size=2",
+  "previous": null,
+  "results": [
+    {
+      "id": 3141,
+      "author": {
+        "id": 0,
+        "nickname": "author",
+        "is_staff": false
+      },
+      "title": "Lost Signature",
+      "tags": [
+        "misc",
+        "crypto",
+        "web3"
+      ],
+      "tier": 0,
+      "tier_display": "Unrated",
+      "is_standard": false,
+      "tier_status": 0,
+      "needs_vm": true,
+      "is_beginner": false,
+      "is_public": true,
+      "deployed": "v0.1.7",
+      "repository": "lost-signature-ii",
+      "created_at": "2026-09-04T17:11:14.375161+09:00",
+      "public_at": "2026-09-04T17:36:48.827606+09:00",
+      "is_completed": false,
+      "is_attempted": false,
+      "cnt_solvers": 0,
+      "is_bounty_ongoing": false,
+      "hitcount": 41
+    },
+    {
+      "id": 3139,
+      "author": {
+        "id": 0,
+        "nickname": "author",
+        "is_staff": true
+      },
+      "title": "Matryoshka",
+      "tags": [
+        "misc"
+      ],
+      "tier": 1,
+      "tier_display": "Sprout",
+      "is_standard": false,
+      "tier_status": 0,
+      "needs_vm": false,
+      "is_beginner": false,
+      "is_public": true,
+      "deployed": "v0.2",
+      "repository": "sprout-matryoshka",
+      "created_at": "2026-09-04T17:02:58.906467+09:00",
+      "public_at": "2026-09-04T17:08:29.355671+09:00",
+      "is_completed": false,
+      "is_attempted": false,
+      "cnt_solvers": 10,
+      "is_bounty_ongoing": false,
+      "hitcount": 27
+    }
+  ]
+}

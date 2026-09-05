@@ -1,0 +1,4 @@
+# Informational only: the Nix devShell/package provide the toolchain (nixpkgs rustc 1.97).
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy"]

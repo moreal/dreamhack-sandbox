@@ -1,0 +1,35 @@
+[package]
+name = "wargame-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wargame: CLI/TUI for disposable wargame VMs"
+default-run = "wargame"
+
+[[bin]]
+name = "wargame"
+path = "src/main.rs"
+
+[dependencies]
+wargame-core.workspace = true
+wargame-dreamhack.workspace = true
+wargame-tart.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+secrecy.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+rpassword.workspace = true
+comfy-table.workspace = true
+time.workspace = true
+url.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
