@@ -60,6 +60,19 @@ pub fn build_context(
             std::fs::write(&dest, content)?;
         }
     }
+    // Unlike the YAMLs, the built-in scripts are overwritten every run: they
+    // are part of the tool, not user configuration, and a stale copy would
+    // silently build images with an older provisioning recipe. Users add
+    // their own scripts under other names.
+    for (rel, content) in profiles_builtin::builtin_provision_scripts() {
+        let dest = dirs.profiles_dir().join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::read_to_string(&dest).ok().as_deref() != Some(content) {
+            std::fs::write(&dest, content)?;
+        }
+    }
 
     let config_path = config_override.unwrap_or_else(|| dirs.config_file());
     let config = Config::load(Some(&config_path))?;
@@ -216,24 +229,15 @@ pub async fn build_profile_image_builder(
     let builder = ProfileImageBuilder::new(ctx.runner.clone(), tart, transport_factory);
 
     let opts = BuildOptions {
-        scripts_dir: default_scripts_dir(&ctx.dirs),
+        // `$WARGAME_HOME/profiles`, which `build_context` has just seeded
+        // with the embedded `scripts/` tree; never a path from the build
+        // machine (a `nix build` binary's `CARGO_MANIFEST_DIR` is a sandbox
+        // path that does not exist at runtime).
+        scripts_dir: ctx.dirs.profiles_dir(),
         pubkey,
         log_path: ctx.dirs.logs_dir().join("profile-build.log"),
     };
     Ok((builder, opts))
-}
-
-/// `$WARGAME_HOME/profiles` if it already has a `scripts/` subtree (a user
-/// dropped one in, or a previous build seeded it); otherwise the checked-out
-/// repo's `profiles/` directory, which is what a `cargo run`/`cargo test`
-/// dev environment actually has on disk.
-fn default_scripts_dir(dirs: &AppDirs) -> PathBuf {
-    let home_profiles = dirs.profiles_dir();
-    if home_profiles.join("scripts").is_dir() {
-        home_profiles
-    } else {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../profiles"))
-    }
 }
 
 #[cfg(test)]
@@ -279,6 +283,26 @@ mod tests {
         let _ctx = build_context(false, None, Some(home.clone())).unwrap();
         assert!(home.join("profiles/macos-minimal-arm64.yaml").is_file());
         assert!(home.join("profiles/macos-re-arm64.yaml").is_file());
+        std::env::remove_var("WARGAME_PROVIDER");
+        std::env::remove_var("WARGAME_VM");
+    }
+
+    #[test]
+    fn build_context_seeds_and_refreshes_builtin_scripts_in_home() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WARGAME_PROVIDER", "fixture");
+        std::env::set_var("WARGAME_VM", "fake");
+        let home = tmp_home();
+        let script = home.join("profiles/scripts/macos/reversing.sh");
+        let _ctx = build_context(false, None, Some(home.clone())).unwrap();
+        assert!(home.join("profiles/scripts/macos/common.sh").is_file());
+        assert!(script.is_file());
+        // A stale copy (e.g. from an older binary) is replaced, not kept.
+        std::fs::write(&script, "#!/usr/bin/env bash\necho stale\n").unwrap();
+        let _ctx = build_context(false, None, Some(home.clone())).unwrap();
+        assert!(!std::fs::read_to_string(&script)
+            .unwrap()
+            .contains("echo stale"));
         std::env::remove_var("WARGAME_PROVIDER");
         std::env::remove_var("WARGAME_VM");
     }
