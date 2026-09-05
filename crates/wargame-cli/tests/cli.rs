@@ -52,11 +52,15 @@ fn help_lists_every_command() {
 }
 
 #[test]
-fn no_subcommand_reports_tui_not_built_and_exits_2() {
+fn no_subcommand_without_a_tty_declines_the_tui_and_exits_2() {
+    // `Command::output()` pipes stdin/stdout, so this exercises Task 8's
+    // TUI graceful-decline path rather than actually driving ratatui/
+    // crossterm (that needs a real pty; see PLAN.md Task 8's note and
+    // `crates/wargame-cli/src/tui/app.rs`'s reducer tests for the rest).
     let home = tempfile::tempdir().unwrap();
     let out = fixture_fake_cmd(home.path()).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(stdout_of(&out).contains("TUI not built yet"));
+    assert!(stdout_of(&out).contains("interactive terminal"));
 }
 
 #[test]

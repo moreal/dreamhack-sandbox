@@ -4,6 +4,7 @@ mod cli;
 mod fixture_provider;
 mod output;
 mod profiles_builtin;
+mod tui;
 mod wiring;
 
 use std::io::{IsTerminal, Write};
@@ -35,19 +36,24 @@ async fn run(cli: Cli) -> i32 {
         command,
     } = cli;
 
-    let Some(command) = command else {
-        // Task 8 builds the TUI; until then this is the documented
-        // placeholder (PLAN.md Task 7's note).
-        println!("TUI not built yet");
-        return 2;
-    };
-
     let ctx = match wiring::build_context(verbose, config, home) {
         Ok(ctx) => ctx,
         Err(e) => {
             print_error(&e);
             return 1;
         }
+    };
+
+    let Some(command) = command else {
+        // No subcommand -> the TUI (PLAN.md Task 8), over the same
+        // AppContext and application services every subcommand below uses.
+        return match tui::run(ctx).await {
+            Ok(code) => code,
+            Err(e) => {
+                print_error(&e);
+                1
+            }
+        };
     };
 
     match dispatch(&ctx, command).await {
