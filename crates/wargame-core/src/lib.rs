@@ -5,6 +5,9 @@
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod infra;
 pub mod ports;
+pub mod security;
+pub mod testing;
 
 pub use error::{Result, WargameError};
