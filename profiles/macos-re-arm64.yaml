@@ -1,0 +1,34 @@
+apiVersion: wargame.vm/v1
+kind: Profile
+
+metadata:
+  name: macos-re-arm64
+  description: "macOS reversing: Ghidra, LLVM, Python/uv"
+
+guest:
+  os: macos
+  arch: arm64
+  user: admin
+  password: admin # only used while building the profile image (DESIGN.md §5)
+
+image:
+  base: ghcr.io/cirruslabs/macos-sequoia-vanilla:latest
+
+resources:
+  cpu: 4
+  memory_gib: 8
+  disk_gib: 60
+
+provision:
+  scripts:
+    - scripts/macos/common.sh
+    - scripts/macos/reversing.sh
+
+tools:
+  verify:
+    - python3 --version
+    - uv --version
+    - test -x /opt/homebrew/bin/ghidraRun
+
+workspace:
+  root: /Users/admin/wargame

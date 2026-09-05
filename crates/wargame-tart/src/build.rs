@@ -1,0 +1,451 @@
+//! `ProfileImageBuilder`: turns a declarative [`Profile`] into a reusable
+//! local Tart image (DESIGN.md §5/§6, MVP.md §13-14, PLAN.md Task 6).
+//!
+//! The pipeline: make sure the base image is local, clear out any previous
+//! build of the same profile image, clone + size a fresh VM, boot it
+//! headless on NAT, install the host's SSH public key over a one-time
+//! password login (`sshpass`, secret only ever in the `SSHPASS` env var --
+//! never argv, never logged), then run the profile's provisioning scripts
+//! and verification commands over that now-keyed SSH connection before
+//! stopping the VM and handing back its image name.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use wargame_core::domain::{NetworkMode, Profile, VmRef};
+use wargame_core::error::{Result, WargameError};
+use wargame_core::infra::process::{Cmd, ProcessRunner};
+use wargame_core::ports::{GuestTransport, ImageRef, StartOptions, VmProvider, VmSpec};
+
+use crate::TartProvider;
+
+/// How often the password-based SSH probe (installing the host's public key)
+/// is retried while the guest's `sshd` finishes coming up.
+const KEY_INSTALL_RETRY: Duration = Duration::from_secs(5);
+/// Total time budget for that probe before giving up.
+const KEY_INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Builds a [`GuestTransport`] for a given guest username, deferred until
+/// after the host's SSH key has actually been installed (see
+/// [`ProfileImageBuilder::build_profile`]).
+pub type TransportFactory = Box<dyn Fn(&str) -> Arc<dyn GuestTransport> + Send + Sync>;
+
+/// Inputs to [`ProfileImageBuilder::build_profile`] that aren't already part
+/// of the [`Profile`] itself.
+pub struct BuildOptions {
+    /// Directory containing the `scripts/` subtree that a profile's
+    /// `provision.scripts` paths are relative to -- the repo's `profiles/`
+    /// directory, or `$WARGAME_HOME/profiles` for a user override.
+    pub scripts_dir: PathBuf,
+    /// The host's ed25519 public key (contents of `id_ed25519.pub`),
+    /// installed into the guest's `authorized_keys` so future sessions can
+    /// SSH in without ever needing the build-time password again.
+    pub pubkey: String,
+    pub log_path: PathBuf,
+}
+
+pub struct ProfileImageBuilder {
+    runner: Arc<dyn ProcessRunner>,
+    tart: Arc<TartProvider>,
+    transport_factory: TransportFactory,
+}
+
+impl ProfileImageBuilder {
+    pub fn new(
+        runner: Arc<dyn ProcessRunner>,
+        tart: Arc<TartProvider>,
+        transport_factory: TransportFactory,
+    ) -> Self {
+        ProfileImageBuilder {
+            runner,
+            tart,
+            transport_factory,
+        }
+    }
+
+    pub async fn build_profile(
+        &self,
+        profile: &Profile,
+        opts: &BuildOptions,
+        progress: &mut dyn FnMut(String),
+    ) -> Result<ImageRef> {
+        let base = ImageRef(profile.image.base.clone());
+        let target_name = profile.image_name();
+        let target_ref = ImageRef(target_name.clone());
+
+        progress(format!("checking for base image {}", base.0));
+        if !self.tart.image_exists(&base).await? {
+            progress(format!("pulling base image {}", base.0));
+            self.tart.pull_image(&base).await?;
+        }
+
+        if self.tart.image_exists(&target_ref).await? {
+            progress(format!("removing previous build of {target_name}"));
+            self.tart
+                .delete(&VmRef {
+                    backend: "tart".to_string(),
+                    name: target_name.clone(),
+                })
+                .await?;
+        }
+
+        progress(format!("cloning {} -> {target_name}", base.0));
+        let vm = self
+            .tart
+            .create(&VmSpec {
+                name: target_name.clone(),
+                image: base,
+                resources: profile.resources,
+            })
+            .await?;
+
+        progress("starting the VM headless on NAT".to_string());
+        self.tart
+            .start(
+                &vm,
+                &StartOptions {
+                    network: NetworkMode::Nat,
+                    headless: true,
+                    log_path: opts.log_path.clone(),
+                },
+            )
+            .await?;
+
+        progress("waiting for a DHCP lease".to_string());
+        let ip = self.tart.wait_ip(&vm, self.tart.boot_timeout()).await?;
+
+        progress("installing the host's SSH key (password login)".to_string());
+        self.install_pubkey(profile, ip.to_string(), &opts.pubkey)
+            .await?;
+
+        let transport = (self.transport_factory)(&profile.guest.user);
+
+        progress("waiting for SSH to accept the new key".to_string());
+        transport.wait_ready(ip, self.tart.boot_timeout()).await?;
+
+        progress("copying provisioning scripts into the guest".to_string());
+        transport
+            .copy_in(ip, &opts.scripts_dir.join("scripts"), "~/wg-provision")
+            .await?;
+
+        for script in &profile.provision.scripts {
+            progress(format!("provisioning: {script}"));
+            let remote_path = format!("~/wg-provision/{script}");
+            let out = transport
+                .exec(ip, &["bash".to_string(), remote_path])
+                .await?;
+            if out.status != 0 {
+                return Err(WargameError::GuestBootstrapFailed(format!(
+                    "provisioning script {script} failed (exit {}): {}",
+                    out.status, out.stderr
+                )));
+            }
+        }
+
+        for check in &profile.tools.verify {
+            progress(format!("verifying: {check}"));
+            let argv: Vec<String> = check.split_whitespace().map(str::to_string).collect();
+            if argv.is_empty() {
+                continue;
+            }
+            let out = transport.exec(ip, &argv).await?;
+            if out.status != 0 {
+                return Err(WargameError::InvalidProfile {
+                    name: profile.name.clone(),
+                    reason: format!("verify command {check:?} failed (exit {})", out.status),
+                });
+            }
+        }
+
+        progress("cleaning up provisioning files".to_string());
+        transport
+            .exec(
+                ip,
+                &[
+                    "rm".to_string(),
+                    "-rf".to_string(),
+                    "~/wg-provision".to_string(),
+                ],
+            )
+            .await?;
+
+        progress("stopping the VM".to_string());
+        self.tart.stop(&vm).await?;
+
+        Ok(ImageRef(target_name))
+    }
+
+    /// Installs `pubkey` into the guest's `authorized_keys` over a
+    /// password-authenticated SSH connection (`sshpass`), retrying while the
+    /// guest's `sshd` finishes starting. `SSHPASS` carries the secret only
+    /// through the environment -- it is never part of argv, so it never
+    /// appears in a process listing or in anything that logs a `Cmd`'s argv.
+    async fn install_pubkey(&self, profile: &Profile, ip: String, pubkey: &str) -> Result<()> {
+        let password =
+            profile
+                .guest
+                .password
+                .clone()
+                .ok_or_else(|| WargameError::InvalidProfile {
+                    name: profile.name.clone(),
+                    reason: "guest.password is required to build a profile image".to_string(),
+                })?;
+
+        let remote_command = format!(
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && printf '%s\\n' '{pubkey}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+        );
+        let cmd = Cmd {
+            program: "sshpass".to_string(),
+            args: vec![
+                "-e".to_string(),
+                "ssh".to_string(),
+                "-o".to_string(),
+                "StrictHostKeyChecking=no".to_string(),
+                "-o".to_string(),
+                "UserKnownHostsFile=/dev/null".to_string(),
+                format!("{}@{ip}", profile.guest.user),
+                remote_command,
+            ],
+            env: vec![("SSHPASS".to_string(), password)],
+            stdin: None,
+            cwd: None,
+        };
+
+        let deadline = Instant::now() + KEY_INSTALL_TIMEOUT;
+        loop {
+            let out = self.runner.run(&cmd).await?;
+            if out.status == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(WargameError::GuestBootstrapFailed(format!(
+                    "could not install the SSH key within {KEY_INSTALL_TIMEOUT:?}: {}",
+                    out.stderr
+                )));
+            }
+            tokio::time::sleep(KEY_INSTALL_RETRY).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    use wargame_core::domain::{
+        GuestArch, GuestOs, GuestSpec, ImageSpec, ProvisionSpec, Resources, ToolsSpec,
+        WorkspaceSpec,
+    };
+    use wargame_core::infra::process::Output;
+    use wargame_core::testing::{FakeRunner, FakeTransport, TransportCall};
+
+    use crate::TartConfig;
+
+    fn sample_profile() -> Profile {
+        Profile {
+            name: "macos-minimal-arm64".to_string(),
+            description: String::new(),
+            guest: GuestSpec {
+                os: GuestOs::Macos,
+                arch: GuestArch::Arm64,
+                user: "admin".to_string(),
+                password: Some("s3cr3t".to_string()),
+            },
+            image: ImageSpec {
+                base: "ghcr.io/cirruslabs/macos-sequoia-vanilla:latest".to_string(),
+            },
+            resources: Resources {
+                cpu: 4,
+                memory_mib: 8192,
+                disk_gib: 50,
+            },
+            provision: ProvisionSpec {
+                scripts: vec![
+                    "scripts/macos/common.sh".to_string(),
+                    "scripts/macos/reversing.sh".to_string(),
+                ],
+            },
+            tools: ToolsSpec {
+                verify: vec!["python3 --version".to_string(), "uv --version".to_string()],
+            },
+            workspace: WorkspaceSpec {
+                root: "/Users/admin/wargame".to_string(),
+            },
+        }
+    }
+
+    /// A `FakeRunner` responder that answers `tart list` with `"[]"` (so no
+    /// image ever appears to already exist) and any other `tart`/`sshpass`
+    /// invocation with a plain success.
+    fn install_happy_responder(cmd: &Cmd) -> Result<Output> {
+        if cmd.program == "tart" && cmd.args.first().map(String::as_str) == Some("list") {
+            return Ok(Output {
+                status: 0,
+                stdout: "[]".to_string(),
+                stderr: String::new(),
+            });
+        }
+        if cmd.program == "tart" && cmd.args.first().map(String::as_str) == Some("ip") {
+            return Ok(Output {
+                status: 0,
+                stdout: "10.0.0.7\n".to_string(),
+                stderr: String::new(),
+            });
+        }
+        Ok(Output::default())
+    }
+
+    fn builder(runner: Arc<FakeRunner>, transport: Arc<FakeTransport>) -> ProfileImageBuilder {
+        let tart = Arc::new(TartProvider::new(runner.clone(), TartConfig::default()));
+        ProfileImageBuilder::new(
+            runner,
+            tart,
+            Box::new(move |_user: &str| transport.clone() as Arc<dyn GuestTransport>),
+        )
+    }
+
+    fn opts() -> BuildOptions {
+        BuildOptions {
+            scripts_dir: PathBuf::from("/repo/profiles"),
+            pubkey: "ssh-ed25519 AAAA... wargame-vm".to_string(),
+            log_path: PathBuf::from("/tmp/build.log"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn happy_path_runs_steps_in_order_and_keeps_the_password_out_of_argv() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_responder(install_happy_responder);
+        let transport = Arc::new(FakeTransport::new());
+        let b = builder(runner.clone(), transport.clone());
+        let profile = sample_profile();
+        let mut messages = Vec::new();
+
+        let image = b
+            .build_profile(&profile, &opts(), &mut |m| messages.push(m))
+            .await
+            .unwrap();
+        assert_eq!(image.0, "wargame-profile-macos-minimal-arm64");
+        assert!(!messages.is_empty());
+
+        let calls = runner.calls();
+        let idx = |program: &str, first_arg: Option<&str>| -> usize {
+            calls
+                .iter()
+                .position(|c| {
+                    c.program == program && c.args.first().map(String::as_str) == first_arg
+                })
+                .unwrap_or_else(|| panic!("no {program} {first_arg:?} call recorded: {calls:?}"))
+        };
+
+        let clone_idx = idx("tart", Some("clone"));
+        let set_idx = idx("tart", Some("set"));
+        let run_idx = idx("tart", Some("run"));
+        let ip_idx = idx("tart", Some("ip"));
+        let sshpass_idx = calls
+            .iter()
+            .position(|c| c.program == "sshpass")
+            .expect("sshpass call recorded");
+        let stop_idx = idx("tart", Some("stop"));
+
+        assert!(clone_idx < set_idx, "clone must precede set");
+        assert!(set_idx < run_idx, "set must precede run");
+        assert!(run_idx < ip_idx, "run must precede ip");
+        assert!(ip_idx < sshpass_idx, "ip must precede the sshpass install");
+        assert!(sshpass_idx < stop_idx, "install must precede stop");
+        assert_eq!(stop_idx, calls.len() - 1, "stop must be the last call");
+
+        let sshpass_cmd = &calls[sshpass_idx];
+        assert_eq!(sshpass_cmd.args[0], "-e");
+        assert_eq!(sshpass_cmd.args[1], "ssh");
+        assert_eq!(
+            sshpass_cmd.env,
+            vec![("SSHPASS".to_string(), "s3cr3t".to_string())]
+        );
+        for arg in &sshpass_cmd.args {
+            assert!(
+                !arg.contains("s3cr3t"),
+                "password leaked into sshpass argv: {arg}"
+            );
+        }
+        for call in &calls {
+            for arg in &call.args {
+                assert!(!arg.contains("s3cr3t"), "password leaked into argv: {arg}");
+            }
+        }
+
+        // Scripts run in profile order, then verify commands, then cleanup.
+        let transport_calls = transport.calls();
+        assert!(matches!(transport_calls[0], TransportCall::CopyIn { .. }));
+        let TransportCall::Exec { argv, .. } = &transport_calls[1] else {
+            panic!("expected the first provisioning exec");
+        };
+        assert_eq!(argv, &["bash", "~/wg-provision/scripts/macos/common.sh"]);
+        let TransportCall::Exec { argv, .. } = &transport_calls[2] else {
+            panic!("expected the second provisioning exec");
+        };
+        assert_eq!(argv, &["bash", "~/wg-provision/scripts/macos/reversing.sh"]);
+        let TransportCall::Exec { argv, .. } = &transport_calls[3] else {
+            panic!("expected the first verify exec");
+        };
+        assert_eq!(argv, &["python3", "--version"]);
+        let TransportCall::Exec { argv, .. } = &transport_calls[4] else {
+            panic!("expected the second verify exec");
+        };
+        assert_eq!(argv, &["uv", "--version"]);
+        let TransportCall::Exec { argv, .. } = &transport_calls[5] else {
+            panic!("expected the cleanup exec");
+        };
+        assert_eq!(argv, &["rm", "-rf", "~/wg-provision"]);
+        assert_eq!(transport_calls.len(), 6);
+
+        // The scripts directory was copied in as a whole, from where the
+        // per-script exec paths expect to find it.
+        let TransportCall::CopyIn { src, dest, .. } = &transport_calls[0] else {
+            unreachable!()
+        };
+        assert_eq!(src, &Path::new("/repo/profiles/scripts"));
+        assert_eq!(dest, "~/wg-provision");
+    }
+
+    #[tokio::test]
+    async fn verify_failure_is_invalid_profile_not_bootstrap_failed() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_responder(install_happy_responder);
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_exec_status(1);
+        let b = builder(runner, transport);
+
+        let mut profile = sample_profile();
+        profile.provision.scripts.clear();
+        profile.tools.verify = vec!["test -x /nonexistent".to_string()];
+
+        let err = b
+            .build_profile(&profile, &opts(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WargameError::InvalidProfile { name, .. } if name == "macos-minimal-arm64")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_password_is_rejected_before_any_guest_transport_use() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_responder(install_happy_responder);
+        let transport = Arc::new(FakeTransport::new());
+        let b = builder(runner, transport.clone());
+
+        let mut profile = sample_profile();
+        profile.guest.password = None;
+
+        let err = b
+            .build_profile(&profile, &opts(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WargameError::InvalidProfile { .. }));
+        assert!(transport.calls().is_empty());
+    }
+}
