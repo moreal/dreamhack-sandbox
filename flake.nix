@@ -108,6 +108,18 @@
             installPhase = "touch $out";
             postInstall = "";
           });
+          # `build`'s own `doCheck = true` already runs `cargo test` as part
+          # of its checkPhase; this check exists in addition so
+          # `nix flake check`'s per-check output names one explicitly
+          # (PLAN.md's `checks.{fmt,clippy,tests}`) rather than folding it
+          # into `build`.
+          tests = wargame.overrideAttrs (old: {
+            pname = "wargame-tests";
+            buildPhase = "cargo test --workspace";
+            doCheck = false;
+            installPhase = "touch $out";
+            postInstall = "";
+          });
         });
     };
 }
