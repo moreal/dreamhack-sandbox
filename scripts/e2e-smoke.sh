@@ -15,6 +15,11 @@
 # Usage:
 #   scripts/e2e-smoke.sh [profile-name]     # default profile: macos-minimal-arm64
 #
+# Networking: this uses NAT by default (see README.md "What \"isolated\"
+# networking means"), because isolated mode needs a one-time Softnet sudo
+# rule that most machines won't have configured; set
+# WARGAME_SMOKE_NETWORK=isolated to exercise that path once it is.
+#
 # Requires (see README.md "Prerequisites"): tart, ssh, jq, cargo -- run this
 # from inside `nix develop` so all of them are on PATH.
 
@@ -32,8 +37,12 @@ for bin in cargo tart ssh jq; do
   fi
 done
 
+# Deliberately NOT a temporary WARGAME_HOME: the guest SSH key the profile
+# image already trusts (installed during `wargame profile build`) lives in
+# the real one, so a fresh/temporary home would have no key the image
+# accepts. Use whatever the rest of `wargame` uses, and never delete it.
+: "${WARGAME_HOME:=$HOME/Library/Application Support/wargame-vm}"
 export WARGAME_HOME
-WARGAME_HOME="$(mktemp -d)"
 export WARGAME_PROVIDER=fixture
 
 SESSION_ID=""
@@ -41,7 +50,6 @@ cleanup() {
   if [ -n "$SESSION_ID" ]; then
     "$BIN" delete "$SESSION_ID" --force >/dev/null 2>&1 || true
   fi
-  rm -rf "$WARGAME_HOME"
 }
 trap cleanup EXIT
 
@@ -55,8 +63,9 @@ echo "==> wargame doctor"
                        # expected to fail on a machine that hasn't built
                        # $PROFILE yet; that's what the next step is for.
 
-echo "==> wargame launch fixture:1 --profile $PROFILE --yes"
-LAUNCH_OUT="$("$BIN" launch fixture:1 --profile "$PROFILE" --yes)"
+NETWORK="${WARGAME_SMOKE_NETWORK:-nat}"
+echo "==> wargame launch fixture:1 --profile $PROFILE --network $NETWORK --yes"
+LAUNCH_OUT="$("$BIN" launch fixture:1 --profile "$PROFILE" --network "$NETWORK" --yes)"
 echo "$LAUNCH_OUT"
 
 SESSION_ID="$(echo "$LAUNCH_OUT" | sed -n 's/^session id: //p')"

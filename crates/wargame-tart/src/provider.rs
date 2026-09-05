@@ -2,9 +2,11 @@
 //! §5), driven entirely through `ProcessRunner` argv arrays — never a shell
 //! string, and no secret ever appears in one of these commands' argv.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,6 +20,33 @@ use wargame_core::ports::{
 };
 
 use crate::{args, console, image, list::TartVm};
+
+/// The remediation text for a host where isolated networking can't run
+/// (DESIGN.md §5/§7). Reuses `wargame-core`'s wording verbatim so the
+/// message is identical everywhere it's shown (CLI error, `doctor`).
+pub fn isolated_network_hint(softnet_path: Option<&Path>) -> String {
+    wargame_core::error::isolated_network_hint(softnet_path)
+}
+
+/// How many of the run log's trailing non-empty lines to include when a VM
+/// exits during boot (DESIGN.md §5) -- enough to show the actual failure
+/// (e.g. Softnet's "root privileges are required...") without dumping the
+/// whole log.
+const RUN_LOG_TAIL_LINES: usize = 5;
+
+/// The last `RUN_LOG_TAIL_LINES` non-empty lines of `log_path`, tolerating a
+/// missing or unreadable file (in which case a placeholder is returned so
+/// the resulting error message still says *something*).
+fn tail_run_log(log_path: &Path) -> String {
+    match std::fs::read_to_string(log_path) {
+        Ok(contents) => {
+            let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+            let start = lines.len().saturating_sub(RUN_LOG_TAIL_LINES);
+            lines[start..].join("\n")
+        }
+        Err(_) => format!("(no run log at {})", log_path.display()),
+    }
+}
 
 /// Static configuration for [`TartProvider`] (DESIGN.md §3.5's `[vm.tart]`
 /// section, resolved into the shapes the provider actually needs).
@@ -44,11 +73,19 @@ const IP_POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub struct TartProvider {
     runner: Arc<dyn ProcessRunner>,
     cfg: TartConfig,
+    /// The `run.log` path passed to the most recent `start()` for each VM
+    /// name, so `wait_ip` can show its tail when the runner process died
+    /// during boot (DESIGN.md §5).
+    run_logs: Mutex<HashMap<String, PathBuf>>,
 }
 
 impl TartProvider {
     pub fn new(runner: Arc<dyn ProcessRunner>, cfg: TartConfig) -> Self {
-        TartProvider { runner, cfg }
+        TartProvider {
+            runner,
+            cfg,
+            run_logs: Mutex::new(HashMap::new()),
+        }
     }
 
     /// The Tart VM name for a session id, e.g. `"wg-dh-out-of-bound-a1b2c3"`.
@@ -64,6 +101,26 @@ impl TartProvider {
 
     fn cmd(&self, args: Vec<String>) -> Cmd {
         Cmd::new(self.cfg.binary.clone(), args)
+    }
+
+    /// Whether isolated networking (`--net-host`, backed by Tart's Softnet)
+    /// can actually run on this host: Softnet needs root, and Tart invokes
+    /// it with non-interactive `sudo` (DESIGN.md §5/§7), so this resolves
+    /// `softnet` on `PATH` and probes non-interactive sudo against it.
+    /// Never runs anything through a shell string -- always argv.
+    async fn isolated_network_available(&self) -> bool {
+        let Some(softnet_path) = self.runner.which("softnet") else {
+            return false;
+        };
+        let cmd = Cmd::new(
+            "sudo",
+            vec![
+                "-n".to_string(),
+                softnet_path.display().to_string(),
+                "--help".to_string(),
+            ],
+        );
+        matches!(self.runner.run(&cmd).await, Ok(out) if out.status == 0)
     }
 
     async fn list_vms(&self) -> Result<Vec<TartVm>> {
@@ -99,20 +156,26 @@ impl VmProvider for TartProvider {
     async fn healthcheck(&self) -> Result<BackendStatus> {
         let cmd = self.cmd(vec!["--version".to_string()]);
         match self.runner.run(&cmd).await {
-            Ok(out) if out.status == 0 => Ok(BackendStatus {
-                available: true,
-                version: Some(out.stdout.trim().to_string()),
-                detail: "ok".to_string(),
-            }),
+            Ok(out) if out.status == 0 => {
+                let isolated_network = Some(self.isolated_network_available().await);
+                Ok(BackendStatus {
+                    available: true,
+                    version: Some(out.stdout.trim().to_string()),
+                    detail: "ok".to_string(),
+                    isolated_network,
+                })
+            }
             Ok(out) => Ok(BackendStatus {
                 available: false,
                 version: None,
                 detail: out.stderr,
+                isolated_network: None,
             }),
             Err(e) => Ok(BackendStatus {
                 available: false,
                 version: None,
                 detail: e.to_string(),
+                isolated_network: None,
             }),
         }
     }
@@ -207,11 +270,16 @@ impl VmProvider for TartProvider {
     async fn start(&self, vm: &VmRef, opts: &StartOptions) -> Result<RuntimeInfo> {
         let cmd = self.cmd(args::run_args(&vm.name, opts));
         let pid = self.runner.spawn_detached(&cmd, &opts.log_path).await?;
+        self.run_logs
+            .lock()
+            .unwrap()
+            .insert(vm.name.clone(), opts.log_path.clone());
         Ok(RuntimeInfo { pid: Some(pid) })
     }
 
     async fn wait_ip(&self, vm: &VmRef, timeout: Duration) -> Result<IpAddr> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut first_iteration = true;
         loop {
             let out = self.runner.run(&self.cmd(args::ip_args(&vm.name))).await?;
             if out.status == 0 {
@@ -219,6 +287,33 @@ impl VmProvider for TartProvider {
                     return Ok(ip);
                 }
             }
+
+            // The `tart run` process can die (e.g. Softnet needing root)
+            // long before the boot timeout elapses; polling `tart ip` alone
+            // would otherwise spin for the whole timeout with no useful
+            // error (DESIGN.md §5). Skip this on the very first iteration so
+            // a VM that simply hasn't reported `Running` yet isn't flagged.
+            if !first_iteration {
+                if let Ok(vms) = self.list_vms().await {
+                    if let Some(v) = vms.iter().find(|v| v.name == vm.name) {
+                        if !v.running {
+                            let log_path = self
+                                .run_logs
+                                .lock()
+                                .unwrap()
+                                .get(&vm.name)
+                                .cloned()
+                                .unwrap_or_else(|| PathBuf::from("/dev/null"));
+                            let tail = tail_run_log(&log_path);
+                            return Err(WargameError::VmCreationFailed(format!(
+                                "VM exited during boot: {tail}"
+                            )));
+                        }
+                    }
+                }
+            }
+            first_iteration = false;
+
             if tokio::time::Instant::now() >= deadline {
                 return Err(WargameError::GuestBootTimeout(timeout));
             }
@@ -317,6 +412,64 @@ mod tests {
             p.vm_name("dh-out-of-bound-a1b2c3"),
             "wg-dh-out-of-bound-a1b2c3"
         );
+    }
+
+    #[tokio::test]
+    async fn healthcheck_isolated_network_false_when_softnet_missing() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.push_success("tart 2.0.0\n"); // --version
+                                             // `which("softnet")` returns None: no set_which() call.
+        let p = provider(runner.clone());
+
+        let status = p.healthcheck().await.unwrap();
+        assert!(status.available);
+        assert_eq!(status.isolated_network, Some(false));
+    }
+
+    #[tokio::test]
+    async fn healthcheck_isolated_network_false_when_sudo_n_fails() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_which("softnet", PathBuf::from("/opt/homebrew/bin/softnet"));
+        runner.push_success("tart 2.0.0\n"); // --version
+        runner.push_failure(1, "sudo: a password is required"); // sudo -n softnet --help
+        let p = provider(runner.clone());
+
+        let status = p.healthcheck().await.unwrap();
+        assert!(status.available);
+        assert_eq!(status.isolated_network, Some(false));
+
+        let calls = runner.calls();
+        let sudo_call = calls
+            .iter()
+            .find(|c| c.program == "sudo")
+            .expect("expected a sudo invocation");
+        assert_eq!(sudo_call.args[0], "-n");
+        assert_eq!(sudo_call.args[1], "/opt/homebrew/bin/softnet");
+        assert_eq!(sudo_call.args[2], "--help");
+    }
+
+    #[tokio::test]
+    async fn healthcheck_isolated_network_true_when_sudo_n_succeeds() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_which("softnet", PathBuf::from("/opt/homebrew/bin/softnet"));
+        runner.push_success("tart 2.0.0\n"); // --version
+        runner.push_success(""); // sudo -n softnet --help
+        let p = provider(runner.clone());
+
+        let status = p.healthcheck().await.unwrap();
+        assert!(status.available);
+        assert_eq!(status.isolated_network, Some(true));
+    }
+
+    #[test]
+    fn isolated_network_hint_mentions_sudoers_and_nat_fallback() {
+        let hint = isolated_network_hint(Some(Path::new("/opt/homebrew/bin/softnet")));
+        assert!(hint.contains("/opt/homebrew/bin/softnet"));
+        assert!(hint.contains("/etc/sudoers.d/wargame-softnet"));
+        assert!(hint.contains("--network nat"));
+
+        let default_hint = isolated_network_hint(None);
+        assert!(default_hint.contains("/opt/homebrew/bin/softnet"));
     }
 
     /// A `tart list --format json` response reporting a single VM named
@@ -469,9 +622,37 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn wait_ip_retries_until_an_ip_appears() {
         let runner = Arc::new(FakeRunner::new());
-        runner.push_failure(1, "no ip"); // still booting
-        runner.push_failure(1, "no ip");
-        runner.push_success("10.0.0.5\n");
+        let ip_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ip_calls_responder = ip_calls.clone();
+        runner.set_responder(move |cmd| {
+            match cmd.args.first().map(String::as_str) {
+                Some("ip") => {
+                    let n = ip_calls_responder.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < 2 {
+                        Ok(Output {
+                            status: 1,
+                            stdout: String::new(),
+                            stderr: "no ip".to_string(),
+                        })
+                    } else {
+                        Ok(Output {
+                            status: 0,
+                            stdout: "10.0.0.5\n".to_string(),
+                            stderr: String::new(),
+                        })
+                    }
+                }
+                // Still booting, but running -- must not be mistaken for an
+                // exited VM (DESIGN.md §5).
+                Some("list") => Ok(Output {
+                    status: 0,
+                    stdout: r#"[{"Name":"wg-x","Source":"local","State":"running","Running":true,"Size":1,"Disk":1}]"#
+                        .to_string(),
+                    stderr: String::new(),
+                }),
+                _ => Ok(Output::default()),
+            }
+        });
         let p = provider(runner.clone());
         let vm = VmRef {
             backend: "tart".to_string(),
@@ -480,7 +661,57 @@ mod tests {
 
         let ip = p.wait_ip(&vm, Duration::from_secs(30)).await.unwrap();
         assert_eq!(ip, IpAddr::from_str("10.0.0.5").unwrap());
-        assert_eq!(runner.calls().len(), 3);
+        assert_eq!(ip_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_ip_fails_fast_when_the_vm_exited_during_boot() {
+        let log_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            log_file.path(),
+            "some earlier line\n\
+             root privileges are required to run and passwordless sudo was not available\n\
+             RuntimeFailed(why: \"Softnet process terminated prematurely\")\n",
+        )
+        .unwrap();
+        let log_path = log_file.path().to_path_buf();
+
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_responder(move |cmd| match cmd.args.first().map(String::as_str) {
+            Some("ip") => Ok(Output {
+                status: 1,
+                stdout: String::new(),
+                stderr: "no ip".to_string(),
+            }),
+            Some("list") => Ok(Output {
+                status: 0,
+                stdout: r#"[{"Name":"wg-x","Source":"local","State":"stopped","Running":false,"Size":1,"Disk":1}]"#
+                    .to_string(),
+                stderr: String::new(),
+            }),
+            _ => Ok(Output::default()),
+        });
+        let p = provider(runner.clone());
+        let vm = VmRef {
+            backend: "tart".to_string(),
+            name: "wg-x".to_string(),
+        };
+        p.start(
+            &vm,
+            &StartOptions {
+                network: NetworkMode::Isolated,
+                headless: true,
+                log_path: log_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = p.wait_ip(&vm, Duration::from_secs(300)).await.unwrap_err();
+        let WargameError::VmCreationFailed(msg) = err else {
+            panic!("expected VmCreationFailed, got {err:?}");
+        };
+        assert!(msg.contains("Softnet"), "message was: {msg}");
     }
 
     #[tokio::test(start_paused = true)]

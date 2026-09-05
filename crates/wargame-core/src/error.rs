@@ -64,11 +64,30 @@ pub enum WargameError {
     Other(String),
 }
 
+/// The remediation text shown whenever isolated (host-only) networking
+/// can't actually run on this host -- Tart implements `--net-host` via
+/// Softnet, which requires root (DESIGN.md §5/§7). `softnet_path`, when
+/// known, is substituted into the sudoers line so the command can be
+/// copy-pasted as-is; otherwise a common Homebrew install path is used as a
+/// placeholder. Shared between [`WargameError::hint`] / `doctor`'s
+/// `network:isolated` check (which have no path to give, so pass `None`)
+/// and `wargame-tart`'s `isolated_network_hint`, which reuses this verbatim
+/// so the message is identical everywhere it's shown.
+pub fn isolated_network_hint(softnet_path: Option<&std::path::Path>) -> String {
+    let path = softnet_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/opt/homebrew/bin/softnet".to_string());
+    format!(
+        "Isolated networking uses Tart's Softnet, which needs root. Either allow passwordless sudo for it:\n  echo \"$(whoami) ALL=(root) NOPASSWD: {path}\" | sudo tee /etc/sudoers.d/wargame-softnet\nor launch with NAT networking instead: --network nat"
+    )
+}
+
 impl WargameError {
     /// A short, actionable next step to show under the error message, if any
     /// (MVP.md §23's "Try:" lines).
     pub fn hint(&self) -> Option<String> {
         match self {
+            WargameError::NetworkUnavailable(_) => Some(isolated_network_hint(None)),
             WargameError::ImageMissing { profile, .. } => {
                 Some(format!("Run: wargame profile build {profile}"))
             }

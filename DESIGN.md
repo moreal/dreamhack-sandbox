@@ -17,7 +17,7 @@
 | Guest transport | System `ssh`/`scp` with a per-install ed25519 key; `sshpass` only during image build | PRD Q3 recommendation; keys stay host-side, guest never sees host keys |
 | Wargame provider | Dreamhack JSON API (`/api/v1/wargame/...`), Django session-cookie auth | Verified live on 2026-09-05; no HTML scraping |
 | Credential store | macOS Keychain via `/usr/bin/security -i` (stdin, never argv) | PRD §9; no plaintext, no argv leak |
-| Isolated network | `tart run --net-host` (host-only vmnet) | Guest can reach only the host bridge; SSH still works |
+| Isolated network | `tart run --net-host` (host-only vmnet via Softnet; needs a sudoers rule for `softnet`, detected by `doctor` and launch preflight) | Guest can reach only the host bridge; SSH still works. Without the rule, launch refuses isolated mode before creating anything |
 | NAT network | Tart default shared networking | Explicit opt-in with confirmation |
 | GUI console | Stop headless run, re-run with Tart window | PRD Q2: delegate; VNC descriptor is a future console type |
 | Archive extraction | Guest-side only, opt-in per launch (`--extract`, default on), never executes | PRD Q4 |
@@ -45,7 +45,7 @@
 | stop / delete | `tart stop <vm>`, `tart delete <vm>` |
 | pull | `tart pull <oci-ref>` |
 
-`--net-host` restricts the guest to the host-only network. `--net-softnet` needs privileged Softnet and is not used in MVP. Guest agent (`tart exec`) is absent from vanilla images, so SSH is the transport.
+`--net-host` restricts the guest to the host-only network, but Tart implements it (like `--net-softnet`) by spawning Softnet with non-interactive sudo. Verified 2026-09-05: without a sudoers rule the runner exits at once with `root privileges are required to run and passwordless sudo was not available`. The backend therefore probes `sudo -n <softnet> --help` in `healthcheck()` and reports `isolated_network`; launch preflight rejects isolated mode with the remediation hint when it is unavailable. `tart set --disk-size` must be strictly larger than the current disk, so it is passed only when the profile grows the clone. Guest agent (`tart exec`) is absent from vanilla images, so SSH is the transport; `ssh host cmd` runs a non-login zsh, so provisioning also writes the Homebrew PATH into `~/.zshenv`.
 
 ### Dreamhack API surface used
 | Purpose | Request | Auth | Verified |

@@ -32,6 +32,7 @@ pub struct FakeVmProvider {
     calls: Mutex<Vec<String>>,
     capabilities: ProviderCapabilities,
     default_ip: IpAddr,
+    isolated_network: Mutex<Option<bool>>,
 }
 
 impl FakeVmProvider {
@@ -52,11 +53,18 @@ impl FakeVmProvider {
                 remote: false,
             },
             default_ip: IpAddr::from_str("10.0.0.5").unwrap(),
+            isolated_network: Mutex::new(None),
         }
     }
 
     pub fn add_image(&self, name: impl Into<String>) {
         self.images.lock().unwrap().push(name.into());
+    }
+
+    /// Configures the `isolated_network` field `healthcheck()` reports
+    /// (`None` = "can't tell", the default).
+    pub fn set_isolated_network(&self, value: Option<bool>) {
+        *self.isolated_network.lock().unwrap() = value;
     }
 
     /// Steps: `"healthcheck"`, `"create"`, `"start"`, `"wait_ip"`.
@@ -113,6 +121,7 @@ impl VmProvider for FakeVmProvider {
             available: true,
             version: Some("fake-1.0".to_string()),
             detail: "ok".to_string(),
+            isolated_network: *self.isolated_network.lock().unwrap(),
         })
     }
 

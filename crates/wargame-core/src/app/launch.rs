@@ -134,6 +134,12 @@ pub async fn launch(
             reason: backend.detail,
         });
     }
+    if req.network == NetworkMode::Isolated && backend.isolated_network == Some(false) {
+        return Err(WargameError::NetworkUnavailable(format!(
+            "isolated networking is not available on this host: {}",
+            backend.detail
+        )));
+    }
 
     let image = ImageRef(profile.image_name());
     if !ctx.vm.image_exists(&image).await? {
@@ -688,6 +694,52 @@ mod tests {
             sessions[0].vm_ref.is_some(),
             "vm_ref must survive so `wargame delete` can clean up the VM"
         );
+    }
+
+    #[tokio::test]
+    async fn isolated_network_unavailable_fails_before_any_session() {
+        let Fixture {
+            ctx, vm, wargame, ..
+        } = fixture();
+        wargame.set_authenticated("tester");
+        vm.set_isolated_network(Some(false));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        let err = launch(&ctx, request(), tx).await.unwrap_err();
+        assert!(matches!(err, WargameError::NetworkUnavailable(_)));
+        assert!(ctx.repo.list().await.unwrap().is_empty());
+        assert!(
+            vm.calls().iter().all(|c| c != "create"),
+            "no VM may be created when isolated networking is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn nat_network_proceeds_even_when_isolated_is_unavailable() {
+        let Fixture {
+            ctx, vm, wargame, ..
+        } = fixture();
+        wargame.set_authenticated("tester");
+        vm.set_isolated_network(Some(false));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        let mut req = request();
+        req.network = NetworkMode::Nat;
+        let session = launch(&ctx, req, tx).await.unwrap();
+        assert_eq!(session.state, SessionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn isolated_network_unknown_proceeds() {
+        let Fixture {
+            ctx, wargame, vm, ..
+        } = fixture();
+        wargame.set_authenticated("tester");
+        vm.set_isolated_network(None);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        let session = launch(&ctx, request(), tx).await.unwrap();
+        assert_eq!(session.state, SessionState::Ready);
     }
 
     #[tokio::test]

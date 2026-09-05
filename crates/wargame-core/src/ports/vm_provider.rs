@@ -45,6 +45,10 @@ pub struct BackendStatus {
     pub available: bool,
     pub version: Option<String>,
     pub detail: String,
+    /// Whether this backend can actually run isolated (host-only) networking
+    /// right now -- e.g. Tart's `--net-host` depends on Softnet, which needs
+    /// root (DESIGN.md §5/§7). `None` when the backend has no way to tell.
+    pub isolated_network: Option<bool>,
 }
 
 /// How the user actually gets a graphical view of the VM (MVP.md §26's

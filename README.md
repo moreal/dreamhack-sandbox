@@ -147,17 +147,43 @@ works) but cannot reach the LAN or the internet. This is the right default
 for offline reversing/file-analysis challenges — plausible malware inside a
 challenge archive has no network to call out on.
 
+**This requires root, every time.** Tart implements `--net-host` (and
+`--net-softnet`) by spawning its own helper process, Softnet, and Softnet
+needs root to set up the host-only interface. Tart launches it with
+non-interactive `sudo`, so unless passwordless sudo is set up for it,
+Softnet exits immediately (`root privileges are required to run and
+passwordless sudo was not available`) and the VM never gets an IP —
+without the check below, `wargame launch --network isolated` would just
+spin until the boot timeout with no useful error. Set up passwordless sudo
+for Softnet once, replacing the path with wherever `which softnet` (or
+`brew --prefix`) puts it on your machine:
+
+```sh
+echo "$(whoami) ALL=(root) NOPASSWD: /opt/homebrew/bin/softnet" | sudo tee /etc/sudoers.d/wargame-softnet
+```
+
+Until that's in place, `wargame doctor` reports the `network:isolated`
+check as failing (with this exact remediation), and `wargame launch
+--network isolated` refuses to run — it checks during preflight, *before*
+creating a session or a VM, and fails fast with `NetworkUnavailable`
+instead of timing out 300 seconds later with a cryptic guest-boot error.
+
 `--network nat` gives the guest Tart's normal shared networking (outbound
 internet access) for challenges that need it — remote challenge servers,
-package installs, web problems. Because that materially changes the threat
-model, `wargame` always shows an explicit warning and asks
-`Continue? [y/N]` before launching with NAT, unless you pass `--yes`:
+package installs, web problems — and needs no sudo rule, so it's the
+alternative if you don't want to set one up. Because it also materially
+changes the threat model, `wargame` always shows an explicit warning and
+asks `Continue? [y/N]` before launching with NAT, unless you pass `--yes`:
 
 ```
 Warning: NAT networking connects this VM directly to your network, rather
 than isolating it (MVP.md §18).
 Continue? [y/N]
 ```
+
+`wargame profile build` always uses NAT regardless of your default —
+provisioning needs Homebrew and package downloads, so it wouldn't work
+isolated even if you had the Softnet rule configured.
 
 Neither mode implements fine-grained egress filtering (e.g. blocking
 specific LAN hosts while allowing the internet) — that's future scope, not
@@ -224,10 +250,20 @@ prerequisite is missing, with a `hint` for each failing check.
   image and provisions from scratch).
 - **`ImageMissing` on `wargame launch`** — same fix as above; the error's
   own hint says so.
-- **Guest boot times out** — check `$WARGAME_HOME/logs/wargame.log` and the
-  session's `run.log` under `$WARGAME_HOME/sessions/<id>/`; a cold Tart
-  image can take longer than the configured `boot_timeout_secs`
-  (`[vm.tart]` in `config.toml`) to get a DHCP lease on some hosts.
+- **`network:isolated` fails / `NetworkUnavailable` on `wargame launch
+  --network isolated`** — Softnet (which `--net-host` needs) isn't allowed
+  to run under passwordless sudo yet; see "What \"isolated\" networking
+  means" above for the exact `sudoers.d` line, or pass `--network nat`
+  instead.
+- **Guest boot times out, or fails immediately with "VM exited during
+  boot"** — check `$WARGAME_HOME/logs/wargame.log` and the session's
+  `run.log` under `$WARGAME_HOME/sessions/<id>/`. A quick exit whose log
+  mentions Softnet is the same root-privilege issue as the previous bullet
+  (`wargame doctor` and `launch --network isolated` now catch this before
+  creating anything, but an older `run.log` from before that check can
+  still show it); an actual multi-minute hang is more likely a cold Tart
+  image taking longer than the configured `boot_timeout_secs` (`[vm.tart]`
+  in `config.toml`) to get a DHCP lease.
 - **`provider:dreamhack` unreachable / `AuthenticationRequired`** — check
   network access to `https://dreamhack.io`, then `wargame auth login`
   again; `wargame auth status` shows the current state without touching
@@ -238,8 +274,9 @@ prerequisite is missing, with a `hint` for each failing check.
 - **Config file** lives at `$WARGAME_HOME/config/config.toml` (all fields
   optional; see `DESIGN.md` §3.5 for the schema) — `$WARGAME_HOME` defaults
   to `~/Library/Application Support/wargame-vm` and can be overridden with
-  the `WARGAME_HOME` env var or `--home` for a fully hermetic setup (this is
-  exactly what `scripts/e2e-smoke.sh` and the test suite do).
+  the `WARGAME_HOME` env var or `--home` (the non-e2e test suite does this,
+  with a temporary directory, since it never boots a real VM;
+  `scripts/e2e-smoke.sh` deliberately does *not* — see below).
 
 ## Testing
 
@@ -262,8 +299,14 @@ CI:
   no Dreamhack account needed): builds, runs `doctor`, launches the fixture
   challenge into the named profile (default `macos-minimal-arm64`, which
   must already be built), verifies the guest-extracted file over SSH, then
-  deletes the session. Run it from inside `nix develop`, with the named
-  profile already built once (`wargame profile build macos-minimal-arm64`).
+  deletes the session. It uses your **real** `$WARGAME_HOME` (not a
+  temporary one) because the profile image only trusts the guest SSH key
+  that already lives there from `wargame profile build`, and it never
+  deletes that directory. It launches with `--network nat` by default (set
+  `WARGAME_SMOKE_NETWORK=isolated` to exercise isolated mode instead, once
+  you've set up the Softnet sudoers rule from "What \"isolated\" networking
+  means" above). Run it from inside `nix develop`, with the named profile
+  already built once (`wargame profile build macos-minimal-arm64`).
 - **`cargo test -p wargame-tart --test e2e -- --ignored`** — the same M0
   proof (MVP.md §36) driven directly against `wargame-tart`, with real
   password authentication against a freshly cloned vanilla image (no

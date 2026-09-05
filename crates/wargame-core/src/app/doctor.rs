@@ -51,11 +51,15 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
         },
     });
 
-    checks.push(match ctx.vm.healthcheck().await {
+    let healthcheck = ctx.vm.healthcheck().await;
+    checks.push(match &healthcheck {
         Ok(status) => Check {
             name: format!("vm-backend:{}", ctx.vm.name()),
             ok: status.available,
-            detail: status.version.unwrap_or(status.detail),
+            detail: status
+                .version
+                .clone()
+                .unwrap_or_else(|| status.detail.clone()),
             hint: if status.available {
                 None
             } else {
@@ -67,6 +71,35 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
             ok: false,
             detail: e.to_string(),
             hint: e.hint(),
+        },
+    });
+
+    checks.push(match &healthcheck {
+        Ok(status) => match status.isolated_network {
+            Some(true) => Check {
+                name: "network:isolated".to_string(),
+                ok: true,
+                detail: status.detail.clone(),
+                hint: None,
+            },
+            Some(false) => Check {
+                name: "network:isolated".to_string(),
+                ok: false,
+                detail: status.detail.clone(),
+                hint: Some(crate::error::isolated_network_hint(None)),
+            },
+            None => Check {
+                name: "network:isolated".to_string(),
+                ok: true,
+                detail: "unknown".to_string(),
+                hint: None,
+            },
+        },
+        Err(_) => Check {
+            name: "network:isolated".to_string(),
+            ok: true,
+            detail: "unknown".to_string(),
+            hint: None,
         },
     });
 
@@ -187,11 +220,15 @@ mod tests {
     }
 
     fn fixture() -> AppContext {
+        fixture_with_vm(Arc::new(FakeVmProvider::new()))
+    }
+
+    fn fixture_with_vm(vm: Arc<FakeVmProvider>) -> AppContext {
         AppContext {
             config: Default::default(),
             dirs: AppDirs { root: tmp_path() },
             wargame: Arc::new(FakeWargameProvider::new()),
-            vm: Arc::new(FakeVmProvider::new()),
+            vm,
             transport: Arc::new(FakeTransport::new()),
             repo: Arc::new(MemoryRepo::new()),
             profiles: ProfileStore::new(vec![], tmp_path()),
@@ -217,6 +254,52 @@ mod tests {
         // (non-fatal) miss with a hint, never a panic or an early return.
         assert!(!sshpass.ok);
         assert!(sshpass.hint.is_some());
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_network_isolated_ok_when_available() {
+        let vm = Arc::new(FakeVmProvider::new());
+        vm.set_isolated_network(Some(true));
+        let ctx = fixture_with_vm(vm);
+        let checks = doctor(&ctx).await;
+        let check = checks
+            .iter()
+            .find(|c| c.name == "network:isolated")
+            .unwrap();
+        assert!(check.ok);
+        assert!(check.hint.is_none());
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_network_isolated_failing_with_hint_when_unavailable() {
+        let vm = Arc::new(FakeVmProvider::new());
+        vm.set_isolated_network(Some(false));
+        let ctx = fixture_with_vm(vm);
+        let checks = doctor(&ctx).await;
+        let check = checks
+            .iter()
+            .find(|c| c.name == "network:isolated")
+            .unwrap();
+        assert!(!check.ok);
+        assert!(check
+            .hint
+            .as_deref()
+            .unwrap()
+            .to_lowercase()
+            .contains("softnet"));
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_network_isolated_ok_unknown_when_backend_cant_tell() {
+        let ctx = fixture();
+        // Default FakeVmProvider reports `None`.
+        let checks = doctor(&ctx).await;
+        let check = checks
+            .iter()
+            .find(|c| c.name == "network:isolated")
+            .unwrap();
+        assert!(check.ok);
+        assert_eq!(check.detail, "unknown");
     }
 
     #[tokio::test]

@@ -9,4 +9,4 @@ pub mod provider;
 
 pub use build::{BuildOptions, ProfileImageBuilder, TransportFactory};
 pub use list::TartVm;
-pub use provider::{TartConfig, TartProvider};
+pub use provider::{isolated_network_hint, TartConfig, TartProvider};
