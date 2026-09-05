@@ -72,10 +72,7 @@ impl FakeRunner {
 
     /// Installs a function that computes the response for every `run()`
     /// call from its `Cmd`. Overrides the queue set by [`Self::push_response`].
-    pub fn set_responder(
-        &self,
-        f: impl Fn(&Cmd) -> Result<Output> + Send + Sync + 'static,
-    ) {
+    pub fn set_responder(&self, f: impl Fn(&Cmd) -> Result<Output> + Send + Sync + 'static) {
         *self.responder.lock().unwrap() = Some(Box::new(f));
     }
 

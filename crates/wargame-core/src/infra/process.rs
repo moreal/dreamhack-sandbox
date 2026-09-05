@@ -56,7 +56,7 @@ impl Cmd {
 }
 
 /// Captured output of a completed (non-detached) process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Output {
     pub status: i32,
     pub stdout: String,
