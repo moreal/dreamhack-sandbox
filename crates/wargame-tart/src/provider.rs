@@ -148,9 +148,43 @@ impl VmProvider for TartProvider {
             )));
         }
 
+        // Tart rejects `--disk-size` unless it's strictly larger than the
+        // clone's *current* disk (clones inherit the base image's disk), so
+        // look up the clone's current size and only request a resize when
+        // it would actually grow (DESIGN.md §5).
+        let current_disk_gib = match self.list_vms().await {
+            Ok(vms) => match vms.iter().find(|v| v.name == spec.name) {
+                Some(v) => Some(v.disk_gib),
+                None => {
+                    tracing::warn!(
+                        vm = %spec.name,
+                        "tart list did not report the newly cloned VM; treating current disk size as unknown"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    vm = %spec.name,
+                    error = %e,
+                    "tart list failed while checking the clone's current disk size; treating it as unknown"
+                );
+                None
+            }
+        };
+        let disk_gib = match current_disk_gib {
+            Some(current) if spec.resources.disk_gib > current => Some(spec.resources.disk_gib),
+            Some(_) => None,
+            None => Some(spec.resources.disk_gib),
+        };
+
         let set_out = self
             .runner
-            .run(&self.cmd(args::set_args(&spec.name, &spec.resources)))
+            .run(&self.cmd(args::set_args_with_disk(
+                &spec.name,
+                &spec.resources,
+                disk_gib,
+            )))
             .await?;
         if set_out.status != 0 {
             // Don't leave a half-configured clone behind (DESIGN.md §5).
@@ -285,9 +319,20 @@ mod tests {
         );
     }
 
+    /// A `tart list --format json` response reporting a single VM named
+    /// `name` with the given current disk size in GiB.
+    fn list_json_with_disk(name: &str, disk_gib: u64) -> String {
+        format!(
+            r#"[{{"Name":"{name}","Source":"local","State":"stopped","Running":false,"Size":1,"Disk":{disk_gib}}}]"#
+        )
+    }
+
     #[tokio::test]
     async fn create_clones_then_sets_and_returns_vm_ref() {
         let runner = Arc::new(FakeRunner::new());
+        runner.push_success(""); // clone
+        runner.push_success(list_json_with_disk("wg-dh-out-of-bound-a1b2c3", 50)); // list
+        runner.push_success(""); // set
         let p = provider(runner.clone());
         let spec = VmSpec {
             name: "wg-dh-out-of-bound-a1b2c3".to_string(),
@@ -300,16 +345,20 @@ mod tests {
         assert_eq!(vm.name, "wg-dh-out-of-bound-a1b2c3");
 
         let calls = runner.calls();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].program, "tart");
         assert_eq!(calls[0].args[0], "clone");
-        assert_eq!(calls[1].args[0], "set");
+        assert_eq!(calls[1].args[0], "list");
+        assert_eq!(calls[2].args[0], "set");
+        // requested 60 > current 50, so the resize is still requested.
+        assert!(calls[2].args.contains(&"--disk-size".to_string()));
     }
 
     #[tokio::test]
     async fn create_deletes_the_clone_when_set_fails() {
         let runner = Arc::new(FakeRunner::new());
         runner.push_success(""); // clone
+        runner.push_success(list_json_with_disk("wg-x", 50)); // list
         runner.push_failure(1, "disk too small"); // set
         runner.push_success(""); // delete
         let p = provider(runner.clone());
@@ -323,11 +372,98 @@ mod tests {
         assert!(matches!(err, WargameError::VmCreationFailed(_)));
 
         let calls = runner.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0].args[0], "clone");
-        assert_eq!(calls[1].args[0], "set");
-        assert_eq!(calls[2].args[0], "delete");
-        assert_eq!(calls[2].args[1], "wg-x");
+        assert_eq!(calls[1].args[0], "list");
+        assert_eq!(calls[2].args[0], "set");
+        assert_eq!(calls[3].args[0], "delete");
+        assert_eq!(calls[3].args[1], "wg-x");
+    }
+
+    #[tokio::test]
+    async fn create_omits_disk_size_when_requested_disk_not_larger_than_current() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.push_success(""); // clone
+        runner.push_success(list_json_with_disk("wg-x", 50)); // list: current disk 50 GiB
+        runner.push_success(""); // set
+        let p = provider(runner.clone());
+        let spec = VmSpec {
+            name: "wg-x".to_string(),
+            image: ImageRef("base".to_string()),
+            resources: Resources {
+                cpu: 4,
+                memory_mib: 8192,
+                disk_gib: 40, // <= current disk: must not pass --disk-size
+            },
+        };
+
+        p.create(&spec).await.unwrap();
+
+        let calls = runner.calls();
+        let set_call = &calls[2];
+        assert_eq!(set_call.args[0], "set");
+        assert!(!set_call.args.contains(&"--disk-size".to_string()));
+    }
+
+    #[tokio::test]
+    async fn create_passes_disk_size_when_requested_disk_larger_than_current() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.push_success(""); // clone
+        runner.push_success(list_json_with_disk("wg-x", 50)); // list: current disk 50 GiB
+        runner.push_success(""); // set
+        let p = provider(runner.clone());
+        let spec = VmSpec {
+            name: "wg-x".to_string(),
+            image: ImageRef("base".to_string()),
+            resources: Resources {
+                cpu: 4,
+                memory_mib: 8192,
+                disk_gib: 60, // > current disk: must pass --disk-size 60
+            },
+        };
+
+        p.create(&spec).await.unwrap();
+
+        let calls = runner.calls();
+        let set_call = &calls[2];
+        assert_eq!(set_call.args[0], "set");
+        let disk_flag_idx = set_call
+            .args
+            .iter()
+            .position(|a| a == "--disk-size")
+            .expect("expected --disk-size to be passed");
+        assert_eq!(set_call.args[disk_flag_idx + 1], "60");
+    }
+
+    #[tokio::test]
+    async fn create_keeps_disk_size_when_list_lookup_fails_to_find_the_clone() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.push_success(""); // clone
+                                 // list succeeds but doesn't report our VM (lookup failure case).
+        runner.push_success(list_json_with_disk("some-other-vm", 50));
+        runner.push_success(""); // set
+        let p = provider(runner.clone());
+        let spec = VmSpec {
+            name: "wg-x".to_string(),
+            image: ImageRef("base".to_string()),
+            resources: Resources {
+                cpu: 4,
+                memory_mib: 8192,
+                disk_gib: 40,
+            },
+        };
+
+        p.create(&spec).await.unwrap();
+
+        let calls = runner.calls();
+        let set_call = &calls[2];
+        assert_eq!(set_call.args[0], "set");
+        let disk_flag_idx = set_call
+            .args
+            .iter()
+            .position(|a| a == "--disk-size")
+            .expect("current disk unknown: --disk-size should still be passed");
+        assert_eq!(set_call.args[disk_flag_idx + 1], "40");
     }
 
     #[tokio::test(start_paused = true)]
