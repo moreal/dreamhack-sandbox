@@ -100,10 +100,47 @@ impl ProfileImageBuilder {
             })
             .await?;
 
+        match self.provision(&vm, profile, opts, progress).await {
+            Ok(()) => Ok(ImageRef(target_name)),
+            Err(err) => {
+                // A partially provisioned image must never satisfy
+                // `image_exists` for a later `launch` (DESIGN.md §5, NFR-02),
+                // so best-effort tear the VM back down before propagating the
+                // original failure.
+                progress("build failed; cleaning up the partially built VM".to_string());
+                if let Err(stop_err) = self.tart.stop(&vm).await {
+                    tracing::warn!(
+                        "failed to stop VM {} after a failed build: {stop_err}",
+                        vm.name
+                    );
+                }
+                if let Err(delete_err) = self.tart.delete(&vm).await {
+                    tracing::warn!(
+                        "failed to delete VM {} after a failed build: {delete_err}",
+                        vm.name
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// The provisioning steps after the clone: start, wait for an IP,
+    /// install the host key, copy in and run the provisioning scripts, run
+    /// the profile's verify commands, clean up, and stop the VM. Split out
+    /// from [`Self::build_profile`] so any failure here can be met with
+    /// best-effort cleanup of the partially built image.
+    async fn provision(
+        &self,
+        vm: &VmRef,
+        profile: &Profile,
+        opts: &BuildOptions,
+        progress: &mut dyn FnMut(String),
+    ) -> Result<()> {
         progress("starting the VM headless on NAT".to_string());
         self.tart
             .start(
-                &vm,
+                vm,
                 &StartOptions {
                     network: NetworkMode::Nat,
                     headless: true,
@@ -113,7 +150,7 @@ impl ProfileImageBuilder {
             .await?;
 
         progress("waiting for a DHCP lease".to_string());
-        let ip = self.tart.wait_ip(&vm, self.tart.boot_timeout()).await?;
+        let ip = self.tart.wait_ip(vm, self.tart.boot_timeout()).await?;
 
         progress("installing the host's SSH key (password login)".to_string());
         self.install_pubkey(profile, ip.to_string(), &opts.pubkey)
@@ -125,13 +162,32 @@ impl ProfileImageBuilder {
         transport.wait_ready(ip, self.tart.boot_timeout()).await?;
 
         progress("copying provisioning scripts into the guest".to_string());
+        // `~` is never expanded in `GuestTransport::exec` argv (every
+        // argument is single-quoted before being sent to the guest shell),
+        // so all guest-side paths here are relative to the SSH user's home
+        // directory instead. `scp -r <src>/scripts wg-provision` would, on a
+        // guest where `wg-provision` doesn't already exist, create
+        // `wg-provision` *as* a copy of `scripts` itself -- so create the
+        // destination directory first and copy into it with a trailing
+        // slash, giving `wg-provision/scripts/...` as the profile's script
+        // paths expect.
         transport
-            .copy_in(ip, &opts.scripts_dir.join("scripts"), "~/wg-provision")
+            .exec(
+                ip,
+                &[
+                    "mkdir".to_string(),
+                    "-p".to_string(),
+                    "wg-provision".to_string(),
+                ],
+            )
+            .await?;
+        transport
+            .copy_in(ip, &opts.scripts_dir.join("scripts"), "wg-provision/")
             .await?;
 
         for script in &profile.provision.scripts {
             progress(format!("provisioning: {script}"));
-            let remote_path = format!("~/wg-provision/{script}");
+            let remote_path = format!("wg-provision/{script}");
             let out = transport
                 .exec(ip, &["bash".to_string(), remote_path])
                 .await?;
@@ -165,15 +221,15 @@ impl ProfileImageBuilder {
                 &[
                     "rm".to_string(),
                     "-rf".to_string(),
-                    "~/wg-provision".to_string(),
+                    "wg-provision".to_string(),
                 ],
             )
             .await?;
 
         progress("stopping the VM".to_string());
-        self.tart.stop(&vm).await?;
+        self.tart.stop(vm).await?;
 
-        Ok(ImageRef(target_name))
+        Ok(())
     }
 
     /// Installs `pubkey` into the guest's `authorized_keys` over a
@@ -378,36 +434,40 @@ mod tests {
 
         // Scripts run in profile order, then verify commands, then cleanup.
         let transport_calls = transport.calls();
-        assert!(matches!(transport_calls[0], TransportCall::CopyIn { .. }));
-        let TransportCall::Exec { argv, .. } = &transport_calls[1] else {
+        let TransportCall::Exec { argv, .. } = &transport_calls[0] else {
+            panic!("expected the mkdir -p exec before the copy");
+        };
+        assert_eq!(argv, &["mkdir", "-p", "wg-provision"]);
+        assert!(matches!(transport_calls[1], TransportCall::CopyIn { .. }));
+        let TransportCall::Exec { argv, .. } = &transport_calls[2] else {
             panic!("expected the first provisioning exec");
         };
-        assert_eq!(argv, &["bash", "~/wg-provision/scripts/macos/common.sh"]);
-        let TransportCall::Exec { argv, .. } = &transport_calls[2] else {
+        assert_eq!(argv, &["bash", "wg-provision/scripts/macos/common.sh"]);
+        let TransportCall::Exec { argv, .. } = &transport_calls[3] else {
             panic!("expected the second provisioning exec");
         };
-        assert_eq!(argv, &["bash", "~/wg-provision/scripts/macos/reversing.sh"]);
-        let TransportCall::Exec { argv, .. } = &transport_calls[3] else {
+        assert_eq!(argv, &["bash", "wg-provision/scripts/macos/reversing.sh"]);
+        let TransportCall::Exec { argv, .. } = &transport_calls[4] else {
             panic!("expected the first verify exec");
         };
         assert_eq!(argv, &["python3", "--version"]);
-        let TransportCall::Exec { argv, .. } = &transport_calls[4] else {
+        let TransportCall::Exec { argv, .. } = &transport_calls[5] else {
             panic!("expected the second verify exec");
         };
         assert_eq!(argv, &["uv", "--version"]);
-        let TransportCall::Exec { argv, .. } = &transport_calls[5] else {
+        let TransportCall::Exec { argv, .. } = &transport_calls[6] else {
             panic!("expected the cleanup exec");
         };
-        assert_eq!(argv, &["rm", "-rf", "~/wg-provision"]);
-        assert_eq!(transport_calls.len(), 6);
+        assert_eq!(argv, &["rm", "-rf", "wg-provision"]);
+        assert_eq!(transport_calls.len(), 7);
 
         // The scripts directory was copied in as a whole, from where the
         // per-script exec paths expect to find it.
-        let TransportCall::CopyIn { src, dest, .. } = &transport_calls[0] else {
+        let TransportCall::CopyIn { src, dest, .. } = &transport_calls[1] else {
             unreachable!()
         };
         assert_eq!(src, &Path::new("/repo/profiles/scripts"));
-        assert_eq!(dest, "~/wg-provision");
+        assert_eq!(dest, "wg-provision/");
     }
 
     #[tokio::test]
@@ -428,6 +488,50 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, WargameError::InvalidProfile { name, .. } if name == "macos-minimal-arm64")
+        );
+    }
+
+    /// NFR-02 (DESIGN.md §5): a build that fails partway through must not
+    /// leave a `wargame-profile-<name>` image behind for a later `launch` to
+    /// mistake for a finished one, so a failing verify must still stop and
+    /// delete the VM before the error is returned.
+    #[tokio::test]
+    async fn verify_failure_stops_and_deletes_the_partially_built_vm() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_responder(install_happy_responder);
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_exec_status(1);
+        let b = builder(runner.clone(), transport);
+
+        let mut profile = sample_profile();
+        profile.provision.scripts.clear();
+        profile.tools.verify = vec!["test -x /nonexistent".to_string()];
+
+        let err = b
+            .build_profile(&profile, &opts(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WargameError::InvalidProfile { name, .. } if name == "macos-minimal-arm64")
+        );
+
+        let calls = runner.calls();
+        let stop_idx = calls
+            .iter()
+            .position(|c| c.program == "tart" && c.args.first().map(String::as_str) == Some("stop"))
+            .expect("cleanup must stop the VM after a failed build");
+        let delete_idx = calls
+            .iter()
+            .position(|c| {
+                c.program == "tart"
+                    && c.args.first().map(String::as_str) == Some("delete")
+                    && c.args.get(1).map(String::as_str)
+                        == Some("wargame-profile-macos-minimal-arm64")
+            })
+            .expect("cleanup must delete the profile image after a failed build");
+        assert!(
+            stop_idx < delete_idx,
+            "the VM must be stopped before it is deleted"
         );
     }
 
