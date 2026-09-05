@@ -1,7 +1,7 @@
 # Verification record — 2026-09-05 / 2026-09-06
 
 Host: macOS 26.6.2, Apple Silicon, Tart 2.36.0 (via nixpkgs wrapper) / 2.32.1 (Homebrew), Determinate Nix 3.21.9.
-Branch: `feat/mvp`.
+Branch: `feat/mvp`, merged fast-forward into `main` on 2026-09-06.
 
 ## Build and static checks
 
@@ -62,14 +62,36 @@ Branch: `feat/mvp`.
 | Second launch | ✓ Ready in 23 s: download 5255 B, SHA-256 `15c4ed7a…fc0eb`, boot, SSH, bootstrap; guest has `~/wargame/rev-basic-1/incoming/extracted/…/chall1.exe` (PE32+), but named `4482bbb1-…-d23253b84453.zip` |
 | Third launch | ✓ Ready in 23 s, asset staged and extracted as `rev-basic-1.zip` / `extracted/rev-basic-1/chall1.exe`; `stop`, `delete` clean, no `wg-` VM left |
 
-### Bugs found and fixed by the real Dreamhack run (uncommitted at the time of writing)
+### Bugs found and fixed by the real Dreamhack run (`dfc42c5`)
 
 6. The adapter treated the download response's top-level JSON string as `ProviderChanged`; only object shapes were accepted → `file_refs_from_json` accepts the bare string first, object/`files[]` shapes stay as fallbacks.
 7. Dreamhack's CSRF cookie is `csrf_token`, not Django's default `csrftoken`, so no `X-CSRFToken` was sent and the 403 was reported as "authentication required" → `client::csrf_token` tries `csrf_token` then `csrftoken` (login and download); a 403 whose body says `CSRF Failed` is now reported as `ProviderChanged` with the cookie names tried, so it cannot be mistaken for a missing login.
 8. Object storage names the file `<uuid>.zip` via `Content-Disposition` → `choose_filename` prefers the asset placeholder (`<repository>.zip`) over a UUID-stem name when the extensions match, so the guest sees `rev-basic-1.zip`.
 
+## Reversing image — 2026-09-06
+
+`wargame profile build macos-re-arm64` with the `nix build` binary, then `wargame launch dreamhack:15 --profile macos-re-arm64 --network nat --yes`. Six image builds in total (≈2.5–3 min each against the cached vanilla image; Homebrew bottles for Ghidra 12.1.3 + openjdk@21, LLVM 23.1.0, lld, binutils, hexyl, file).
+
+| Step | Result |
+|---|---|
+| Build 1 | ✗ before provisioning: `scp: stat local "/nix/var/nix/builds/…/source/crates/wargame-cli/../../profiles/scripts": No such file` (bug 9) |
+| Build 2 | ✓ built in 2:42; `ghidraRun` on PATH, but `llvm-objdump`/`lld`/LLVM `clang` missing from PATH (keg-only), Temurin JDK redundant next to openjdk@21 |
+| Launch into build 2 | ✓ Ready in 23 s; `analyzeHeadless … -import chall1.exe` → `Analysis succeeded`, `Import succeeded` on the PE32+ challenge binary |
+| Build 3 | ✓ built, but the extended `tools.verify` list was silently ignored (bug 10) |
+| Build 4 | ✗ `analyzeHeadless`: `Unable to locate a Java Runtime` without Temurin (fixed: JAVA_HOME from openjdk@21) |
+| Build 5 | ✗ verify `analyzeHeadless 2>&1 \| grep …`: `Bad argument: grep`, verify entries are argv, not shell; then `which lld` failed: `lld` is its own formula |
+| Build 6 | ✓ built in 2:41, all 10 verify commands pass |
+| Launch into build 6 | ✓ Ready in 19.5 s. Over non-login `ssh host cmd`: `ghidraRun`, `pyghidraRun`, `analyzeHeadless`, `java` (openjdk 21.0.12.1), `clang` (Homebrew 23.1.0), `lld`, `llvm-objdump`, `llvm-readobj`, `gobjdump`, `hexyl`, `python3`, `uv`, `git` all resolve; Apple `objdump`/`strings`/`file` stay the defaults. `analyzeHeadless gp p -import chall1.exe -deleteProject` → `Analysis succeeded` / `Import succeeded`; `llvm-objdump -d chall1.exe` disassembles 1291 instructions. `delete` clean, no `wg-` VM left |
+
+### Bugs found and fixed by the reversing image build
+
+9. `profile build` located provisioning scripts via a compile-time `CARGO_MANIFEST_DIR` fallback, a sandbox path in a `nix build` binary → scripts are embedded and written to `$WARGAME_HOME/profiles/scripts/` on every run (`083dc66`).
+10. Built-in YAMLs seeded into `$WARGAME_HOME/profiles/` were user overrides forever, so a newer built-in never took effect → a pristine copy under `profiles/.builtin/` lets `build_context` refresh unedited YAMLs and leave edited ones alone (`829de02`). On a host seeded by an older binary, delete the unedited YAML once (or the `.builtin/` bookkeeping starts from the next run).
+11. Keg-only LLVM/binutils/openjdk and the separate `lld` formula were not on PATH; `reversing.sh` exports `JAVA_HOME` and the PATH additions into `~/.zshenv` + `~/.zprofile`, Temurin dropped (`829de02`).
+12. `tools.verify` entries are whitespace-split argv with no shell; the YAML documents it and uses `which`/`--version` checks only (`829de02`).
+
 ## Not verified live
 
 - `wargame gui` (re-runs the VM with a Tart window) was only covered by unit tests; it would open a window on the host.
-- `macos-re-arm64` (Ghidra) image build was not run; it uses the same builder with `reversing.sh` on top of the verified `common.sh`.
+- Ghidra's GUI (`ghidraRun`) inside the guest: only headless analysis was exercised over SSH.
 - Isolated networking end to end, because it requires the sudoers rule on this host.

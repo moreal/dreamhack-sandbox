@@ -94,7 +94,8 @@ $ wargame profile build macos-re-arm64
 image, boots it, generates a per-install ed25519 key under
 `$WARGAME_HOME/keys/` the first time it's needed, installs that key's public
 half into the clone over a temporary password login, provisions it with the
-profile's scripts (`profiles/scripts/macos/*.sh`), runs the profile's
+profile's scripts (`profiles/scripts/macos/*.sh`, embedded in the binary and
+written to `$WARGAME_HOME/profiles/scripts/`), runs the profile's
 `tools.verify` commands, then stops it and keeps the result as a named local
 Tart image (`wargame-profile-<name>`). This step is slow (tens of minutes)
 and is the only place a guest password is ever used — every VM launched

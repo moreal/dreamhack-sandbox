@@ -315,7 +315,7 @@ Capabilities: `guest_os=[macos], guest_arch=[arm64], graphical_console=true, ssh
 
 ## 6. Profiles
 
-`profiles/*.yaml` (embedded in the binary with `include_str!` and also copied to `$WARGAME_HOME/profiles/` on first run so users can edit/add):
+`profiles/*.yaml` (embedded in the binary with `include_str!` and also copied to `$WARGAME_HOME/profiles/` so users can edit/add; a pristine copy under `profiles/.builtin/` lets an unedited YAML follow the binary while an edited one is kept. `profiles/scripts/**` is embedded the same way and rewritten under `$WARGAME_HOME/profiles/scripts/` on every run, since a `nix build` binary has no checkout to read them from):
 
 ```yaml
 apiVersion: wargame.vm/v1
