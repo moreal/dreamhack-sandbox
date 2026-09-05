@@ -55,6 +55,11 @@ pub struct TartConfig {
     pub binary: String,
     pub vm_prefix: String,
     pub boot_timeout: Duration,
+    /// The `--timeout` (seconds) passed to `tart stop`. Tart's own default
+    /// is 30s, which is too short for a guest with a lot of dirty pages to
+    /// flush to disk before it's force-killed (DESIGN.md §5); 180s gives it
+    /// room to finish a graceful shutdown.
+    pub stop_timeout_secs: u64,
 }
 
 impl Default for TartConfig {
@@ -63,6 +68,7 @@ impl Default for TartConfig {
             binary: "tart".to_string(),
             vm_prefix: "wg-".to_string(),
             boot_timeout: Duration::from_secs(300),
+            stop_timeout_secs: 180,
         }
     }
 }
@@ -108,9 +114,15 @@ impl TartProvider {
     /// it with non-interactive `sudo` (DESIGN.md §5/§7), so this resolves
     /// `softnet` on `PATH` and probes non-interactive sudo against it.
     /// Never runs anything through a shell string -- always argv.
-    async fn isolated_network_available(&self) -> bool {
+    ///
+    /// Returns `(available, detail)`: `detail` is `"ok"` when available, and
+    /// otherwise a specific reason (`softnet` missing from `PATH`, or
+    /// non-interactive `sudo` failing with its stderr) so a caller never has
+    /// to show the generic "ok" next to "isolated networking is not
+    /// available on this host".
+    async fn isolated_network_available(&self) -> (bool, String) {
         let Some(softnet_path) = self.runner.which("softnet") else {
-            return false;
+            return (false, "softnet not found on PATH".to_string());
         };
         let cmd = Cmd::new(
             "sudo",
@@ -120,7 +132,20 @@ impl TartProvider {
                 "--help".to_string(),
             ],
         );
-        matches!(self.runner.run(&cmd).await, Ok(out) if out.status == 0)
+        match self.runner.run(&cmd).await {
+            Ok(out) if out.status == 0 => (true, "ok".to_string()),
+            Ok(out) => {
+                let first_line = out.stderr.lines().next().unwrap_or(out.stderr.as_str());
+                (
+                    false,
+                    format!("sudo -n {} failed: {first_line}", softnet_path.display()),
+                )
+            }
+            Err(e) => (
+                false,
+                format!("sudo -n {} failed: {e}", softnet_path.display()),
+            ),
+        }
     }
 
     async fn list_vms(&self) -> Result<Vec<TartVm>> {
@@ -157,12 +182,13 @@ impl VmProvider for TartProvider {
         let cmd = self.cmd(vec!["--version".to_string()]);
         match self.runner.run(&cmd).await {
             Ok(out) if out.status == 0 => {
-                let isolated_network = Some(self.isolated_network_available().await);
+                let (isolated_network_ok, isolated_network_detail) =
+                    self.isolated_network_available().await;
                 Ok(BackendStatus {
                     available: true,
                     version: Some(out.stdout.trim().to_string()),
-                    detail: "ok".to_string(),
-                    isolated_network,
+                    detail: isolated_network_detail,
+                    isolated_network: Some(isolated_network_ok),
                 })
             }
             Ok(out) => Ok(BackendStatus {
@@ -324,7 +350,7 @@ impl VmProvider for TartProvider {
     async fn stop(&self, vm: &VmRef) -> Result<()> {
         let out = self
             .runner
-            .run(&self.cmd(args::stop_args(&vm.name)))
+            .run(&self.cmd(args::stop_args(&vm.name, self.cfg.stop_timeout_secs)))
             .await?;
         if out.status != 0 {
             return Err(WargameError::Other(format!(
@@ -424,6 +450,7 @@ mod tests {
         let status = p.healthcheck().await.unwrap();
         assert!(status.available);
         assert_eq!(status.isolated_network, Some(false));
+        assert_eq!(status.detail, "softnet not found on PATH");
     }
 
     #[tokio::test]
@@ -437,6 +464,10 @@ mod tests {
         let status = p.healthcheck().await.unwrap();
         assert!(status.available);
         assert_eq!(status.isolated_network, Some(false));
+        assert_eq!(
+            status.detail,
+            "sudo -n /opt/homebrew/bin/softnet failed: sudo: a password is required"
+        );
 
         let calls = runner.calls();
         let sudo_call = calls
@@ -459,6 +490,7 @@ mod tests {
         let status = p.healthcheck().await.unwrap();
         assert!(status.available);
         assert_eq!(status.isolated_network, Some(true));
+        assert_eq!(status.detail, "ok");
     }
 
     #[test]

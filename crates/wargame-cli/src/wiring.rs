@@ -162,6 +162,7 @@ fn tart_config(config: &Config) -> TartConfig {
         binary: config.vm.tart.binary.clone(),
         vm_prefix: config.vm.tart.vm_prefix.clone(),
         boot_timeout: Duration::from_secs(config.vm.tart.boot_timeout_secs),
+        ..TartConfig::default()
     }
 }
 

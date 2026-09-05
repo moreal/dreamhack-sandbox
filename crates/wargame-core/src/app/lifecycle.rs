@@ -35,6 +35,15 @@ pub async fn stop(ctx: &AppContext, id: &str) -> Result<Session> {
             to: SessionState::Stopped,
         });
     }
+    if let Some(ip) = session.guest_ip {
+        // Best-effort: flush the guest's filesystem before asking Tart to
+        // stop it, so a stop that outruns its own graceful-shutdown window
+        // doesn't lose writes that were still dirty in page cache
+        // (DESIGN.md §5). A failure here must never block the stop itself.
+        if let Err(err) = ctx.transport.exec(ip, &["sync".to_string()]).await {
+            tracing::debug!(session = %id, error = %err, "sync before stop failed; stopping anyway");
+        }
+    }
     if let Some(vm_ref) = &session.vm_ref {
         ctx.vm.stop(vm_ref).await?;
     }
@@ -163,22 +172,24 @@ mod tests {
     struct Fixture {
         ctx: AppContext,
         vm: Arc<FakeVmProvider>,
+        transport: Arc<FakeTransport>,
     }
 
     fn fixture() -> Fixture {
         let vm = Arc::new(FakeVmProvider::new());
+        let transport = Arc::new(FakeTransport::new());
         let ctx = AppContext {
             config: Default::default(),
             dirs: AppDirs { root: tmp_path() },
             wargame: Arc::new(FakeWargameProvider::new()),
             vm: vm.clone(),
-            transport: Arc::new(FakeTransport::new()),
+            transport: transport.clone(),
             repo: Arc::new(MemoryRepo::new()),
             profiles: ProfileStore::new(vec![], tmp_path()),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
             bootstrap_script: "#!/bin/bash\n",
         };
-        Fixture { ctx, vm }
+        Fixture { ctx, vm, transport }
     }
 
     fn sample_session(id: &str, state: SessionState, keep: KeepPolicy) -> Session {
@@ -224,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_moves_ready_through_running_to_stopped() {
-        let Fixture { ctx, vm } = fixture();
+        let Fixture { ctx, vm, .. } = fixture();
         let vm_ref = vm
             .create(&VmSpec {
                 name: "wg-s".to_string(),
@@ -245,6 +256,42 @@ mod tests {
         assert_eq!(stopped.state, SessionState::Stopped);
     }
 
+    /// DESIGN.md §5: a session stop should flush the guest's filesystem
+    /// (best-effort) before the VM is actually stopped, so a Tart guest with
+    /// dirty pages doesn't lose writes if it's later force-killed.
+    #[tokio::test]
+    async fn stop_syncs_the_guest_before_stopping_when_an_ip_is_known() {
+        let Fixture { ctx, vm, transport } = fixture();
+        let vm_ref = vm
+            .create(&VmSpec {
+                name: "wg-s".to_string(),
+                image: ImageRef("img".to_string()),
+                resources: Resources {
+                    cpu: 1,
+                    memory_mib: 1024,
+                    disk_gib: 10,
+                },
+            })
+            .await
+            .unwrap();
+        let mut session = sample_session("s", SessionState::Ready, KeepPolicy::Discard);
+        session.vm_ref = Some(vm_ref);
+        let ip: std::net::IpAddr = "10.0.0.9".parse().unwrap();
+        session.guest_ip = Some(ip);
+        ctx.repo.save(&session).await.unwrap();
+
+        stop(&ctx, "s").await.unwrap();
+
+        let calls = transport.calls();
+        assert!(
+            calls.iter().any(
+                |c| matches!(c, crate::testing::TransportCall::Exec { ip: call_ip, argv }
+                    if *call_ip == ip && argv == &["sync".to_string()])
+            ),
+            "expected a sync exec to the guest before stop: {calls:?}"
+        );
+    }
+
     #[tokio::test]
     async fn stop_on_stopped_session_is_invalid() {
         let Fixture { ctx, .. } = fixture();
@@ -258,7 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_starts_the_vm_and_marks_running() {
-        let Fixture { ctx, vm } = fixture();
+        let Fixture { ctx, vm, .. } = fixture();
         let vm_ref = vm
             .create(&VmSpec {
                 name: "wg-s".to_string(),
@@ -296,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_vm_and_session() {
-        let Fixture { ctx, vm } = fixture();
+        let Fixture { ctx, vm, .. } = fixture();
         let vm_ref = vm
             .create(&VmSpec {
                 name: "wg-s".to_string(),
@@ -332,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_finds_and_deletes_orphan_vms() {
-        let Fixture { ctx, vm } = fixture();
+        let Fixture { ctx, vm, .. } = fixture();
         // A VM with no session record at all.
         vm.create(&VmSpec {
             name: "wg-orphan".to_string(),

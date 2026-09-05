@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use wargame_core::domain::{NetworkMode, Profile, VmRef};
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::process::{Cmd, ProcessRunner};
-use wargame_core::ports::{GuestTransport, ImageRef, StartOptions, VmProvider, VmSpec};
+use wargame_core::ports::{GuestTransport, ImageRef, StartOptions, VmProvider, VmSpec, VmStatus};
 
 use crate::TartProvider;
 
@@ -27,6 +27,15 @@ use crate::TartProvider;
 const KEY_INSTALL_RETRY: Duration = Duration::from_secs(5);
 /// Total time budget for that probe before giving up.
 const KEY_INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How often, after `tart stop` returns, the build polls the VM's status to
+/// confirm it actually stopped -- a bulk Homebrew install can leave hundreds
+/// of MB of dirty pages that don't finish flushing within `tart stop`'s own
+/// (now-extended) grace period, in which case Tart force-kills the guest and
+/// the late writes are lost (DESIGN.md §5).
+const STOP_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Total time budget for that confirmation poll before giving up.
+const STOP_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Builds a [`GuestTransport`] for a given guest username, deferred until
 /// after the host's SSH key has actually been installed (see
@@ -251,8 +260,47 @@ impl ProfileImageBuilder {
             )
             .await?;
 
-        progress("stopping the VM".to_string());
+        progress("flushing guest filesystem and shutting down".to_string());
+        match transport.exec(ip, &["sync".to_string()]).await {
+            Ok(out) if out.status != 0 => {
+                tracing::warn!(
+                    vm = %vm.name,
+                    status = out.status,
+                    stderr = %out.stderr,
+                    "sync failed on the guest before stop; proceeding anyway"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    vm = %vm.name,
+                    error = %err,
+                    "could not run sync on the guest before stop; proceeding anyway"
+                );
+            }
+        }
         self.tart.stop(vm).await?;
+
+        let deadline = tokio::time::Instant::now() + STOP_POLL_TIMEOUT;
+        loop {
+            match self.tart.status(vm).await {
+                Ok(VmStatus::Running) => {}
+                Ok(_) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        vm = %vm.name,
+                        error = %err,
+                        "failed to check VM status while confirming it stopped"
+                    );
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(WargameError::VmCreationFailed(
+                    "profile VM did not stop cleanly".to_string(),
+                ));
+            }
+            tokio::time::sleep(STOP_POLL_INTERVAL).await;
+        }
 
         Ok(())
     }
@@ -525,7 +573,24 @@ mod tests {
         assert!(run_idx < ip_idx, "run must precede ip");
         assert!(ip_idx < sshpass_idx, "ip must precede the sshpass install");
         assert!(sshpass_idx < stop_idx, "install must precede stop");
-        assert_eq!(stop_idx, calls.len() - 1, "stop must be the last call");
+        assert!(
+            calls[stop_idx].args.contains(&"--timeout".to_string()),
+            "tart stop must pass an explicit --timeout: {:?}",
+            calls[stop_idx]
+        );
+        // Nothing but the post-stop status confirmation poll (`tart list`)
+        // may follow `stop` (DESIGN.md §5).
+        let calls_after_stop = &calls[stop_idx + 1..];
+        assert!(
+            !calls_after_stop.is_empty(),
+            "expected a status poll after stop to confirm it stopped cleanly"
+        );
+        assert!(
+            calls_after_stop
+                .iter()
+                .all(|c| c.program == "tart" && c.args.first().map(String::as_str) == Some("list")),
+            "only status polls should follow stop: {calls_after_stop:?}"
+        );
 
         let sshpass_cmd = &calls[sshpass_idx];
         assert_eq!(sshpass_cmd.args[0], "-e");
@@ -573,7 +638,11 @@ mod tests {
             panic!("expected the cleanup exec");
         };
         assert_eq!(argv, &["rm", "-rf", "wg-provision"]);
-        assert_eq!(transport_calls.len(), 7);
+        let TransportCall::Exec { argv, .. } = &transport_calls[7] else {
+            panic!("expected the pre-stop sync exec");
+        };
+        assert_eq!(argv, &["sync"]);
+        assert_eq!(transport_calls.len(), 8);
 
         // The scripts directory was copied in as a whole, from where the
         // per-script exec paths expect to find it.
@@ -582,6 +651,47 @@ mod tests {
         };
         assert_eq!(src, &Path::new("/repo/profiles/scripts"));
         assert_eq!(dest, "wg-provision/");
+    }
+
+    /// If `tart stop` returns but the VM never reports as stopped within the
+    /// poll window, the build must fail loudly rather than silently hand
+    /// back an image that was built from a guest killed mid-flush
+    /// (DESIGN.md §5).
+    #[tokio::test(start_paused = true)]
+    async fn provision_fails_when_the_vm_does_not_stop_cleanly() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_responder(|cmd| {
+            if cmd.program == "tart" && cmd.args.first().map(String::as_str) == Some("list") {
+                // Always reports running, including after `stop` -- the VM
+                // never actually stops within the poll window.
+                return Ok(Output {
+                    status: 0,
+                    stdout: r#"[{"Name":"wargame-profile-macos-minimal-arm64","Source":"local","State":"running","Running":true,"Size":1,"Disk":1}]"#.to_string(),
+                    stderr: String::new(),
+                });
+            }
+            if cmd.program == "tart" && cmd.args.first().map(String::as_str) == Some("ip") {
+                return Ok(Output {
+                    status: 0,
+                    stdout: "10.0.0.7\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(Output::default())
+        });
+        let transport = Arc::new(FakeTransport::new());
+        let b = builder(runner, transport);
+        let mut profile = sample_profile();
+        profile.provision.scripts.clear();
+
+        let err = b
+            .build_profile(&profile, &opts(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WargameError::VmCreationFailed(ref msg) if msg.contains("did not stop cleanly")),
+            "expected a VmCreationFailed about not stopping cleanly, got {err:?}"
+        );
     }
 
     #[tokio::test]

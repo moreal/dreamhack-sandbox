@@ -53,8 +53,18 @@ pub fn ip_args(vm: &str) -> Vec<String> {
     vec!["ip".to_string(), vm.to_string()]
 }
 
-pub fn stop_args(vm: &str) -> Vec<String> {
-    vec!["stop".to_string(), vm.to_string()]
+/// `tart stop` with an explicit `--timeout` (seconds): a plain `tart stop`
+/// defaults to a 30s graceful-shutdown window (`tart stop --help`), which is
+/// not enough for a guest with hundreds of MB of dirty pages after a bulk
+/// Homebrew install -- it gets force-killed and the late writes are lost
+/// (DESIGN.md §5).
+pub fn stop_args(vm: &str, timeout_secs: u64) -> Vec<String> {
+    vec![
+        "stop".to_string(),
+        vm.to_string(),
+        "--timeout".to_string(),
+        timeout_secs.to_string(),
+    ]
 }
 
 pub fn delete_args(vm: &str) -> Vec<String> {
@@ -205,7 +215,10 @@ mod tests {
     #[test]
     fn ip_stop_delete_list_pull_exact() {
         assert_eq!(ip_args("wg-abc"), vec!["ip", "wg-abc"]);
-        assert_eq!(stop_args("wg-abc"), vec!["stop", "wg-abc"]);
+        assert_eq!(
+            stop_args("wg-abc", 180),
+            vec!["stop", "wg-abc", "--timeout", "180"]
+        );
         assert_eq!(delete_args("wg-abc"), vec!["delete", "wg-abc"]);
         assert_eq!(list_args(), vec!["list", "--format", "json"]);
         assert_eq!(
