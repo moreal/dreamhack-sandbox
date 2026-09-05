@@ -120,9 +120,33 @@ pub fn cookie_value(jar: &Jar, url: &Url, name: &str) -> Option<String> {
         .map(|(_, v)| v)
 }
 
+/// Cookie names Dreamhack may use for the CSRF token, most specific first.
+/// Live dreamhack.io sets `csrf_token` (verified 2026-09-06); `csrftoken`
+/// is Django's default and is kept as a fallback.
+pub const CSRF_COOKIE_NAMES: &[&str] = &["csrf_token", "csrftoken"];
+
+/// The CSRF token to echo back in `X-CSRFToken`, from whichever of
+/// [`CSRF_COOKIE_NAMES`] the jar holds for `url`.
+pub fn csrf_token(jar: &Jar, url: &Url) -> Option<String> {
+    CSRF_COOKIE_NAMES
+        .iter()
+        .find_map(|name| cookie_value(jar, url, name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csrf_token_prefers_dreamhacks_csrf_token_cookie() {
+        let url = Url::parse("https://dreamhack.io").unwrap();
+        let jar = Jar::default();
+        assert_eq!(csrf_token(&jar, &url), None);
+        jar.add_cookie_str("csrftoken=django", &url);
+        assert_eq!(csrf_token(&jar, &url), Some("django".to_string()));
+        jar.add_cookie_str("csrf_token=live", &url);
+        assert_eq!(csrf_token(&jar, &url), Some("live".to_string()));
+    }
 
     #[test]
     fn cookie_value_reads_from_jar() {

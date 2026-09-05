@@ -1,6 +1,8 @@
-//! `POST /api/v1/wargame/challenges/<id>/download/` and the two response
-//! shapes it may return (DESIGN.md §1, §4): a JSON body pointing at one or
-//! more file URLs, or the file bytes directly.
+//! `POST /api/v1/wargame/challenges/<id>/download/` and the response
+//! shapes it may return (DESIGN.md §1, §4). Live Dreamhack (verified against
+//! the frontend's challenge-page chunk on 2026-09-06) answers with a bare
+//! JSON string holding a signed file URL; JSON objects with a URL field and
+//! direct attachments are accepted as fallbacks.
 
 use futures_util::StreamExt;
 use reqwest::cookie::Jar;
@@ -10,7 +12,7 @@ use url::Url;
 use wargame_core::error::{Result, WargameError};
 use wargame_core::ports::{AssetSink, DownloadResult, DownloadedFile};
 
-use crate::client::cookie_value;
+use crate::client::csrf_token;
 
 const PROVIDER: &str = "dreamhack";
 
@@ -53,6 +55,15 @@ pub fn parse_content_disposition(header: &str) -> Option<String> {
     plain
 }
 
+/// True when a 403 body is Django REST framework's CSRF rejection
+/// (`{"detail": "CSRF Failed: ..."}`) rather than a permission denial.
+pub fn is_csrf_failure(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("detail")?.as_str().map(|d| d.contains("CSRF")))
+        .unwrap_or(false)
+}
+
 fn url_filename(url: &Url) -> String {
     url.path_segments()
         .and_then(|mut segs| segs.next_back())
@@ -74,6 +85,7 @@ pub async fn download_asset(
     jar: &Jar,
     base: &Url,
     challenge_id: &str,
+    preferred_name: Option<&str>,
     sink: &mut dyn AssetSink,
 ) -> Result<DownloadResult> {
     let url = join(
@@ -81,7 +93,7 @@ pub async fn download_asset(
         &format!("/api/v1/wargame/challenges/{challenge_id}/download/"),
     )?;
     let referer = join(base, &format!("/wargame/challenges/{challenge_id}/"))?;
-    let csrf = cookie_value(jar, base, "csrftoken");
+    let csrf = csrf_token(jar, base);
 
     let mut req = client.post(url).header("Referer", referer.as_str());
     if let Some(csrf) = &csrf {
@@ -90,10 +102,25 @@ pub async fn download_asset(
     let resp = req.send().await.map_err(|e| unavailable(e.to_string()))?;
 
     match resp.status() {
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+        StatusCode::UNAUTHORIZED => {
             return Err(WargameError::AuthenticationRequired {
                 provider: PROVIDER.to_string(),
             })
+        }
+        StatusCode::FORBIDDEN => {
+            // Django answers a missing/stale CSRF token with 403 too; that is
+            // an adapter problem, not a login problem, so tell them apart.
+            let body = resp.text().await.unwrap_or_default();
+            if is_csrf_failure(&body) {
+                return Err(changed(format!(
+                    "download rejected the CSRF token (cookie {:?} sent: {})",
+                    crate::client::CSRF_COOKIE_NAMES,
+                    csrf.is_some()
+                )));
+            }
+            return Err(WargameError::AuthenticationRequired {
+                provider: PROVIDER.to_string(),
+            });
         }
         StatusCode::NOT_FOUND => {
             return Err(WargameError::ChallengeNotFound(challenge_id.to_string()))
@@ -119,7 +146,7 @@ pub async fn download_asset(
             .json()
             .await
             .map_err(|_| changed("download response shape"))?;
-        return download_from_json(client, &body, sink).await;
+        return download_from_json(client, &body, preferred_name, sink).await;
     }
 
     if content_disposition.is_some()
@@ -137,48 +164,132 @@ pub async fn download_asset(
     Err(changed("download response shape"))
 }
 
-async fn download_from_json(
-    client: &reqwest::Client,
-    body: &serde_json::Value,
-    sink: &mut dyn AssetSink,
-) -> Result<DownloadResult> {
-    if let Some(arr) = body.get("files").and_then(|v| v.as_array()) {
-        let mut files = Vec::new();
-        for item in arr {
-            let Some(url) = item
-                .get("url")
-                .or_else(|| item.get("file"))
-                .and_then(|v| v.as_str())
-            else {
-                continue;
-            };
-            let name = item
-                .get("name")
-                .or_else(|| item.get("filename"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            files.push(fetch_one(client, url, name, sink).await?);
+/// One file reference pulled out of a JSON download response: the URL to GET
+/// and, when the server named it, the filename to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRef {
+    pub url: String,
+    pub name: Option<String>,
+}
+
+/// Extracts the file URL(s) from a JSON download response. Dreamhack's
+/// frontend (`onDownload` in its challenge page chunk) assigns the whole
+/// response body to the anchor `href`, so the live shape is a **bare JSON
+/// string** holding the URL. Object shapes (`url`/`file`/`download_url`,
+/// or `files: [{url|file, name|filename}]`) are kept as defensive fallbacks.
+pub fn file_refs_from_json(body: &serde_json::Value) -> Result<Vec<FileRef>> {
+    if let Some(url) = body.as_str() {
+        if !url.is_empty() {
+            return Ok(vec![FileRef {
+                url: url.to_string(),
+                name: None,
+            }]);
         }
+        return Err(changed("download response shape"));
+    }
+
+    if let Some(arr) = body.get("files").and_then(|v| v.as_array()) {
+        let files: Vec<FileRef> = arr
+            .iter()
+            .filter_map(|item| {
+                let url = item
+                    .get("url")
+                    .or_else(|| item.get("file"))
+                    .and_then(|v| v.as_str())?;
+                let name = item
+                    .get("name")
+                    .or_else(|| item.get("filename"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                Some(FileRef {
+                    url: url.to_string(),
+                    name,
+                })
+            })
+            .collect();
         if files.is_empty() {
             return Err(changed("download response shape"));
         }
-        return Ok(DownloadResult { files });
+        return Ok(files);
     }
 
     let url = ["url", "file", "download_url"]
         .iter()
         .find_map(|k| body.get(*k).and_then(|v| v.as_str()));
-    let Some(url) = url else {
-        return Err(changed("download response shape"));
+    match url {
+        Some(url) => Ok(vec![FileRef {
+            url: url.to_string(),
+            name: None,
+        }]),
+        None => Err(changed("download response shape")),
+    }
+}
+
+async fn download_from_json(
+    client: &reqwest::Client,
+    body: &serde_json::Value,
+    preferred_name: Option<&str>,
+    sink: &mut dyn AssetSink,
+) -> Result<DownloadResult> {
+    let refs = file_refs_from_json(body)?;
+    // The placeholder name only makes sense when there is exactly one file.
+    let preferred = if refs.len() == 1 {
+        preferred_name
+    } else {
+        None
     };
-    let file = fetch_one(client, url, None, sink).await?;
-    Ok(DownloadResult { files: vec![file] })
+    let mut files = Vec::new();
+    for file in refs {
+        files.push(fetch_one(client, &file.url, file.name, preferred, sink).await?);
+    }
+    Ok(DownloadResult { files })
+}
+
+/// True for names like `4482bbb1-7ec4-4a42-8325-d23253b84453.zip`: a UUID
+/// stem carries no information for the person working on the challenge, so
+/// the asset's placeholder (`<repository>.zip`) is preferred over it.
+fn is_opaque_name(name: &str) -> bool {
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let groups: Vec<&str> = stem.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8usize, 4, 4, 4, 12])
+            .all(|(g, len)| g.len() == len && g.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+fn extension(name: &str) -> Option<&str> {
+    name.rsplit_once('.')
+        .filter(|(stem, _)| !stem.is_empty())
+        .map(|(_, ext)| ext)
+}
+
+/// Picks the filename for a fetched file: the server's explicit name first,
+/// then the asset's placeholder when it has the same extension as the URL
+/// (live Dreamhack serves `<uuid>.zip` from object storage with no
+/// `Content-Disposition`, so the placeholder `<repository>.zip` is the only
+/// human-readable name available), else the URL's last path segment.
+pub fn choose_filename(server_name: Option<String>, preferred: Option<&str>, url: &Url) -> String {
+    if let Some(name) = server_name.filter(|n| !is_opaque_name(n)) {
+        return name;
+    }
+    let from_url = url_filename(url);
+    match preferred {
+        Some(p)
+            if extension(p).map(str::to_ascii_lowercase)
+                == extension(&from_url).map(str::to_ascii_lowercase) =>
+        {
+            p.to_string()
+        }
+        _ => from_url,
+    }
 }
 
 async fn fetch_one(
     client: &reqwest::Client,
     url: &str,
     name: Option<String>,
+    preferred: Option<&str>,
     sink: &mut dyn AssetSink,
 ) -> Result<DownloadedFile> {
     let resp = client
@@ -189,14 +300,13 @@ async fn fetch_one(
     if !resp.status().is_success() {
         return Err(unavailable(format!("HTTP {}", resp.status())));
     }
-    let filename = name
-        .or_else(|| {
-            resp.headers()
-                .get(CONTENT_DISPOSITION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(parse_content_disposition)
-        })
-        .unwrap_or_else(|| url_filename(resp.url()));
+    let server_name = name.or_else(|| {
+        resp.headers()
+            .get(CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_disposition)
+    });
+    let filename = choose_filename(server_name, preferred, resp.url());
     stream_to_sink(resp, &filename, sink).await
 }
 
@@ -251,5 +361,105 @@ mod tests {
     fn url_filename_takes_last_path_segment() {
         let url = Url::parse("https://cdn.example.com/files/challenge.zip?x=1").unwrap();
         assert_eq!(url_filename(&url), "challenge.zip");
+    }
+
+    #[test]
+    fn choose_filename_prefers_server_then_placeholder_then_url() {
+        let url = Url::parse("https://cdn/x/4482bbb1-7ec4.zip?sig=1").unwrap();
+        assert_eq!(
+            choose_filename(Some("named.zip".into()), Some("rev-basic-1.zip"), &url),
+            "named.zip"
+        );
+        assert_eq!(
+            choose_filename(None, Some("rev-basic-1.zip"), &url),
+            "rev-basic-1.zip"
+        );
+        // Extension mismatch: do not mislabel the file.
+        assert_eq!(
+            choose_filename(
+                None,
+                Some("rev-basic-1.zip"),
+                &Url::parse("https://cdn/x/a.tar.gz").unwrap()
+            ),
+            "a.tar.gz"
+        );
+        assert_eq!(choose_filename(None, None, &url), "4482bbb1-7ec4.zip");
+    }
+
+    #[test]
+    fn uuid_server_name_yields_to_placeholder() {
+        let url = Url::parse("https://cdn/x/4482bbb1-7ec4-4a42-8325-d23253b84453.zip").unwrap();
+        let uuid = "4482bbb1-7ec4-4a42-8325-d23253b84453.zip".to_string();
+        assert!(is_opaque_name(&uuid));
+        assert!(!is_opaque_name("rev-basic-1.zip"));
+        assert_eq!(
+            choose_filename(Some(uuid.clone()), Some("rev-basic-1.zip"), &url),
+            "rev-basic-1.zip"
+        );
+        // No placeholder: the UUID name is still better than nothing.
+        assert_eq!(choose_filename(Some(uuid.clone()), None, &url), uuid);
+    }
+
+    #[test]
+    fn csrf_failure_body_is_detected() {
+        assert!(is_csrf_failure(
+            r#"{"detail":"CSRF Failed: CSRF token missing."}"#
+        ));
+        assert!(!is_csrf_failure(
+            r#"{"detail":"You do not have permission to perform this action."}"#
+        ));
+        assert!(!is_csrf_failure("not json"));
+    }
+
+    #[test]
+    fn bare_json_string_is_the_download_url() {
+        let body = serde_json::json!("https://cdn.example.com/signed/rev-basic-1.zip?sig=abc");
+        assert_eq!(
+            file_refs_from_json(&body).unwrap(),
+            vec![FileRef {
+                url: "https://cdn.example.com/signed/rev-basic-1.zip?sig=abc".to_string(),
+                name: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_json_string_is_provider_changed() {
+        let body = serde_json::json!("");
+        assert!(matches!(
+            file_refs_from_json(&body),
+            Err(WargameError::ProviderChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn object_with_url_field_still_accepted() {
+        let body = serde_json::json!({"url": "https://x/a.zip"});
+        assert_eq!(
+            file_refs_from_json(&body).unwrap()[0].url,
+            "https://x/a.zip"
+        );
+    }
+
+    #[test]
+    fn files_array_keeps_names_and_skips_bad_items() {
+        let body = serde_json::json!({"files": [
+            {"url": "https://x/a.zip", "name": "a.zip"},
+            {"nope": 1},
+            {"file": "https://x/b.zip", "filename": "b.zip"}
+        ]});
+        let refs = file_refs_from_json(&body).unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].name.as_deref(), Some("a.zip"));
+        assert_eq!(refs[1].url, "https://x/b.zip");
+    }
+
+    #[test]
+    fn unknown_object_is_provider_changed() {
+        let body = serde_json::json!({"detail": "ok"});
+        assert!(matches!(
+            file_refs_from_json(&body),
+            Err(WargameError::ProviderChanged { .. })
+        ));
     }
 }

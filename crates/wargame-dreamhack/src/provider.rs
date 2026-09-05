@@ -108,6 +108,7 @@ impl WargameProvider for DreamhackProvider {
             &self.jar,
             &self.cfg.base_url,
             &challenge_id,
+            Some(a.filename.as_str()),
             sink,
         )
         .await

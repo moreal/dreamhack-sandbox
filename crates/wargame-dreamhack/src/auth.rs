@@ -10,7 +10,7 @@ use url::Url;
 use wargame_core::error::{Result, WargameError};
 use wargame_core::ports::{CredentialStore, Secret};
 
-use crate::client::{cookie_value, persist_jar};
+use crate::client::{csrf_token, persist_jar};
 
 const PROVIDER: &str = "dreamhack";
 
@@ -31,7 +31,7 @@ pub async fn login(
     let login_url = base
         .join("/api/v1/auth/login/")
         .map_err(|e| unavailable(e.to_string()))?;
-    let csrf = cookie_value(jar, base, "csrftoken");
+    let csrf = csrf_token(jar, base);
 
     let mut req = client
         .post(login_url)
