@@ -56,6 +56,12 @@ impl TartProvider {
         format!("{}{session_id}", self.cfg.vm_prefix)
     }
 
+    /// The configured boot timeout (used for `wait_ip`/`wait_ready` waits by
+    /// callers outside this module, e.g. [`crate::build::ProfileImageBuilder`]).
+    pub fn boot_timeout(&self) -> Duration {
+        self.cfg.boot_timeout
+    }
+
     fn cmd(&self, args: Vec<String>) -> Cmd {
         Cmd::new(self.cfg.binary.clone(), args)
     }
