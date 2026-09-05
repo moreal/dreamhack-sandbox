@@ -216,10 +216,12 @@ mod tests {
     #[tokio::test]
     async fn wait_ready_times_out() {
         let runner = Arc::new(FakeRunner::new());
-        runner.set_responder(|_| crate::infra::process::Output {
-            status: 255,
-            stdout: String::new(),
-            stderr: String::new(),
+        runner.set_responder(|_| {
+            Ok(crate::infra::process::Output {
+                status: 255,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
         });
         let transport =
             SshGuestTransport::new(runner.clone(), "admin", PathBuf::from("/keys/id_ed25519"));

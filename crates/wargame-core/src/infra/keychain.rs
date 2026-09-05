@@ -223,10 +223,12 @@ mod tests {
     #[test]
     fn keychain_get_uses_find_generic_password_argv_only() {
         let runner = Arc::new(FakeRunner::new());
-        runner.set_responder(|_| Output {
-            status: 0,
-            stdout: "s3cr3t\n".to_string(),
-            stderr: String::new(),
+        runner.set_responder(|_| {
+            Ok(Output {
+                status: 0,
+                stdout: "s3cr3t\n".to_string(),
+                stderr: String::new(),
+            })
         });
         let store = KeychainStore::new(runner.clone());
 
@@ -243,10 +245,12 @@ mod tests {
     #[test]
     fn keychain_get_missing_returns_none() {
         let runner = Arc::new(FakeRunner::new());
-        runner.set_responder(|_| Output {
-            status: 44,
-            stdout: String::new(),
-            stderr: "not found".to_string(),
+        runner.set_responder(|_| {
+            Ok(Output {
+                status: 44,
+                stdout: String::new(),
+                stderr: "not found".to_string(),
+            })
         });
         let store = KeychainStore::new(runner);
         assert!(store.get("missing").unwrap().is_none());

@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use crate::error::Result;
 use crate::infra::process::{Cmd, Output, ProcessRunner};
 
-type Responder = dyn Fn(&Cmd) -> Output + Send + Sync;
+type Responder = dyn Fn(&Cmd) -> Result<Output> + Send + Sync;
 
 pub struct FakeRunner {
     calls: Mutex<Vec<Cmd>>,
@@ -52,9 +52,30 @@ impl FakeRunner {
         self.responses.lock().unwrap().push(out);
     }
 
+    /// Queues a successful (`status: 0`) response with the given stdout.
+    pub fn push_success(&self, stdout: impl Into<String>) {
+        self.push_response(Output {
+            status: 0,
+            stdout: stdout.into(),
+            stderr: String::new(),
+        });
+    }
+
+    /// Queues a failing response with the given status and stderr.
+    pub fn push_failure(&self, status: i32, stderr: impl Into<String>) {
+        self.push_response(Output {
+            status,
+            stdout: String::new(),
+            stderr: stderr.into(),
+        });
+    }
+
     /// Installs a function that computes the response for every `run()`
     /// call from its `Cmd`. Overrides the queue set by [`Self::push_response`].
-    pub fn set_responder(&self, f: impl Fn(&Cmd) -> Output + Send + Sync + 'static) {
+    pub fn set_responder(
+        &self,
+        f: impl Fn(&Cmd) -> Result<Output> + Send + Sync + 'static,
+    ) {
         *self.responder.lock().unwrap() = Some(Box::new(f));
     }
 
@@ -83,7 +104,7 @@ impl ProcessRunner for FakeRunner {
     async fn run(&self, cmd: &Cmd) -> Result<Output> {
         self.calls.lock().unwrap().push(cmd.clone());
         if let Some(f) = self.responder.lock().unwrap().as_ref() {
-            return Ok(f(cmd));
+            return f(cmd);
         }
         let mut responses = self.responses.lock().unwrap();
         if !responses.is_empty() {
@@ -171,5 +192,21 @@ mod tests {
             runner.which("tart"),
             Some(PathBuf::from("/usr/local/bin/tart"))
         );
+    }
+
+    #[tokio::test]
+    async fn push_success_and_failure_helpers() {
+        let runner = FakeRunner::new();
+        runner.push_success("ok");
+        runner.push_failure(1, "bad");
+
+        let cmd = Cmd::new("tart", vec!["list".to_string()]);
+        let first = runner.run(&cmd).await.unwrap();
+        let second = runner.run(&cmd).await.unwrap();
+
+        assert_eq!(first.status, 0);
+        assert_eq!(first.stdout, "ok");
+        assert_eq!(second.status, 1);
+        assert_eq!(second.stderr, "bad");
     }
 }
