@@ -1,6 +1,6 @@
 # Next steps (handoff for a fresh session)
 
-State on 2026-09-05: the MVP is complete on branch `feat/mvp` and verified on real Tart VMs.
+State on 2026-09-06: the MVP is complete, merged to `main` (fast-forward from `feat/mvp`), and verified on real Tart VMs.
 Read, in order: `docs/verification.md` (what works, what was not tested live), `DESIGN.md`
 (architecture and verified external facts), `PLAN.md` (task map), `README.md` (user guide).
 
@@ -13,9 +13,9 @@ nix develop -c scripts/e2e-smoke.sh macos-minimal-arm64   # real VM, needs the b
 
 ## Open items, in suggested order
 
-1. **Merge** `feat/mvp` into `main` (25 commits; `main` only has docs + scaffold).
+1. ~~Merge~~ — done 2026-09-06: `main` fast-forwarded to `feat/mvp` (28 commits), `nix flake check` green on `main`.
 2. ~~Real Dreamhack run~~ — done 2026-09-06 with `dreamhack:15` (see `docs/verification.md`); three
-   adapter fixes (bare-string response, `csrf_token` cookie, UUID filename) are in the working tree.
+   adapter fixes (bare-string response, `csrf_token` cookie, UUID filename) are committed (`dfc42c5`).
    `wargame auth login` must run in a real terminal (the password prompt needs a TTY).
 3. **Reversing image**: `wargame profile build macos-re-arm64` (Ghidra, LLVM; slow, uses NAT).
 4. **Isolated networking**: add the Softnet sudoers rule printed by `wargame doctor`, then confirm
