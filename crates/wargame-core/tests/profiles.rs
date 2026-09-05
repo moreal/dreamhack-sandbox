@@ -29,6 +29,16 @@ fn macos_re_arm64_parses() {
         profile.provision.scripts,
         vec!["scripts/macos/common.sh", "scripts/macos/reversing.sh"]
     );
-    assert_eq!(profile.tools.verify.len(), 3);
+    assert!(profile.tools.verify.len() >= 3);
+    assert!(profile
+        .tools
+        .verify
+        .iter()
+        .any(|cmd| cmd.contains("ghidraRun")));
+    assert!(profile
+        .tools
+        .verify
+        .iter()
+        .any(|cmd| cmd.contains("llvm-objdump")));
     assert_eq!(profile.image_name(), "wargame-profile-macos-re-arm64");
 }

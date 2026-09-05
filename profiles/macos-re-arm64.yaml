@@ -25,10 +25,17 @@ provision:
     - scripts/macos/reversing.sh
 
 tools:
+  # Each entry is split on whitespace and run as one argv over SSH (no shell,
+  # so no pipes or redirections). PATH comes from the guest's ~/.zshenv.
   verify:
     - python3 --version
     - uv --version
     - test -x /opt/homebrew/bin/ghidraRun
+    - java -version
+    - which analyzeHeadless
+    - llvm-objdump --version
+    - which lld
+    - hexyl --version
 
 workspace:
   root: /Users/admin/wargame

@@ -39,6 +39,32 @@ use crate::profiles_builtin;
 /// user (DESIGN.md §6).
 const DEFAULT_GUEST_USER: &str = "admin";
 
+/// Writes the built-in profile YAMLs to `$WARGAME_HOME/profiles/`, where
+/// [`ProfileStore`] treats them as user overrides of the embedded set.
+///
+/// A copy the user has edited is theirs and is never touched. A copy that
+/// still equals what the previous binary seeded (kept as a pristine copy
+/// under `profiles/.builtin/`) is replaced, so an unedited profile follows
+/// the binary instead of being frozen at whatever version first ran.
+fn seed_builtin_profile_yamls(dirs: &AppDirs) -> Result<()> {
+    let pristine_dir = dirs.profiles_dir().join(".builtin");
+    std::fs::create_dir_all(&pristine_dir)?;
+    for (filename, content) in profiles_builtin::builtin_profile_yamls() {
+        let dest = dirs.profiles_dir().join(filename);
+        let pristine = pristine_dir.join(filename);
+        let current = std::fs::read_to_string(&dest).ok();
+        let last_seeded = std::fs::read_to_string(&pristine).ok();
+        let unedited = current.is_none() || current == last_seeded;
+        if unedited && current.as_deref() != Some(content) {
+            std::fs::write(&dest, content)?;
+        }
+        if last_seeded.as_deref() != Some(content) {
+            std::fs::write(&pristine, content)?;
+        }
+    }
+    Ok(())
+}
+
 /// Builds the one [`AppContext`] a CLI invocation runs through: resolves
 /// `$WARGAME_HOME` (or `--home`), makes sure its subdirectories and the
 /// built-in profile YAMLs exist, loads config, and wires a provider/VM
@@ -54,12 +80,7 @@ pub fn build_context(
     };
     dirs.ensure_layout()?;
 
-    for (filename, content) in profiles_builtin::builtin_profile_yamls() {
-        let dest = dirs.profiles_dir().join(filename);
-        if !dest.exists() {
-            std::fs::write(&dest, content)?;
-        }
-    }
+    seed_builtin_profile_yamls(&dirs)?;
     // Unlike the YAMLs, the built-in scripts are overwritten every run: they
     // are part of the tool, not user configuration, and a stale copy would
     // silently build images with an older provisioning recipe. Users add
@@ -285,6 +306,32 @@ mod tests {
         assert!(home.join("profiles/macos-re-arm64.yaml").is_file());
         std::env::remove_var("WARGAME_PROVIDER");
         std::env::remove_var("WARGAME_VM");
+    }
+
+    #[test]
+    fn unedited_builtin_yaml_follows_the_binary_but_an_edited_one_is_kept() {
+        let home = tmp_home();
+        let dirs = AppDirs { root: home.clone() };
+        dirs.ensure_layout().unwrap();
+        let yaml = home.join("profiles/macos-re-arm64.yaml");
+        let (_, current) = profiles_builtin::builtin_profile_yamls()[1];
+
+        // Simulate an older binary having seeded a different version.
+        std::fs::write(&yaml, "old: version\n").unwrap();
+        std::fs::create_dir_all(home.join("profiles/.builtin")).unwrap();
+        std::fs::write(
+            home.join("profiles/.builtin/macos-re-arm64.yaml"),
+            "old: version\n",
+        )
+        .unwrap();
+        seed_builtin_profile_yamls(&dirs).unwrap();
+        assert_eq!(std::fs::read_to_string(&yaml).unwrap(), current);
+
+        // The user edits it: the edit survives later runs.
+        let edited = format!("{current}# edited by user\n");
+        std::fs::write(&yaml, &edited).unwrap();
+        seed_builtin_profile_yamls(&dirs).unwrap();
+        assert_eq!(std::fs::read_to_string(&yaml).unwrap(), edited);
     }
 
     #[test]
