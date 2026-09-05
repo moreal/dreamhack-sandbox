@@ -53,11 +53,12 @@
 | Search | `GET /api/v1/wargame/challenges/?search=<q>&page=<n>&page_size=<k>[&category=<c>]` → `{count, next, previous, results[]}` | none | yes |
 | Detail | `GET /api/v1/wargame/challenges/<id>/` → `{id, title, description(markdown), tags[], tier_display, needs_vm, repository, ...}` | none | yes |
 | Login | `POST /api/v1/auth/login/` body `{"email","password"}`; `WWW-Authenticate: Session`; 401 on failure | none | yes (failure path) |
-| Download | `POST /api/v1/wargame/challenges/<id>/download/` → 401 without credentials | session cookie + `X-CSRFToken` + `Referer` | route verified, success shape **not** verified |
+| Download | `POST /api/v1/wargame/challenges/<id>/download/` (no body) → 200 JSON body that is a **bare string** holding a presigned DigitalOcean Spaces URL (`sfo2.digitaloceanspaces.com/wargame1/public/<uuid>.zip?X-Amz-…`); the object answers with `Content-Disposition: attachment; filename="<uuid>.zip"`. 401 without a session; 403 `{"detail":"CSRF Failed: …"}` without the token | `sessionid` cookie + `X-CSRFToken` (value of the **`csrf_token`** cookie, not Django's default `csrftoken`) + `Referer` | yes, live on 2026-09-06 (rev-basic-1) |
 
-Because the download success shape is unverified, the adapter accepts two shapes and fails with `ProviderChanged` otherwise:
-1. JSON body containing a URL field (`url`, `file`, `download_url`, or `files[0].url`) → follow with GET, raw bytes.
-2. Binary body with `Content-Disposition: attachment; filename=...` → raw bytes directly.
+The adapter accepts these shapes and fails with `ProviderChanged` otherwise:
+1. JSON body that is a bare string URL (the live Dreamhack shape) → follow with GET, raw bytes. Filename: server `Content-Disposition`, unless its stem is a bare UUID, in which case the asset placeholder `<repository>.zip` is used when the extension matches; else the URL's last path segment.
+2. JSON object containing a URL field (`url`, `file`, `download_url`, or `files[]{url|file, name|filename}`) → same, defensive fallback.
+3. Binary body with `Content-Disposition: attachment; filename=...` → raw bytes directly.
 
 Public search/detail responses are stored as sanitized fixtures under `crates/wargame-dreamhack/fixtures/`.
 

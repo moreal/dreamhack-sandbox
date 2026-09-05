@@ -14,9 +14,9 @@ nix develop -c scripts/e2e-smoke.sh macos-minimal-arm64   # real VM, needs the b
 ## Open items, in suggested order
 
 1. **Merge** `feat/mvp` into `main` (25 commits; `main` only has docs + scaffold).
-2. **Real Dreamhack run**: `wargame auth login`, then `wargame launch dreamhack:<id> --profile macos-minimal-arm64 --network nat`.
-   The authenticated download response shape is unverified; if it differs, the adapter reports
-   `ProviderChanged` and the fix belongs in `crates/wargame-dreamhack/src/download.rs`.
+2. ~~Real Dreamhack run~~ — done 2026-09-06 with `dreamhack:15` (see `docs/verification.md`); three
+   adapter fixes (bare-string response, `csrf_token` cookie, UUID filename) are in the working tree.
+   `wargame auth login` must run in a real terminal (the password prompt needs a TTY).
 3. **Reversing image**: `wargame profile build macos-re-arm64` (Ghidra, LLVM; slow, uses NAT).
 4. **Isolated networking**: add the Softnet sudoers rule printed by `wargame doctor`, then confirm
    `wargame launch … --network isolated` boots and SSH still works over the host-only bridge.

@@ -1,4 +1,4 @@
-# Verification record — 2026-09-05
+# Verification record — 2026-09-05 / 2026-09-06
 
 Host: macOS 26.6.2, Apple Silicon, Tart 2.36.0 (via nixpkgs wrapper) / 2.32.1 (Homebrew), Determinate Nix 3.21.9.
 Branch: `feat/mvp`.
@@ -51,9 +51,25 @@ Branch: `feat/mvp`.
 4. Tart's `--net-host` runs Softnet, which needs root; without it the runner died instantly and launch waited the full 300 s → `doctor` check `network:isolated`, launch preflight refusal with remediation, and fail-fast when the runner exits during boot (`c61cb32`).
 5. `tart stop` force-kills after 30 s, losing the tail of the provisioning writes (python/uv missing from the image) → `sync` in the guest, `--timeout 180`, poll until stopped (`7e2a994`).
 
+## Real Dreamhack run — 2026-09-06
+
+`wargame auth login` (interactive, in a terminal), then `wargame launch dreamhack:15 --profile macos-minimal-arm64 --network nat --yes` (rev-basic-1, Bronze 4 reversing).
+
+| Step | Result |
+|---|---|
+| Download shape recon (no credentials) | Frontend API wrapper (`static.dreamhack.io/main/v2/js/2e5a94f.js`) does a bodiless `axios.post` and returns `response.data`; the challenge-page chunk (`ebda421.js`, found via the webpack chunk map in `f0efc1a.js`) assigns that value straight to `<a href>` and clicks it → the body is a bare JSON string URL |
+| First launch | ✗ `authentication required` at the download step although `auth status` showed a session: a curl replay returned `403 {"detail":"CSRF Failed: CSRF token missing."}` |
+| Second launch | ✓ Ready in 23 s: download 5255 B, SHA-256 `15c4ed7a…fc0eb`, boot, SSH, bootstrap; guest has `~/wargame/rev-basic-1/incoming/extracted/…/chall1.exe` (PE32+), but named `4482bbb1-…-d23253b84453.zip` |
+| Third launch | ✓ Ready in 23 s, asset staged and extracted as `rev-basic-1.zip` / `extracted/rev-basic-1/chall1.exe`; `stop`, `delete` clean, no `wg-` VM left |
+
+### Bugs found and fixed by the real Dreamhack run (uncommitted at the time of writing)
+
+6. The adapter treated the download response's top-level JSON string as `ProviderChanged`; only object shapes were accepted → `file_refs_from_json` accepts the bare string first, object/`files[]` shapes stay as fallbacks.
+7. Dreamhack's CSRF cookie is `csrf_token`, not Django's default `csrftoken`, so no `X-CSRFToken` was sent and the 403 was reported as "authentication required" → `client::csrf_token` tries `csrf_token` then `csrftoken` (login and download); a 403 whose body says `CSRF Failed` is now reported as `ProviderChanged` with the cookie names tried, so it cannot be mistaken for a missing login.
+8. Object storage names the file `<uuid>.zip` via `Content-Disposition` → `choose_filename` prefers the asset placeholder (`<repository>.zip`) over a UUID-stem name when the extensions match, so the guest sees `rev-basic-1.zip`.
+
 ## Not verified live
 
 - `wargame gui` (re-runs the VM with a Tart window) was only covered by unit tests; it would open a window on the host.
-- Dreamhack authenticated download: the route and the 401 path are verified; the success response shape is not, since no credentials were used. The adapter accepts a JSON-with-URL or a direct attachment and otherwise reports `ProviderChanged`.
 - `macos-re-arm64` (Ghidra) image build was not run; it uses the same builder with `reversing.sh` on top of the verified `common.sh`.
 - Isolated networking end to end, because it requires the sudoers rule on this host.
