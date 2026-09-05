@@ -238,18 +238,27 @@ fn default_scripts_dir(dirs: &AppDirs) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn tmp_home() -> PathBuf {
         tempfile::tempdir().unwrap().keep()
     }
 
+    // Both tests below mutate the same process-wide `WARGAME_PROVIDER`/
+    // `WARGAME_VM` env vars and unset them again once `build_context`
+    // returns. Without serializing that, cargo test's default
+    // multi-threaded harness can interleave them: one test's teardown can
+    // remove a var while the other is still inside `build_context`, which
+    // then falls through to the real Dreamhack/Keychain path instead of the
+    // fixture/fake one and fails (surfaced in `nix build`'s sandboxed
+    // checkPhase, whose PATH has no `/usr/bin/security` for `KeychainStore`
+    // to find). This lock makes the env-var-and-`build_context` section a
+    // single critical section instead.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn build_context_with_fixture_and_fake_env_needs_no_external_tools() {
-        // SAFETY: this test mutates process-wide env vars; wargame-cli's
-        // test binary runs each `#[test]` in its own OS thread by default,
-        // so this could race a parallel test that reads the same vars --
-        // none of this crate's other unit tests touch WARGAME_PROVIDER or
-        // WARGAME_VM, so in practice it does not.
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("WARGAME_PROVIDER", "fixture");
         std::env::set_var("WARGAME_VM", "fake");
         let ctx = build_context(false, None, Some(tmp_home())).unwrap();
@@ -262,6 +271,7 @@ mod tests {
 
     #[test]
     fn build_context_copies_builtin_profile_yamls_into_home() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("WARGAME_PROVIDER", "fixture");
         std::env::set_var("WARGAME_VM", "fake");
         let home = tmp_home();
