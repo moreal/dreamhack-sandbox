@@ -13,13 +13,30 @@ use crate::error::{Result, WargameError};
 
 /// A subprocess invocation: always `program` + argv, never an interpolated
 /// shell string.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// `stdin` is how secrets reach adapters like `security -i` without ever
+/// appearing in argv (DESIGN.md §3.6), so [`std::fmt::Debug`] is implemented
+/// by hand below to redact it -- a derived impl would print the raw script,
+/// undoing that protection the moment anyone logs `?cmd`.
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct Cmd {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub stdin: Option<Vec<u8>>,
     pub cwd: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Cmd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cmd")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("env", &self.env)
+            .field("stdin", &self.stdin.as_ref().map(|_| "<redacted>"))
+            .field("cwd", &self.cwd)
+            .finish()
+    }
 }
 
 impl Cmd {
@@ -211,5 +228,20 @@ mod tests {
     fn pid_alive_true_for_self() {
         let runner = RealRunner;
         assert!(runner.pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn debug_redacts_stdin_but_not_argv() {
+        let mut cmd = Cmd::new("security", vec!["-i"]);
+        cmd.stdin = Some(b"add-generic-password -w super-secret".to_vec());
+        let rendered = format!("{cmd:?}");
+        assert!(!rendered.contains("super-secret"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("security"));
+        assert!(rendered.contains("-i"));
+
+        // stdin: None must not be misrepresented as a redacted secret.
+        let cmd_no_stdin = Cmd::new("true", Vec::<String>::new());
+        assert!(!format!("{cmd_no_stdin:?}").contains("<redacted>"));
     }
 }

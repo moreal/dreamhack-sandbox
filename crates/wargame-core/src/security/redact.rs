@@ -18,6 +18,17 @@ use tracing_subscriber::EnvFilter;
 
 const REDACTED: &str = "<redacted>";
 
+/// Field names (DESIGN.md §3.6) whose *value* is always replaced wholesale,
+/// regardless of how it is formatted (Display, Debug-quoted, etc.), before
+/// the line is even assembled.
+const SENSITIVE_FIELD_NAMES: &[&str] = &[
+    "cookie",
+    "authorization",
+    "password",
+    "sessionid",
+    "csrftoken",
+];
+
 /// Masks secret-shaped substrings in `s`:
 /// - `sessionid=...`, `csrftoken=...`, `password=...` key/value pairs
 /// - `Bearer <token>` authorization schemes
@@ -53,6 +64,12 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
 /// Replaces every value that follows (case-insensitive) `key` with
 /// `<redacted>`, where the value ends at the first character matching `stop`
 /// (or at the end of the string).
+///
+/// If the value is quoted (`key"..."` or `key'...'`, as e.g. a Debug-rendered
+/// `&str` field would render), the quotes are preserved but the *entire*
+/// quoted body is treated as the value -- a quote character is deliberately
+/// excluded from `stop` handling here so a value like `"hunter2"` is not cut
+/// off at its own opening quote.
 fn redact_value_after(s: &str, key: &str, stop: impl Fn(char) -> bool + Copy) -> String {
     let mut result = String::new();
     let mut rest = s;
@@ -66,9 +83,27 @@ fn redact_value_after(s: &str, key: &str, stop: impl Fn(char) -> bool + Copy) ->
                 let value_start = idx + key.len();
                 result.push_str(&rest[..value_start]);
                 let value_rest = &rest[value_start..];
-                let end = value_rest.find(stop).unwrap_or(value_rest.len());
-                result.push_str(REDACTED);
-                rest = &value_rest[end..];
+                match value_rest.chars().next().filter(|&c| c == '"' || c == '\'') {
+                    Some(quote) => {
+                        let after_quote = &value_rest[quote.len_utf8()..];
+                        result.push(quote);
+                        result.push_str(REDACTED);
+                        match after_quote.find(quote) {
+                            Some(p) => {
+                                result.push(quote);
+                                rest = &value_rest[quote.len_utf8() + p + quote.len_utf8()..];
+                            }
+                            None => {
+                                rest = &value_rest[value_rest.len()..];
+                            }
+                        }
+                    }
+                    None => {
+                        let end = value_rest.find(stop).unwrap_or(value_rest.len());
+                        result.push_str(REDACTED);
+                        rest = &value_rest[end..];
+                    }
+                }
             }
         }
     }
@@ -149,14 +184,36 @@ struct RedactingVisitor {
     fields: Vec<(String, String)>,
 }
 
-impl Visit for RedactingVisitor {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let rendered = format!("{value:?}");
+impl RedactingVisitor {
+    /// Records `rendered` for `field`, masking it wholesale first if its name
+    /// is one of [`SENSITIVE_FIELD_NAMES`] (DESIGN.md §3.6) -- this runs
+    /// before any Debug-quoting or pattern matching, so a quoted secret value
+    /// can never leak past it.
+    fn record(&mut self, field: &Field, rendered: String) {
         if field.name() == "message" {
             self.message = rendered;
-        } else {
-            self.fields.push((field.name().to_string(), rendered));
+            return;
         }
+        let name = field.name();
+        let masked = SENSITIVE_FIELD_NAMES
+            .iter()
+            .any(|sensitive| name.eq_ignore_ascii_case(sensitive));
+        let value = if masked {
+            REDACTED.to_string()
+        } else {
+            rendered
+        };
+        self.fields.push((name.to_string(), value));
+    }
+}
+
+impl Visit for RedactingVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.record(field, value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.record(field, format!("{value:?}"));
     }
 }
 
@@ -282,5 +339,65 @@ mod tests {
         let log_path = dir.path().join("log.txt");
         init_tracing(true, Some(&log_path));
         tracing::info!(cookie = "sessionid=abc", "hello");
+    }
+
+    #[test]
+    fn masks_quoted_value_in_free_text() {
+        // A value can be quoted even outside a tracing field (e.g. copied
+        // from an HTTP request dump); the closing quote must not be treated
+        // as the end of the redacted run, and the value itself must vanish.
+        let out = redact(r#"login attempt password="hunter2""#);
+        assert!(!out.contains("hunter2"));
+        assert_eq!(out, r#"login attempt password="<redacted>""#);
+
+        let out = redact("session cookie sessionid='abc123XYZ' seen");
+        assert!(!out.contains("abc123XYZ"));
+        assert_eq!(out, "session cookie sessionid='<redacted>' seen");
+    }
+
+    /// Constructs a [`RedactingWriterLayer`] writing into an in-memory buffer
+    /// and returns `(subscriber, buffer)` so a test can drive real
+    /// `tracing::info!` calls through it and inspect exactly what would have
+    /// been written to disk.
+    fn layer_with_buffer() -> (
+        tracing_subscriber::layer::Layered<RedactingWriterLayer, tracing_subscriber::Registry>,
+        std::sync::Arc<Mutex<Vec<u8>>>,
+    ) {
+        struct SharedBuf(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl IoWrite for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let layer = RedactingWriterLayer {
+            writer: Mutex::new(Box::new(SharedBuf(buf.clone()))),
+        };
+        (tracing_subscriber::registry().with(layer), buf)
+    }
+
+    /// End-to-end regression test for the review finding: going through the
+    /// installed layer (not just calling [`redact`] directly), a Debug-quoted
+    /// `&str` field named `password`/`cookie`/etc. must never leak its value,
+    /// and the DESIGN §3.6 field-name masking must actually fire.
+    #[test]
+    fn layer_masks_sensitive_fields_end_to_end() {
+        let (subscriber, buf) = layer_with_buffer();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(password = "hunter2", "login attempt");
+            tracing::info!(sessionid = "abc", "session set");
+            tracing::info!(cookie = "flavor=choc; other=1", "cookie set");
+        });
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(!out.contains("hunter2"), "leaked password: {out}");
+        assert!(!out.contains("flavor=choc"), "leaked cookie: {out}");
+        assert!(out.contains("password=<redacted>"));
+        assert!(out.contains("sessionid=<redacted>"));
+        assert!(out.contains("cookie=<redacted>"));
     }
 }

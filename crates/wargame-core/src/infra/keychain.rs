@@ -11,10 +11,33 @@ use tracing::warn;
 
 use crate::error::{Result, WargameError};
 use crate::infra::process::{Cmd, Output, ProcessRunner};
-use crate::infra::ssh::shell_quote;
 use crate::ports::{CredentialStore, Secret};
 
 const SERVICE: &str = "wargame-vm";
+
+/// Quotes `s` as a single token for `security -i` stdin scripts.
+///
+/// `security -i` is *not* a POSIX shell: it has no close/reopen escaping
+/// inside single quotes (`'a'\''b'` is rejected as a usage error) and it
+/// drops a bare backslash inside single quotes (`'back\slash'` becomes
+/// `backslash`), so [`crate::infra::ssh::shell_quote`] is the wrong tool
+/// here even though it happens to work for values that contain neither `'`
+/// nor `\` (e.g. the JSON session payload this store actually persists,
+/// which is alphanumeric/`{}[]:,"` only). This instead always produces a
+/// double-quoted token with `\` and `"` backslash-escaped, which `security
+/// -i` accepts for arbitrary bytes.
+fn security_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
 
 /// Runs `fut` to completion regardless of whether we're already inside a
 /// tokio runtime, by handing it to a dedicated worker thread with its own
@@ -82,9 +105,9 @@ impl CredentialStore for KeychainStore {
     fn set(&self, key: &str, value: &Secret<String>) -> Result<()> {
         let script = format!(
             "add-generic-password -U -a {} -s {} -w {}\n",
-            shell_quote(key),
-            shell_quote(&self.service),
-            shell_quote(value.expose_secret()),
+            security_quote(key),
+            security_quote(&self.service),
+            security_quote(value.expose_secret()),
         );
         let cmd = Cmd {
             program: "security".to_string(),
@@ -106,8 +129,8 @@ impl CredentialStore for KeychainStore {
     fn delete(&self, key: &str) -> Result<()> {
         let script = format!(
             "delete-generic-password -a {} -s {}\n",
-            shell_quote(key),
-            shell_quote(&self.service),
+            security_quote(key),
+            security_quote(&self.service),
         );
         let cmd = Cmd {
             program: "security".to_string(),
@@ -261,6 +284,43 @@ mod tests {
         assert_eq!(calls[0].args, vec!["-i".to_string()]);
         let stdin = String::from_utf8(calls[0].stdin.clone().unwrap()).unwrap();
         assert!(stdin.starts_with("delete-generic-password -a"));
+    }
+
+    #[test]
+    fn security_quote_escapes_backslash_and_double_quote() {
+        assert_eq!(security_quote("plain"), "\"plain\"");
+        assert_eq!(
+            security_quote(r#"back\slash"#),
+            r#""back\\slash""#,
+            "a bare backslash must survive, unlike security -i's own single-quote handling"
+        );
+        assert_eq!(security_quote(r#"a"b"#), r#""a\"b""#);
+        // The DESIGN §3.6 payload: a JSON blob containing double quotes.
+        let json = r#"{"cookies":[{"name":"sessionid","value":"abc"}]}"#;
+        assert_eq!(
+            security_quote(json),
+            format!("\"{}\"", json.replace('\\', "\\\\").replace('"', "\\\""))
+        );
+        // A single quote (the character that breaks security -i's own
+        // close/reopen idiom) needs no special handling in a double-quoted
+        // token.
+        assert_eq!(security_quote("a'b"), "\"a'b\"");
+    }
+
+    #[test]
+    fn keychain_set_quotes_secret_for_security_i_not_a_posix_shell() {
+        let runner = Arc::new(FakeRunner::new());
+        let store = KeychainStore::new(runner.clone());
+
+        // A value containing a single quote and a backslash: `shell_quote`
+        // (POSIX shell escaping) would mis-round-trip this through
+        // `security -i`, which is not a POSIX shell.
+        let secret = Secret::new(Box::new(r#"a'b\c"d"#.to_string()));
+        store.set("dreamhack.session", &secret).unwrap();
+
+        let calls = runner.calls();
+        let stdin = String::from_utf8(calls[0].stdin.clone().unwrap()).unwrap();
+        assert!(stdin.contains(&security_quote(r#"a'b\c"d"#)));
     }
 
     #[test]
