@@ -105,8 +105,26 @@ The user installed the sudoers rule printed by `wargame doctor` (`moreal ALL=(ro
 
 No bugs found; the preflight/doctor/fail-fast work from `c61cb32` behaved as designed once the rule existed.
 
+## `wargame gui` — 2026-09-06
+
+`wargame launch dreamhack:15 --profile macos-re-arm64 --yes` (default `isolated` network) with the `nix build` binary, then `wargame gui <id>` and the lifecycle commands around it. The window itself was observed through Launch Services (`lsappinfo` lists `com.github.cirruslabs.tart`, pid of the new runner, type Foreground, "in front"), not by eye; the user was invited to watch it.
+
+| Step | Result |
+|---|---|
+| Launch | ✓ Ready in 36 s, guest IP `192.168.18.3`, headless runner `tart run … --no-graphics --net-host` |
+| `gui` on the Ready session | ✓ returned in 20 s: old runner gone, new `tart run … --net-host` without `--no-graphics`, Softnet re-escalated, Tart registered as a foreground app; record `ready → running`, same guest IP, `runner_pid` updated to the new runner; `tart list` shows the VM running |
+| SSH with the window open | ✓ guest key login, challenge file still under `~/wargame/rev-basic-1/incoming/extracted/rev-basic-1/`, no IPv4 default route, `curl https://dreamhack.io` cannot resolve (still isolated) |
+| Closing the window (quit the Tart app) | VM stopped cleanly in Tart (no `tart run`/`softnet` process, `tart list` says stopped) but the record stayed `running`; `stop` failed with `tart stop … failed: VM "…" is not running`, `resume` refused with `Running -> Running` (bug 13) |
+| After the fix | `sessions` reported `stopped` without any command touching the record; `resume` ✓ 12 s; `gui` ✓ 20 s |
+| `stop` with the window open | ✓ 4.4 s: window and runner gone, VM stopped, record `stopped` |
+| `gui` on the Stopped session | ✓ 14 s: window back, record `running`, SSH answers |
+| `delete --force` with the window open | ✓ 1.8 s: no `wg-` VM, no `tart run`/`softnet` process, no Tart app, `prune --dry-run` finds nothing |
+
+### Bug found and fixed by the `gui` run
+
+13. The VM can stop without going through the CLI (the Tart window is closed, the guest shuts down, the runner dies) and nothing reconciled the session record, so it stayed `running` and both `stop` (`tart stop` on a stopped VM) and `resume` (`Running -> Running`) failed; only `delete` worked → `lifecycle::reconcile` moves an up record to `Stopped` (and clears `runner_pid`) when the backend reports the VM stopped, and `sessions`/`inspect`/`stop`/`resume`/`ssh`/`gui` all go through it. `stop` on such a session is a no-op that returns the corrected record, and `gui` now accepts a `Stopped` session so the closed window can simply be reopened. A `Missing` VM is left alone (delete/prune territory). Six unit tests cover the drift cases.
+
 ## Not verified live
 
-- `wargame gui` (re-runs the VM with a Tart window) was only covered by unit tests; it would open a window on the host.
 - Ghidra's GUI (`ghidraRun`) inside the guest: only headless analysis was exercised over SSH.
 - `scripts/e2e-smoke.sh` with `WARGAME_SMOKE_NETWORK=isolated` (the manual run above covers the same path).

@@ -167,7 +167,7 @@ Ready|Running|Stopped|Failed → Deleting → Deleted
 Stopped → Booting (resume)
 ```
 
-`Ready` means bootstrap finished; the VM is up. `Running` is the same VM after a resume; both count as "up" for `ssh`/`gui`.
+`Ready` means bootstrap finished; the VM is up. `Running` is the same VM after a resume; both count as "up" for `ssh`/`gui`. The record can drift when the VM stops without going through the CLI (the `gui` window is closed, the guest shuts down, the runner dies): every lifecycle read (`sessions`, `inspect`, `stop`, `resume`, `ssh`, `gui`) first reconciles an "up" record against the backend and moves it to `Stopped` when the VM is reported stopped. A `Stopped` session may be `gui`-started directly.
 
 ### 3.3 Ports
 

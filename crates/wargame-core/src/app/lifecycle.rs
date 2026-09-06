@@ -14,11 +14,50 @@ use crate::ports::{StartOptions, VmStatus};
 use super::AppContext;
 
 pub async fn list_sessions(ctx: &AppContext) -> Result<Vec<Session>> {
-    ctx.repo.list().await
+    let mut sessions = Vec::new();
+    for session in ctx.repo.list().await? {
+        sessions.push(reconcile(ctx, session).await?);
+    }
+    Ok(sessions)
 }
 
 pub async fn inspect(ctx: &AppContext, id: &str) -> Result<Session> {
-    ctx.repo.load(id).await
+    let session = ctx.repo.load(id).await?;
+    reconcile(ctx, session).await
+}
+
+/// Brings a session record back in line with what the backend reports.
+///
+/// The VM can stop without going through us: the user closes the Tart
+/// window opened by `wargame gui`, shuts the guest down from inside, or
+/// the runner dies. The record would otherwise say `Ready`/`Running`
+/// forever, so `stop` fails ("VM is not running") and `resume` refuses
+/// (`Running -> Running`). When an up session's VM is reported `Stopped`,
+/// the record is moved to `Stopped` and saved. A `Missing` VM is a
+/// different problem (delete/prune territory) and is left alone, as is a
+/// backend that cannot answer.
+pub async fn reconcile(ctx: &AppContext, mut session: Session) -> Result<Session> {
+    if !session.state.is_up() {
+        return Ok(session);
+    }
+    let Some(vm_ref) = &session.vm_ref else {
+        return Ok(session);
+    };
+    if ctx.vm.status(vm_ref).await? != VmStatus::Stopped {
+        return Ok(session);
+    }
+    tracing::info!(
+        session = %session.id,
+        vm = %vm_ref.name,
+        "VM stopped outside of wargame; marking the session stopped"
+    );
+    if session.state == SessionState::Ready {
+        session.transition(SessionState::Running)?;
+    }
+    session.transition(SessionState::Stopped)?;
+    session.runner_pid = None;
+    ctx.repo.save(&session).await?;
+    Ok(session)
 }
 
 /// Stops a `Ready` or `Running` session's VM.
@@ -28,7 +67,14 @@ pub async fn inspect(ctx: &AppContext, id: &str) -> Result<Session> {
 /// Stopped`); a `Ready` session is therefore first (validly) advanced
 /// through `Running` before the final `-> Stopped` move.
 pub async fn stop(ctx: &AppContext, id: &str) -> Result<Session> {
-    let mut session = ctx.repo.load(id).await?;
+    let recorded = ctx.repo.load(id).await?;
+    let recorded_state = recorded.state;
+    let mut session = reconcile(ctx, recorded).await?;
+    if recorded_state.is_up() && session.state == SessionState::Stopped {
+        // The VM had already exited (e.g. the Tart window was closed);
+        // the record is now correct and there is nothing left to stop.
+        return Ok(session);
+    }
     if !session.state.is_up() {
         return Err(WargameError::InvalidTransition {
             from: session.state,
@@ -59,7 +105,8 @@ pub async fn stop(ctx: &AppContext, id: &str) -> Result<Session> {
 /// mode it was originally launched with, waits for a guest IP and for the
 /// guest transport to answer, then marks it `Running`.
 pub async fn resume(ctx: &AppContext, id: &str) -> Result<Session> {
-    let mut session = ctx.repo.load(id).await?;
+    let session = ctx.repo.load(id).await?;
+    let mut session = reconcile(ctx, session).await?;
     if session.state != SessionState::Stopped {
         return Err(WargameError::InvalidTransition {
             from: session.state,
@@ -233,6 +280,126 @@ mod tests {
         }
     }
 
+    /// Closing the Tart window (or any out-of-band VM exit) leaves a
+    /// `Ready`/`Running` record behind a VM that Tart reports stopped.
+    /// The lifecycle ops must reconcile that instead of failing.
+    fn drifted_fixture() -> Fixture {
+        fixture()
+    }
+
+    async fn drifted_session(f: &Fixture, id: &str) {
+        let vm_ref =
+            f.vm.create(&VmSpec {
+                name: format!("wg-{id}"),
+                image: ImageRef("img".to_string()),
+                resources: Resources {
+                    cpu: 1,
+                    memory_mib: 1024,
+                    disk_gib: 10,
+                },
+            })
+            .await
+            .unwrap();
+        let opts = StartOptions {
+            network: NetworkMode::Isolated,
+            headless: true,
+            log_path: tmp_path(),
+        };
+        f.vm.start(&vm_ref, &opts).await.unwrap();
+        let mut session = sample_session(id, SessionState::Running, KeepPolicy::Discard);
+        session.vm_ref = Some(vm_ref.clone());
+        session.runner_pid = Some(4242);
+        session.guest_ip = Some("10.0.0.9".parse().unwrap());
+        f.ctx.repo.save(&session).await.unwrap();
+        // The VM dies behind the record's back.
+        f.vm.stop(&vm_ref).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_reconciles_a_running_record_whose_vm_already_exited() {
+        let f = drifted_fixture();
+        drifted_session(&f, "s").await;
+        let before = f.vm.calls().iter().filter(|c| *c == "stop").count();
+
+        let stopped = stop(&f.ctx, "s").await.unwrap();
+        assert_eq!(stopped.state, SessionState::Stopped);
+        assert_eq!(stopped.runner_pid, None);
+        assert_eq!(
+            f.ctx.repo.load("s").await.unwrap().state,
+            SessionState::Stopped
+        );
+        let after = f.vm.calls().iter().filter(|c| *c == "stop").count();
+        assert_eq!(
+            after, before,
+            "must not ask the backend to stop a stopped VM"
+        );
+        assert!(
+            f.transport.calls().is_empty(),
+            "must not try to sync a guest that is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_reconciles_a_running_record_whose_vm_already_exited() {
+        let f = drifted_fixture();
+        drifted_session(&f, "s").await;
+
+        let resumed = resume(&f.ctx, "s").await.unwrap();
+        assert_eq!(resumed.state, SessionState::Running);
+        assert_eq!(
+            f.vm.status(resumed.vm_ref.as_ref().unwrap()).await.unwrap(),
+            VmStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn list_and_inspect_report_the_reconciled_state() {
+        let f = drifted_fixture();
+        drifted_session(&f, "s").await;
+
+        let listed = list_sessions(&f.ctx).await.unwrap();
+        assert_eq!(listed[0].state, SessionState::Stopped);
+        assert_eq!(
+            inspect(&f.ctx, "s").await.unwrap().state,
+            SessionState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_a_running_vm_alone() {
+        let f = drifted_fixture();
+        drifted_session(&f, "s").await;
+        let vm_ref = f.ctx.repo.load("s").await.unwrap().vm_ref.unwrap();
+        let opts = StartOptions {
+            network: NetworkMode::Isolated,
+            headless: true,
+            log_path: tmp_path(),
+        };
+        f.vm.start(&vm_ref, &opts).await.unwrap();
+
+        assert_eq!(
+            inspect(&f.ctx, "s").await.unwrap().state,
+            SessionState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_a_missing_vm_alone() {
+        // A missing VM is a different failure (prune/delete territory), not
+        // an out-of-band stop; do not rewrite the record.
+        let f = drifted_fixture();
+        let mut session = sample_session("s", SessionState::Running, KeepPolicy::Discard);
+        session.vm_ref = Some(crate::domain::VmRef {
+            backend: "fake".to_string(),
+            name: "wg-gone".to_string(),
+        });
+        f.ctx.repo.save(&session).await.unwrap();
+        assert_eq!(
+            inspect(&f.ctx, "s").await.unwrap().state,
+            SessionState::Running
+        );
+    }
+
     #[tokio::test]
     async fn stop_moves_ready_through_running_to_stopped() {
         let Fixture { ctx, vm, .. } = fixture();
@@ -248,6 +415,16 @@ mod tests {
             })
             .await
             .unwrap();
+        vm.start(
+            &vm_ref,
+            &StartOptions {
+                network: NetworkMode::Isolated,
+                headless: true,
+                log_path: tmp_path(),
+            },
+        )
+        .await
+        .unwrap();
         let mut session = sample_session("s", SessionState::Ready, KeepPolicy::Discard);
         session.vm_ref = Some(vm_ref);
         ctx.repo.save(&session).await.unwrap();
@@ -274,6 +451,16 @@ mod tests {
             })
             .await
             .unwrap();
+        vm.start(
+            &vm_ref,
+            &StartOptions {
+                network: NetworkMode::Isolated,
+                headless: true,
+                log_path: tmp_path(),
+            },
+        )
+        .await
+        .unwrap();
         let mut session = sample_session("s", SessionState::Ready, KeepPolicy::Discard);
         session.vm_ref = Some(vm_ref);
         let ip: std::net::IpAddr = "10.0.0.9".parse().unwrap();

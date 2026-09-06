@@ -23,7 +23,12 @@ nix develop -c scripts/e2e-smoke.sh macos-minimal-arm64   # real VM, needs the b
 4. ~~Isolated networking~~ — done 2026-09-06 after the user installed the Softnet sudoers rule:
    default `isolated` launch boots in 20 s, guest gets a host-only IP, SSH works, guest has no
    internet, stop/resume/delete clean (see `docs/verification.md`).
-5. **`wargame gui`**: try it once by hand; it re-runs the VM with a Tart window and has only unit tests.
+5. ~~`wargame gui`~~ — done 2026-09-06: window opens, SSH keeps working, `stop`/`delete` with the window open leave
+   nothing behind. Closing the window left the record stuck at `running` (bug 13, fixed: lifecycle ops now
+   reconcile the record with `tart list`; see `docs/verification.md`).
+
+All five items are done. The next milestone is open; candidates are multiple challenges per session, Linux
+guest profiles, and a `wargame flag` submit flow.
 
 ## Host facts that matter
 

@@ -8,6 +8,7 @@ use crate::domain::SessionState;
 use crate::error::{Result, WargameError};
 use crate::ports::{StartOptions, VmStatus};
 
+use super::lifecycle::reconcile;
 use super::AppContext;
 
 /// Builds (but does not spawn) the interactive `ssh` command for a session
@@ -15,6 +16,7 @@ use super::AppContext;
 /// `exec`s it so it replaces the current process (DESIGN.md §7).
 pub async fn ssh_command(ctx: &AppContext, id: &str) -> Result<std::process::Command> {
     let session = ctx.repo.load(id).await?;
+    let session = reconcile(ctx, session).await?;
     if !session.state.is_up() {
         return Err(WargameError::InvalidTransition {
             from: session.state,
@@ -30,10 +32,12 @@ pub async fn ssh_command(ctx: &AppContext, id: &str) -> Result<std::process::Com
 /// Reopens a session's VM with a graphical console (DESIGN.md §5's
 /// "delegate to Tart" decision): stops the current (headless) run if it is
 /// active, restarts it with a window, and waits for the guest to answer
-/// again before returning.
+/// again before returning. A `Stopped` session (including one whose Tart
+/// window was closed, which stops the VM) is simply started with a window.
 pub async fn open_gui(ctx: &AppContext, id: &str) -> Result<()> {
-    let mut session = ctx.repo.load(id).await?;
-    if !session.state.is_up() {
+    let session = ctx.repo.load(id).await?;
+    let mut session = reconcile(ctx, session).await?;
+    if !session.state.is_up() && session.state != SessionState::Stopped {
         return Err(WargameError::InvalidTransition {
             from: session.state,
             to: SessionState::Running,
@@ -61,7 +65,7 @@ pub async fn open_gui(ctx: &AppContext, id: &str) -> Result<()> {
     session.guest_ip = Some(ip);
     ctx.transport.wait_ready(ip, boot_timeout).await?;
 
-    if session.state == SessionState::Ready {
+    if session.state != SessionState::Running {
         session.transition(SessionState::Running)?;
     }
     ctx.repo.save(&session).await?;
@@ -198,5 +202,65 @@ mod tests {
         let after = ctx.repo.load("s").await.unwrap();
         assert_eq!(after.state, SessionState::Running);
         assert!(after.guest_ip.is_some());
+    }
+
+    #[tokio::test]
+    async fn ssh_command_refuses_when_the_vm_exited_behind_a_running_record() {
+        let (ctx, vm) = fixture();
+        let vm_ref = vm
+            .create(&VmSpec {
+                name: "wg-s".to_string(),
+                image: ImageRef("img".to_string()),
+                resources: Resources {
+                    cpu: 1,
+                    memory_mib: 1024,
+                    disk_gib: 10,
+                },
+            })
+            .await
+            .unwrap();
+        let mut session = sample_session("s", SessionState::Running);
+        session.vm_ref = Some(vm_ref);
+        session.guest_ip = Some(IpAddr::from_str("10.0.0.9").unwrap());
+        ctx.repo.save(&session).await.unwrap();
+
+        assert!(matches!(
+            ssh_command(&ctx, "s").await.unwrap_err(),
+            WargameError::InvalidTransition {
+                from: SessionState::Stopped,
+                ..
+            }
+        ));
+        assert_eq!(
+            ctx.repo.load("s").await.unwrap().state,
+            SessionState::Stopped
+        );
+    }
+
+    /// After the user closes the Tart window the record is reconciled to
+    /// `Stopped`; `gui` must still be able to bring the VM back with a window.
+    #[tokio::test]
+    async fn open_gui_starts_a_stopped_session_with_a_window() {
+        let (ctx, vm) = fixture();
+        let vm_ref = vm
+            .create(&VmSpec {
+                name: "wg-s".to_string(),
+                image: ImageRef("img".to_string()),
+                resources: Resources {
+                    cpu: 1,
+                    memory_mib: 1024,
+                    disk_gib: 10,
+                },
+            })
+            .await
+            .unwrap();
+        let mut session = sample_session("s", SessionState::Stopped);
+        session.vm_ref = Some(vm_ref.clone());
+        ctx.repo.save(&session).await.unwrap();
+
+        open_gui(&ctx, "s").await.unwrap();
+        let after = ctx.repo.load("s").await.unwrap();
+        assert_eq!(after.state, SessionState::Running);
+        assert_eq!(vm.status(&vm_ref).await.unwrap(), VmStatus::Running);
     }
 }
