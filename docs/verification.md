@@ -90,8 +90,23 @@ Branch: `feat/mvp`, merged fast-forward into `main` on 2026-09-06.
 11. Keg-only LLVM/binutils/openjdk and the separate `lld` formula were not on PATH; `reversing.sh` exports `JAVA_HOME` and the PATH additions into `~/.zshenv` + `~/.zprofile`, Temurin dropped (`829de02`).
 12. `tools.verify` entries are whitespace-split argv with no shell; the YAML documents it and uses `which`/`--version` checks only (`829de02`).
 
+## Isolated networking — 2026-09-06
+
+The user installed the sudoers rule printed by `wargame doctor` (`moreal ALL=(root) NOPASSWD: /opt/homebrew/bin/softnet`), then `wargame launch dreamhack:15 --profile macos-minimal-arm64 --yes` with the default `isolated` network.
+
+| Step | Result |
+|---|---|
+| `doctor` | `network:isolated` flipped from the sudoers hint to `ok` with no code change |
+| Launch | ✓ Ready in 20.0 s; guest IP `192.168.18.2` on the host-only bridge (NAT launches get `192.168.64.x`). Host shows `tart run … --net-host` and Softnet escalated via `sudo --non-interactive … /opt/homebrew/bin/softnet --vm-net-type host` and running as the user afterwards |
+| SSH + staging | ✓ `ssh admin@192.168.18.2` with the guest key; `chall1.exe` extracted under `~/wargame/rev-basic-1/incoming/extracted/rev-basic-1/` (download happened on the host, as designed) |
+| Guest isolation | ✓ no default route (`netstat -rn` has none); `dig dreamhack.io` fails; `curl https://dreamhack.io` → could not resolve; `curl http://1.1.1.1` → could not connect; `ping 8.8.8.8` 100 % loss; only the bridge gateway `192.168.18.1` answers |
+| `stop` / `resume` | ✓ stop 0.7 s, resume 9.4 s, same guest IP; SSH works and the guest is still cut off after the resume |
+| `delete --force` | ✓ no `wg-` VM, no `tart run`/`softnet` process left |
+
+No bugs found; the preflight/doctor/fail-fast work from `c61cb32` behaved as designed once the rule existed.
+
 ## Not verified live
 
 - `wargame gui` (re-runs the VM with a Tart window) was only covered by unit tests; it would open a window on the host.
 - Ghidra's GUI (`ghidraRun`) inside the guest: only headless analysis was exercised over SSH.
-- Isolated networking end to end, because it requires the sudoers rule on this host.
+- `scripts/e2e-smoke.sh` with `WARGAME_SMOKE_NETWORK=isolated` (the manual run above covers the same path).

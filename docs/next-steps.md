@@ -20,13 +20,15 @@ nix develop -c scripts/e2e-smoke.sh macos-minimal-arm64   # real VM, needs the b
 3. ~~Reversing image~~ — done 2026-09-06: `wargame-profile-macos-re-arm64` built (≈2.7 min, 60 GiB disk),
    `dreamhack:15` launched into it, Ghidra headless + LLVM toolchain verified on PATH (see
    `docs/verification.md`, bugs 9–12 fixed in `083dc66`, `829de02`).
-4. **Isolated networking**: add the Softnet sudoers rule printed by `wargame doctor`, then confirm
-   `wargame launch … --network isolated` boots and SSH still works over the host-only bridge.
+4. ~~Isolated networking~~ — done 2026-09-06 after the user installed the Softnet sudoers rule:
+   default `isolated` launch boots in 20 s, guest gets a host-only IP, SSH works, guest has no
+   internet, stop/resume/delete clean (see `docs/verification.md`).
 5. **`wargame gui`**: try it once by hand; it re-runs the VM with a Tart window and has only unit tests.
 
 ## Host facts that matter
 
-- Passwordless sudo is not configured, so isolated mode is refused in preflight until step 4.
+- `/etc/sudoers.d/wargame-softnet` grants passwordless sudo for `/opt/homebrew/bin/softnet` only, so the
+  default isolated network works on this host; `doctor` reports `network:isolated ok`.
 - The profile images `wargame-profile-macos-minimal-arm64` and `wargame-profile-macos-re-arm64` and
   the guest SSH key live under `~/Library/Application Support/wargame-vm`; a fresh `WARGAME_HOME`
   will not have that key.
