@@ -1,0 +1,2 @@
+6dbefacc95e3b556c19c48e8bae39b8b505e2d3a1aba0bfb7ab62b036c3d2ba3  kali-linux-2026.2-installer-amd64.iso
+b9a08050ee522fbee7cac703b1bc48178f79eb974c962d4ed9dc1ccfdfa77fb6  kali-linux-2026.2-installer-arm64.iso

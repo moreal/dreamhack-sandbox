@@ -1,0 +1,5 @@
+UUID                                 Status   Name
+A8E9F979-A198-433A-B2DE-74A6D7302D2F stopped  wargame-t1-x86
+76A0BFAA-5F03-40F2-AA43-E4EE792ABC28 stopped  wargame-t1-kali-arm64
+99526A6E-D02E-405B-9931-256E2466F640 stopped  wargame-t1-kali-amd64
+AE4AC721-7F87-431F-A7D0-795C91939BD6 stopped  wargame-t1 한글 이름 vm

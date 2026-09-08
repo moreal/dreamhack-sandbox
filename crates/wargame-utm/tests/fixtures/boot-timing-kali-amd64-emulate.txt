@@ -1,0 +1,8 @@
+[    6.16s] utmctl start exit=0 stdout='' stderr=''
+[    6.35s] status=started
+[    6.67s] serial=/dev/ttys010
+[   21.28s] first serial byte
+[   21.28s] saw firmware
+[   31.04s] saw grub
+[   31.04s] saw installer
+[  420.33s] captured 1170 bytes -> serial-amd64-boot.bin

@@ -1,0 +1,1 @@
+136:169: execution error: UTM got an error: The virtual machine must be stopped before this operation can be performed. (-2700)

@@ -1,0 +1,2 @@
+WARNING: attach command is not implemented yet!
+PTTY: /dev/ttys010

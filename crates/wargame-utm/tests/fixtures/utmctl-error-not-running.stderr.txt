@@ -1,0 +1,2 @@
+Error from event: The operation couldn’t be completed. (OSStatus error -2700.)
+The virtual machine is not running.

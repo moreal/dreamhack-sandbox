@@ -1,0 +1,11 @@
+	<key>CFBundleIdentifier</key>
+	<string>com.utmapp.UTM</string>
+--
+	<key>CFBundleShortVersionString</key>
+	<string>4.7.5</string>
+--
+	<key>CFBundleVersion</key>
+	<string>118</string>
+--
+	<key>LSMinimumSystemVersion</key>
+	<string>11.3</string>

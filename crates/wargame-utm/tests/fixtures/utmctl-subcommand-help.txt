@@ -1,0 +1,352 @@
+##### utmctl version --help
+OVERVIEW: Display the version number of the application.
+
+USAGE: utmctl version [--debug] [--hide]
+
+OPTIONS:
+  -d, --debug             Show debug logging.
+  --hide                  Hide the main UTM window.
+  -h, --help              Show help information.
+
+##### exit=0
+
+##### utmctl list --help
+OVERVIEW: Enumerate all registered virtual machines.
+
+USAGE: utmctl list [--debug] [--hide]
+
+OPTIONS:
+  -d, --debug             Show debug logging.
+  --hide                  Hide the main UTM window.
+  -h, --help              Show help information.
+
+##### exit=0
+
+##### utmctl status --help
+OVERVIEW: Query the status of a virtual machine.
+
+USAGE: utmctl status [--debug] [--hide] <identifier>
+
+ARGUMENTS:
+  <identifier>            Either the UUID or the complete name of the virtual
+                          machine.
+
+OPTIONS:
+  -d, --debug             Show debug logging.
+  --hide                  Hide the main UTM window.
+  -h, --help              Show help information.
+
+##### exit=0
+
+##### utmctl start --help
+OVERVIEW: Start a virtual machine or resume a suspended virtual machine.
+
+USAGE: utmctl start [--debug] [--hide] <identifier> [--attach] [--disposable] [--recovery]
+
+ARGUMENTS:
+  <identifier>            Either the UUID or the complete name of the virtual
+                          machine.
+
+OPTIONS:
+  -d, --debug             Show debug logging.
+  --hide                  Hide the main UTM window.
+  -a, --attach            Attach to the first serial port after start.
+  --disposable            Run VM as a snapshot and do not save changes to disk.
+  --recovery              Boot a VM in recovery mode.
+  -h, --help              Show help information.
+
+##### exit=0
+
+##### utmctl suspend --help
+OVERVIEW: Suspend running a virtual machine to memory.
+
+USAGE: utmctl suspend [--debug] [--hide] <identifier> [--save-state]
+
+ARGUMENTS:
+  <identifier>            Either the UUID or the complete name of the virtual
+                          machine.
+
+OPTIONS:
+  -d, --debug             Show debug logging.
+  --hide                  Hide the main UTM window.
+  -s, --save-state        Save the VM state to disk after suspending.
+  -h, --help              Show help information.
+
+##### exit=0
+
+##### utmctl stop --help
+OVERVIEW: Shuts down a running virtual machine.
+
+USAGE: utmctl stop [--debug] [--hide] <identifier> [--force] [--kill] [--request]
+
+ARGUMENTS:
+  <identifier>            Either the UUID or the complete name of the virtual
+                          machine.
+
+OPTIONS:
+  -d, --debug             Show debug logging.
+  --hide                  Hide the main UTM window.
+  --force                 Force stop by sending a power off event (default)
+  --kill                  Force kill the VM process
+  --request               Request power down from guest operating system
+  -h, --help              Show help information.
+
+##### exit=0
+
+##### utmctl attach --help
+OVERVIEW: Redirect the serial input/output to this terminal.
+
+USAGE: utmctl attach [--debug] [--hide] <identifier> [--index <index>]
+
+ARGUMENTS:
+  <identifier>            Either the UUID or the complete name of the virtual
+                          machine.
+
+OPTIONS:
+  -d, --debug             Show debug logging.
+  --hide                  Hide the main UTM window.
+  --index <index>         Index of the serial device to attach to.
+  -h, --help              Show help information.
+
+##### exit=0
+
+##### utmctl file --help
+OVERVIEW: Guest agent file operations.
+
+USAGE: utmctl file <subcommand>
+
+OPTIONS:
+  -h, --help              Show help information.
+
+SUBCOMMANDS:
+  pull                    Fetches a file from the guest and output it to stdout.
+  push                    Uploads the contents of stdin to the guest.
+
+  See 'utmctl help file <subcommand>' for detailed help.
+##### exit=0
+
+##### utmctl exec --help
+OVERVIEW: Execute an application on the guest.
+
+The return value of the command will be returned from this tool.
+
+USAGE: utmctl exec [--debug] [--hide] <identifier> [--input] [--env <env> ...] --cmd <cmd> ...
+
+ARGUMENTS:
+  <identifier>            Either the UUID or the complete name of the virtual
+                          machine.
+
+OPTIONS:
+  -d, --debug             Show debug logging.
+  --hide                  Hide the main UTM window.
+  --input                 Read in standard input and forward it to the guest.
+  --env <env>             Set a single environment variable in the format
+                          NAME=VALUE
+  --cmd <cmd>             Command line to execute on the guest.
+  -h, --help              Show help information.
+
+##### exit=0
+
+##### utmctl ip-address --help
+OVERVIEW: List all IP addresses associated with network interfaces on the
+guest.
+
+IPv4 addresses (if available) will be listed before any IPv6 address.
+
+USAGE: utmctl ip-address [--debug] [--hide] <identifier>
+
+ARGUMENTS:
+  <identifier>            Either the UUID or the complete name of the virtual
+                          machine.
+
+OPTIONS:
+  -d, --debug             Show debug logging.
+  --hide                  Hide the main UTM window.
+  -h, --help              Show help information.
+
+##### exit=0
+
+##### utmctl clone --help
+OVERVIEW: Clone an existing virtual machine.
+
+USAGE: utmctl clone [--debug] [--hide] <identifier> [--name <name>]
+
+ARGUMENTS:
+  <identifier>            Either the UUID or the complete name of the virtual
+                          machine.
+
+OPTIONS:
+  -d, --debug             Show debug logging.
+  --hide                  Hide the main UTM window.
+  --name <name>
+  -h, --help              Show help information.
+
+##### exit=0
+
+##### utmctl delete --help
+OVERVIEW: Delete a virtual machine (there is no confirmation).
+
+USAGE: utmctl delete [--debug] [--hide] <identifier>
+
+ARGUMENTS:
+  <identifier>            Either the UUID or the complete name of the virtual
+                          machine.
+
+OPTIONS:
+  -d, --debug             Show debug logging.
+  --hide                  Hide the main UTM window.
+  -h, --help              Show help information.
+
+##### exit=0
+
+##### utmctl usb --help
+OVERVIEW: USB device handling.
+
+USAGE: utmctl usb <subcommand>
+
+OPTIONS:
+  -h, --help              Show help information.
+
+SUBCOMMANDS:
+  list                    List connected devices.
+  connect                 Connect a USB device to a virtual machine.
+  disconnect              Disconnect a USB device from a virtual machine.
+
+  See 'utmctl help usb <subcommand>' for detailed help.
+##### exit=0
+
+##### utmctl file pull --help
+OVERVIEW: CLI tool for controlling UTM virtual machines.
+
+USAGE: utmctl <subcommand>
+
+OPTIONS:
+  -h, --help              Show help information.
+
+SUBCOMMANDS:
+  version                 Display the version number of the application.
+  list                    Enumerate all registered virtual machines.
+  status                  Query the status of a virtual machine.
+  start                   Start a virtual machine or resume a suspended virtual
+                          machine.
+  suspend                 Suspend running a virtual machine to memory.
+  stop                    Shuts down a running virtual machine.
+  attach                  Redirect the serial input/output to this terminal.
+  file                    Guest agent file operations.
+  exec                    Execute an application on the guest.
+  ip-address              List all IP addresses associated with network
+                          interfaces on the guest.
+  clone                   Clone an existing virtual machine.
+  delete                  Delete a virtual machine (there is no confirmation).
+  usb                     USB device handling.
+
+  See 'utmctl help <subcommand>' for detailed help.
+
+##### utmctl file push --help
+OVERVIEW: CLI tool for controlling UTM virtual machines.
+
+USAGE: utmctl <subcommand>
+
+OPTIONS:
+  -h, --help              Show help information.
+
+SUBCOMMANDS:
+  version                 Display the version number of the application.
+  list                    Enumerate all registered virtual machines.
+  status                  Query the status of a virtual machine.
+  start                   Start a virtual machine or resume a suspended virtual
+                          machine.
+  suspend                 Suspend running a virtual machine to memory.
+  stop                    Shuts down a running virtual machine.
+  attach                  Redirect the serial input/output to this terminal.
+  file                    Guest agent file operations.
+  exec                    Execute an application on the guest.
+  ip-address              List all IP addresses associated with network
+                          interfaces on the guest.
+  clone                   Clone an existing virtual machine.
+  delete                  Delete a virtual machine (there is no confirmation).
+  usb                     USB device handling.
+
+  See 'utmctl help <subcommand>' for detailed help.
+
+##### utmctl usb list --help
+OVERVIEW: CLI tool for controlling UTM virtual machines.
+
+USAGE: utmctl <subcommand>
+
+OPTIONS:
+  -h, --help              Show help information.
+
+SUBCOMMANDS:
+  version                 Display the version number of the application.
+  list                    Enumerate all registered virtual machines.
+  status                  Query the status of a virtual machine.
+  start                   Start a virtual machine or resume a suspended virtual
+                          machine.
+  suspend                 Suspend running a virtual machine to memory.
+  stop                    Shuts down a running virtual machine.
+  attach                  Redirect the serial input/output to this terminal.
+  file                    Guest agent file operations.
+  exec                    Execute an application on the guest.
+  ip-address              List all IP addresses associated with network
+                          interfaces on the guest.
+  clone                   Clone an existing virtual machine.
+  delete                  Delete a virtual machine (there is no confirmation).
+  usb                     USB device handling.
+
+  See 'utmctl help <subcommand>' for detailed help.
+
+##### utmctl usb connect --help
+OVERVIEW: CLI tool for controlling UTM virtual machines.
+
+USAGE: utmctl <subcommand>
+
+OPTIONS:
+  -h, --help              Show help information.
+
+SUBCOMMANDS:
+  version                 Display the version number of the application.
+  list                    Enumerate all registered virtual machines.
+  status                  Query the status of a virtual machine.
+  start                   Start a virtual machine or resume a suspended virtual
+                          machine.
+  suspend                 Suspend running a virtual machine to memory.
+  stop                    Shuts down a running virtual machine.
+  attach                  Redirect the serial input/output to this terminal.
+  file                    Guest agent file operations.
+  exec                    Execute an application on the guest.
+  ip-address              List all IP addresses associated with network
+                          interfaces on the guest.
+  clone                   Clone an existing virtual machine.
+  delete                  Delete a virtual machine (there is no confirmation).
+  usb                     USB device handling.
+
+  See 'utmctl help <subcommand>' for detailed help.
+
+##### utmctl usb disconnect --help
+OVERVIEW: CLI tool for controlling UTM virtual machines.
+
+USAGE: utmctl <subcommand>
+
+OPTIONS:
+  -h, --help              Show help information.
+
+SUBCOMMANDS:
+  version                 Display the version number of the application.
+  list                    Enumerate all registered virtual machines.
+  status                  Query the status of a virtual machine.
+  start                   Start a virtual machine or resume a suspended virtual
+                          machine.
+  suspend                 Suspend running a virtual machine to memory.
+  stop                    Shuts down a running virtual machine.
+  attach                  Redirect the serial input/output to this terminal.
+  file                    Guest agent file operations.
+  exec                    Execute an application on the guest.
+  ip-address              List all IP addresses associated with network
+                          interfaces on the guest.
+  clone                   Clone an existing virtual machine.
+  delete                  Delete a virtual machine (there is no confirmation).
+  usb                     USB device handling.
+
+  See 'utmctl help <subcommand>' for detailed help.
+

@@ -1,0 +1,12 @@
+^[[10;03HBdsDxe: starting Boot0001 "UEFI QEMU QEMU USB HARDDRIVE 1-0000:00:02.0-4.1"\
+
+^[[11;03H from PciRoot(0x0)/Pci(0x2,0x0)/USB(0x7,0x0)/U                              ^[[12;03Hsetparams '... Install'                                                     ^[[13;03H                                                                            ^[[14;03H        set background_color=black                                          ^[[15;03H        linux    /install.a64/vmlinuz net.ifnames=0 console=tty0 preseed/fi\
+
+^[[16;03Hle=/cdrom/simple-cdd/default.preseed simple-cdd/profiles=kali,offline theme\
+
+^[[17;03H=dark --- quiet                                                             ^[[17;80Hv^[[12;03H^[[12;03H                                                                            ^[[13;03Hsetparams '... Install'                                                     ^[[14;03H                                                                            ^[[15;03H        set background_color=black                                          ^[[16;03H        linux    /install.a64/vmlinuz net.ifnames=0 console=tty0 preseed/fi\
+
+^[[17;03Hle=/cdrom/simple-cdd/default.preseed simple-cdd/profiles=kali,offline theme\
+
+^[[18;03H^[[17;80Hv^[[13;03H^[[13;03H                                                                            ^[[14;03Hsetparams '... Install'                                                     ^[[15;03H                                                                            ^[[16;03H        set background_color=black                                          ^[[17;03H        linux    /install.a64/vmlinuz net.ifnames=0 console=tty0 preseed/fi\
+
