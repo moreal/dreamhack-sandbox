@@ -7,6 +7,114 @@ under `changes.d/` and compiled into the region below at release time. Do not
 edit that region, or any released section, by hand.
 
 <!-- sacho:unreleased:begin -->
+
+
+Unreleased
+----------
+
+To be released.
+
+ -  Challenges can now be solved on Kali Linux and Windows guests, not only
+    macOS. Three profiles ship with the binary: `kali-arm64`, `kali-x86_64`
+    and `windows-x86_64`.
+
+ -  A profile now says which processor architecture its guest uses. An arm64
+    guest runs virtualized at close to native speed; an `x86_64` guest runs
+    emulated, so expect it to be markedly slower and to need far longer to
+    boot the first time (30 minutes is the default patience, raise it with
+    `[vm.utm].boot_timeout_secs`).
+
+ -  The Kali and Windows profiles have not yet been driven end to end
+    against a fully installed guest. Treat them as ready to try, not as
+    proven.
+
+ -  Guests that Tart cannot host are now run through UTM. You never choose
+    the virtualizer yourself: each profile names the guest it wants and
+    `wargame` picks the one that can run it, so macOS guests keep working
+    exactly as before.
+
+ -  `wargame profiles` shows what that resolved to -- the guest system and
+    architecture, the virtualizer and whether it virtualizes or emulates,
+    and the profile's image state -- and `wargame doctor` reports the health
+    of every virtualizer you actually have profiles for. A session made with
+    a profile whose virtualizer this build cannot drive still lists and
+    still deletes; only starting it is refused.
+
+ -  Kali and Windows have no ready-made base image to clone, so `wargame`
+    now walks you through installing one yourself, once:
+
+     -  `wargame profile init <template> --name <yours>` copies a bundled
+        profile under your own name, with its own provisioning scripts that
+        a later upgrade will not overwrite.
+     -  `wargame profile create <yours> --iso <path>` builds a long-lived
+        installation VM from an installer image, checking `--sha256` against
+        it first if you pass one. `--from-vm <uuid>` starts from a VM you
+        already installed instead; that VM is only ever copied, never
+        altered. Re-running the command against the same source just
+        re-prints what to prepare in the guest; pointing it at a different
+        source is refused rather than quietly making a second VM.
+     -  `wargame profile console <yours>` opens the installer window. Install
+        the OS, create your user, and leave an SSH server, the guest agent
+        and this host's public key in place.
+     -  `wargame profile build <yours>` then boots that VM, runs your
+        profile's provisioning scripts, checks the tools the profile
+        promises, shuts the guest down and publishes the result as the image
+        every launch clones.
+
+ -  Until that build succeeds the profile reports that it is still awaiting
+    its install, and a build that fails leaves the previous image launchable.
+    Neither the installation VM nor a published image is ever removed by
+    `wargame prune`, and the installation VM is what the next rebuild starts
+    from, so keep it.
+
+ -  Windows 11 additionally wants TPM 2.0 and Secure Boot, which cannot be
+    switched on for you; `wargame profile create` prints the one-time step to
+    do by hand before you install. You supply the Windows installer and its
+    licence.
+
+ -  Windows guests are driven through PowerShell. `wargame profile build`
+    runs the profile's PowerShell provisioning scripts, and a script that
+    asks for a reboot is honoured: the build waits for the guest to come
+    back and carries on. `wargame ssh` into a Windows session drops you at a
+    PowerShell prompt, and every other command that reaches into the guest
+    uses the session's own shell rather than assuming a Unix one.
+
+ -  Commands and paths survive the trip intact -- spaces, backslashes,
+    quotes, `$`, and non-ASCII text such as Korean all arrive unmangled, and
+    the guest command's own exit code comes back to you.
+
+ -  A Windows guest gets the same challenge workspace as every other guest:
+    `incoming`, `work`, `notes` and `output`, with the challenge summary
+    written alongside them.
+
+ -  `wargame doctor --profile <name>` checks only what that one profile needs
+    -- its virtualizer, execution mode, network, image and guest tooling --
+    instead of everything on the host. Useful when one profile misbehaves and
+    the rest are fine.
+
+ -  Challenge files are now checksummed again inside the guest. The host
+    records a digest for everything it copies over and the guest recomputes
+    each one before anything is unpacked, so a truncated or corrupted
+    transfer is caught in the guest rather than silently solved around.
+
+ -  A challenge archive that tries to write outside the place it was unpacked
+    is now refused whole, rather than partly extracted. Absolute paths, `..`
+    traversal, drive letters, UNC prefixes, reserved Windows device names,
+    trailing dots or spaces, control characters and links all disqualify the
+    archive.
+
+ -  When that happens the original file stays untouched in `incoming/`, no
+    destination directory is created, and the reason is written to
+    `notes/archive-refusals.txt` so you can decide what to do with it.
+    Archives are still only ever unpacked inside the guest, never on your
+    machine.
+
+ -  When a guest never becomes reachable, the error now says what was
+    actually missing -- the SSH service, key authentication, or the shell
+    itself -- along with how long it waited, the timeout in force and how to
+    raise it. A guest whose SSH service has not started is no longer reported
+    as ready.
+
 <!-- sacho:unreleased:end -->
 
 ## [Unreleased] — Usability pass (2026-09-08)
