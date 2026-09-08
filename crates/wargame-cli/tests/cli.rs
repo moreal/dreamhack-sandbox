@@ -64,7 +64,7 @@ fn no_subcommand_without_a_tty_declines_the_tui_and_exits_2() {
 }
 
 #[test]
-fn profiles_json_lists_both_builtin_profiles() {
+fn profiles_json_lists_every_builtin_profile_including_the_templates() {
     let home = tempfile::tempdir().unwrap();
     let out = fixture_fake_cmd(home.path())
         .args(["profiles", "--json"])
@@ -81,6 +81,149 @@ fn profiles_json_lists_both_builtin_profiles() {
         .collect();
     assert!(names.contains(&"macos-minimal-arm64".to_string()));
     assert!(names.contains(&"macos-re-arm64".to_string()));
+    assert!(names.contains(&"kali-arm64".to_string()));
+    assert!(names.contains(&"kali-x86_64".to_string()));
+    assert!(names.contains(&"windows-x86_64".to_string()));
+}
+
+/// spec.md §4's `profile init`: the copy gets its own YAML *and* its own
+/// scripts, and a second run refuses rather than overwriting.
+#[test]
+fn profile_init_copies_a_template_and_refuses_a_second_run() {
+    let home = tempfile::tempdir().unwrap();
+    let out = fixture_fake_cmd(home.path())
+        .args(["profile", "init", "kali-arm64", "--name", "kali-custom"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("kali-custom.yaml"), "{stdout}");
+    assert!(
+        stdout.contains("wargame profile create kali-custom"),
+        "{stdout}"
+    );
+
+    let yaml = home.path().join("profiles/kali-custom.yaml");
+    assert!(yaml.is_file());
+    assert!(std::fs::read_to_string(&yaml)
+        .unwrap()
+        .contains("name: kali-custom"));
+    assert!(home
+        .path()
+        .join("profiles/scripts/kali-custom/common.sh")
+        .is_file());
+    // The template itself is untouched.
+    assert!(
+        std::fs::read_to_string(home.path().join("profiles/kali-arm64.yaml"))
+            .unwrap()
+            .contains("name: kali-arm64")
+    );
+
+    let again = fixture_fake_cmd(home.path())
+        .args(["profile", "init", "kali-arm64", "--name", "kali-custom"])
+        .output()
+        .unwrap();
+    assert!(!again.status.success());
+    assert!(
+        combined_of(&again).contains("already exists"),
+        "{:?}",
+        again
+    );
+}
+
+/// A Tart profile has no installation VM: `profile create`/`profile console`
+/// say so and name what to run instead (spec.md §4).
+#[test]
+fn profile_create_and_console_refuse_a_tart_profile() {
+    let home = tempfile::tempdir().unwrap();
+    let create = fixture_fake_cmd(home.path())
+        .args([
+            "profile",
+            "create",
+            "macos-re-arm64",
+            "--iso",
+            "/nonexistent.iso",
+        ])
+        .output()
+        .unwrap();
+    assert!(!create.status.success());
+    let message = combined_of(&create);
+    assert!(message.contains("image.base"), "{message}");
+    assert!(message.contains("profile build"), "{message}");
+
+    let console = fixture_fake_cmd(home.path())
+        .args(["profile", "console", "macos-re-arm64"])
+        .output()
+        .unwrap();
+    assert!(!console.status.success());
+    assert!(combined_of(&console).contains("installation VM"));
+}
+
+/// spec.md §3 FR-2: a UTM profile cannot be built before `profile create`
+/// made its installation VM, and the error says which command to run.
+#[test]
+fn profile_build_without_a_record_points_at_profile_create() {
+    let home = tempfile::tempdir().unwrap();
+    let out = fixture_fake_cmd(home.path())
+        .args(["profile", "build", "kali-arm64"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let message = combined_of(&out);
+    assert!(message.contains("no installation VM"), "{message}");
+    assert!(
+        message.contains("wargame profile create kali-arm64"),
+        "{message}"
+    );
+}
+
+/// A `--sha256` that does not match fails before any VM exists, and leaves
+/// no build record behind (spec.md §6).
+#[test]
+fn profile_create_refuses_a_mismatched_iso_hash_before_creating_anything() {
+    let home = tempfile::tempdir().unwrap();
+    let iso = home.path().join("fake.iso");
+    std::fs::write(&iso, b"not an iso").unwrap();
+    let out = fixture_fake_cmd(home.path())
+        .args([
+            "profile",
+            "create",
+            "kali-arm64",
+            "--iso",
+            iso.to_str().unwrap(),
+            "--sha256",
+            &"0".repeat(64),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let message = combined_of(&out);
+    assert!(message.contains("does not match --sha256"), "{message}");
+    assert!(!home.path().join("builds/kali-arm64").exists());
+}
+
+/// `doctor --profile` on an unbuilt UTM profile reports the image as not
+/// ready and names the command that would produce one.
+#[test]
+fn doctor_profile_reports_an_unbuilt_utm_image() {
+    let home = tempfile::tempdir().unwrap();
+    let out = fixture_fake_cmd(home.path())
+        .args(["doctor", "--profile", "kali-arm64", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let checks: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    let image = checks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "profile-image:kali-arm64")
+        .expect("a profile-image check");
+    assert_eq!(image["ok"], serde_json::Value::Bool(false));
+    assert!(image["hint"]
+        .as_str()
+        .unwrap()
+        .contains("wargame profile create kali-arm64"));
 }
 
 #[test]

@@ -14,21 +14,27 @@ use std::time::Duration;
 
 use url::Url;
 
-use wargame_core::app::{AppContext, BackendRegistry, ProfileStore, TransportRegistry};
+use wargame_core::app::{
+    AppContext, BackendRegistry, BuilderRegistry, ProfileStore, TransportRegistry,
+};
 use wargame_core::config::Config;
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::fs::AppDirs;
 use wargame_core::infra::process::{Cmd, ProcessRunner, RealRunner};
-use wargame_core::infra::{FileStore, JsonSessionRepository, KeychainStore, SshGuestTransport};
+use wargame_core::infra::{
+    FileStore, HostDiskSpace, JsonBuildRepository, JsonSessionRepository, KeychainStore,
+    SshGuestTransport,
+};
 use wargame_core::ports::{
-    CredentialStore, GuestTransport, SessionRepository, VmProvider, WargameProvider,
+    BuildRecordRepository, CredentialStore, DiskSpace, GuestTransport, ProfileImageBuilder,
+    SessionRepository, VmProvider, WargameProvider,
 };
 use wargame_core::security::init_tracing;
 use wargame_core::testing::{FakeTransport, FakeVmProvider};
 
 use wargame_dreamhack::{DreamhackConfig, DreamhackProvider};
-use wargame_tart::{BuildOptions, ProfileImageBuilder, TartConfig, TartProvider, TransportFactory};
-use wargame_utm::{UtmConfig, UtmProvider};
+use wargame_tart::{TartConfig, TartImageBuilder, TartProvider, TransportFactory};
+use wargame_utm::{RecordImageCatalog, UtmConfig, UtmImageBuilder, UtmProvider};
 
 use crate::fixture_provider::FixtureProvider;
 use crate::profiles_builtin;
@@ -103,11 +109,16 @@ pub fn build_context(
     let builtin_profiles = profiles_builtin::builtin_profiles()?;
 
     let wargame = build_wargame_provider(&config, &dirs, &runner)?;
-    let (backends, transports) = build_vm_backends(&config, &dirs, &runner, &builtin_profiles);
+    let builds: Arc<dyn BuildRecordRepository> =
+        Arc::new(JsonBuildRepository::new(dirs.builds_dir()));
+    let (backends, transports) =
+        build_vm_backends(&config, &dirs, &runner, &builtin_profiles, &builds);
+    let builders = build_image_builders(&config, &dirs, &runner, &builds);
 
     let repo: Arc<dyn SessionRepository> =
         Arc::new(JsonSessionRepository::new(dirs.sessions_dir()));
-    let profiles = ProfileStore::new(builtin_profiles, dirs.profiles_dir());
+    let profiles = ProfileStore::new(builtin_profiles, dirs.profiles_dir())
+        .with_builtin_yaml(profiles_builtin::builtin_profile_sources()?);
 
     Ok(AppContext {
         config,
@@ -116,6 +127,9 @@ pub fn build_context(
         backends,
         transports,
         repo,
+        builds,
+        builders,
+        disk: Arc::new(HostDiskSpace) as Arc<dyn DiskSpace>,
         profiles,
         runner,
         bootstrap_script: profiles_builtin::BOOTSTRAP_SH,
@@ -177,6 +191,7 @@ fn build_vm_backends(
     dirs: &AppDirs,
     runner: &Arc<dyn ProcessRunner>,
     builtin_profiles: &[wargame_core::domain::Profile],
+    builds: &Arc<dyn BuildRecordRepository>,
 ) -> (BackendRegistry, TransportRegistry) {
     if std::env::var("WARGAME_VM").as_deref() == Ok("fake") {
         let fake_tart = Arc::new(FakeVmProvider::new());
@@ -196,7 +211,12 @@ fn build_vm_backends(
     }
 
     let tart = Arc::new(TartProvider::new(runner.clone(), tart_config(config)));
-    let utm = Arc::new(UtmProvider::new(runner.clone(), utm_config(config)));
+    // The build records are what tells UTM which images exist: without them
+    // every UTM profile would report "not ready" forever (spec.md §5 item 5).
+    let utm = Arc::new(
+        UtmProvider::new(runner.clone(), utm_config(config))
+            .with_image_catalog(Arc::new(RecordImageCatalog::new(builds.clone()))),
+    );
     let transport = Arc::new(SshGuestTransport::new(
         runner.clone(),
         dirs.keys_dir().join("id_ed25519"),
@@ -210,6 +230,52 @@ fn build_vm_backends(
     )
 }
 
+/// The per-backend image builders `wargame profile create|build` runs
+/// through (spec.md §5 item 4).
+///
+/// Always the real ones, even under `$WARGAME_VM=fake`: a builder touches
+/// `tart`/`utmctl` only when a build step actually runs, and wiring the real
+/// ones keeps the "this backend cannot do that" errors (a `profile create` on
+/// a Tart profile, say) exact instead of turning them into "no builder is
+/// wired".
+fn build_image_builders(
+    config: &Config,
+    dirs: &AppDirs,
+    runner: &Arc<dyn ProcessRunner>,
+    builds: &Arc<dyn BuildRecordRepository>,
+) -> BuilderRegistry {
+    let key_path = dirs.keys_dir().join("id_ed25519");
+    let tart = Arc::new(TartProvider::new(runner.clone(), tart_config(config)));
+    let tart_runner = runner.clone();
+    let tart_key = key_path.clone();
+    let transport_factory: TransportFactory = Box::new(move || {
+        Arc::new(SshGuestTransport::new(
+            tart_runner.clone(),
+            tart_key.clone(),
+        )) as Arc<dyn GuestTransport>
+    });
+    let tart_builder = TartImageBuilder::new(
+        runner.clone(),
+        tart,
+        transport_factory,
+        dirs.keys_dir().join("id_ed25519.pub"),
+    );
+
+    let utm = Arc::new(
+        UtmProvider::new(runner.clone(), utm_config(config))
+            .with_image_catalog(Arc::new(RecordImageCatalog::new(builds.clone()))),
+    );
+    let utm_builder = UtmImageBuilder::new(
+        utm,
+        Arc::new(SshGuestTransport::new(runner.clone(), key_path)) as Arc<dyn GuestTransport>,
+    );
+
+    BuilderRegistry::new(vec![
+        Arc::new(tart_builder) as Arc<dyn ProfileImageBuilder>,
+        Arc::new(utm_builder) as Arc<dyn ProfileImageBuilder>,
+    ])
+}
+
 /// What the real UTM backend reports, mirrored onto the fake so
 /// `WARGAME_VM=fake` can exercise a UTM profile end to end.
 fn utm_capabilities() -> wargame_core::domain::ProviderCapabilities {
@@ -220,6 +286,7 @@ fn utm_config(config: &Config) -> UtmConfig {
     UtmConfig {
         utmctl: config.vm.utm.utmctl.clone(),
         vm_prefix: config.vm.utm.vm_prefix.clone(),
+        build_prefix: config.vm.utm.build_prefix.clone(),
         boot_timeout: Duration::from_secs(config.vm.utm.boot_timeout_secs),
         virtualize_boot_timeout: Duration::from_secs(config.vm.utm.virtualize_boot_timeout_secs),
         ..UtmConfig::default()
@@ -235,64 +302,37 @@ fn tart_config(config: &Config) -> TartConfig {
     }
 }
 
-/// Builds the (real-Tart-only) [`ProfileImageBuilder`] and its
-/// [`BuildOptions`] for `wargame profile build` (DESIGN.md §5/§6): generates
-/// the host's ed25519 guest key on first use (DESIGN.md §3.6) and locates
-/// the provisioning `scripts/` tree.
-pub async fn build_profile_image_builder(
-    ctx: &AppContext,
-) -> Result<(ProfileImageBuilder, BuildOptions)> {
+/// Makes sure the host's ed25519 guest key exists (DESIGN.md §3.6), which
+/// is what a Tart build installs into the guest and what every UTM guest is
+/// told to authorize. Generated on first use, never overwritten.
+pub async fn ensure_host_key(ctx: &AppContext) -> Result<PathBuf> {
     let key_path = ctx.dirs.keys_dir().join("id_ed25519");
     let pubkey_path = ctx.dirs.keys_dir().join("id_ed25519.pub");
-    if !key_path.exists() {
-        std::fs::create_dir_all(ctx.dirs.keys_dir())?;
-        let cmd = Cmd::new(
-            "ssh-keygen",
-            vec![
-                "-t".to_string(),
-                "ed25519".to_string(),
-                "-N".to_string(),
-                String::new(),
-                "-f".to_string(),
-                key_path.display().to_string(),
-                "-C".to_string(),
-                "wargame-vm".to_string(),
-            ],
-        );
-        let out = ctx.runner.run(&cmd).await?;
-        if out.status != 0 {
-            return Err(WargameError::Other(format!(
-                "ssh-keygen failed: {}",
-                out.stderr
-            )));
-        }
+    if pubkey_path.exists() {
+        return Ok(pubkey_path);
     }
-    let pubkey = std::fs::read_to_string(&pubkey_path)?.trim().to_string();
-
-    let tart = Arc::new(TartProvider::new(
-        ctx.runner.clone(),
-        tart_config(&ctx.config),
-    ));
-    let runner = ctx.runner.clone();
-    let key_path_for_factory = key_path.clone();
-    let transport_factory: TransportFactory = Box::new(move || {
-        Arc::new(SshGuestTransport::new(
-            runner.clone(),
-            key_path_for_factory.clone(),
-        )) as Arc<dyn GuestTransport>
-    });
-    let builder = ProfileImageBuilder::new(ctx.runner.clone(), tart, transport_factory);
-
-    let opts = BuildOptions {
-        // `$WARGAME_HOME/profiles`, which `build_context` has just seeded
-        // with the embedded `scripts/` tree; never a path from the build
-        // machine (a `nix build` binary's `CARGO_MANIFEST_DIR` is a sandbox
-        // path that does not exist at runtime).
-        scripts_dir: ctx.dirs.profiles_dir(),
-        pubkey,
-        log_path: ctx.dirs.logs_dir().join("profile-build.log"),
-    };
-    Ok((builder, opts))
+    std::fs::create_dir_all(ctx.dirs.keys_dir())?;
+    let cmd = Cmd::new(
+        "ssh-keygen",
+        vec![
+            "-t".to_string(),
+            "ed25519".to_string(),
+            "-N".to_string(),
+            String::new(),
+            "-f".to_string(),
+            key_path.display().to_string(),
+            "-C".to_string(),
+            "wargame-vm".to_string(),
+        ],
+    );
+    let out = ctx.runner.run(&cmd).await?;
+    if out.status != 0 {
+        return Err(WargameError::Other(format!(
+            "ssh-keygen failed: {}",
+            out.stderr
+        )));
+    }
+    Ok(pubkey_path)
 }
 
 #[cfg(test)]
@@ -326,7 +366,12 @@ mod tests {
         assert_eq!(ctx.backends.names(), vec!["tart", "utm"]);
         assert_eq!(ctx.backends.get("tart").unwrap().name(), "tart");
         assert_eq!(ctx.backends.get("utm").unwrap().name(), "utm");
-        assert_eq!(ctx.profiles.list().len(), 2);
+        assert_eq!(
+            ctx.profiles.list().len(),
+            5,
+            "two macOS profiles plus the Kali/Windows templates"
+        );
+        assert_eq!(ctx.builders.names(), vec!["tart", "utm"]);
         std::env::remove_var("WARGAME_PROVIDER");
         std::env::remove_var("WARGAME_VM");
     }
@@ -340,6 +385,11 @@ mod tests {
         let _ctx = build_context(false, None, Some(home.clone())).unwrap();
         assert!(home.join("profiles/macos-minimal-arm64.yaml").is_file());
         assert!(home.join("profiles/macos-re-arm64.yaml").is_file());
+        assert!(home.join("profiles/kali-arm64.yaml").is_file());
+        assert!(home.join("profiles/kali-x86_64.yaml").is_file());
+        assert!(home.join("profiles/windows-x86_64.yaml").is_file());
+        assert!(home.join("profiles/scripts/kali/common.sh").is_file());
+        assert!(home.join("profiles/scripts/windows/common.ps1").is_file());
         std::env::remove_var("WARGAME_PROVIDER");
         std::env::remove_var("WARGAME_VM");
     }

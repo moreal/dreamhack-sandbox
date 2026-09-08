@@ -1,0 +1,46 @@
+apiVersion: wargame.vm/v1
+kind: Profile
+
+# Template. Copy it under your own name before editing:
+#   wargame profile init windows-x86_64 --name windows-custom
+#   wargame profile create windows-custom --iso /path/to/windows-x64.iso
+#   wargame profile console windows-custom   # enable TPM 2.0 + Secure Boot in
+#                                            # UTM's QEMU settings, then install
+#   wargame profile build windows-custom
+#
+# You supply the Windows ISO and its licence; wargame installs nothing on
+# your behalf and bypasses no installation requirement.
+
+metadata:
+  name: windows-x86_64
+  description: "Windows 11 x86_64 (UTM, full emulation)"
+
+vm:
+  backend: utm
+  mode: emulate
+
+guest:
+  os: windows
+  arch: x86_64
+  # Must match the account created during the Windows installation.
+  user: wargame
+
+image:
+  # UTM has no base images: the source is the installation VM `profile
+  # create` makes, and the image is what `profile build` publishes from it.
+  base: ""
+
+resources:
+  cpu: 4
+  memory_gib: 8
+  disk_gib: 80
+
+provision:
+  scripts:
+    - scripts/windows/common.ps1
+
+tools:
+  verify: []
+
+workspace:
+  root: 'C:\wargame'

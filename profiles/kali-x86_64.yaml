@@ -1,0 +1,43 @@
+apiVersion: wargame.vm/v1
+kind: Profile
+
+# Template. Copy it under your own name before editing:
+#   wargame profile init kali-x86_64 --name kali-custom
+#   wargame profile create kali-custom --iso /path/to/kali-amd64-installer.iso
+#   wargame profile console kali-custom      # install the OS, prepare SSH
+#   wargame profile build kali-custom
+
+metadata:
+  name: kali-x86_64
+  description: "Kali Linux x86_64 (UTM, full emulation)"
+
+vm:
+  backend: utm
+  mode: emulate
+
+guest:
+  os: linux
+  distribution: kali
+  arch: x86_64
+  user: kali
+
+image:
+  # UTM has no base images: the source is the installation VM `profile
+  # create` makes, and the image is what `profile build` publishes from it.
+  base: ""
+
+resources:
+  cpu: 4
+  memory_gib: 8
+  disk_gib: 80
+
+provision:
+  scripts:
+    - scripts/kali/common.sh
+
+tools:
+  verify:
+    - python3 --version
+
+workspace:
+  root: /home/kali/wargame

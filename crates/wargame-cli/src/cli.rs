@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 use wargame_core::domain::NetworkMode;
@@ -227,7 +227,35 @@ pub enum SessionCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ProfileCommand {
-    /// Build (or rebuild) a profile's local Tart image. Slow (tens of minutes) the first time.
+    /// Copy a built-in template profile under your own name, with its own scripts.
+    Init {
+        /// Template to copy; see `wargame profiles` (e.g. kali-arm64, windows-x86_64).
+        template: String,
+        /// Name for the new profile. Must not already exist.
+        #[arg(long, value_name = "NAME")]
+        name: String,
+    },
+    /// Create a UTM profile's installation VM, from an ISO or an installed VM.
+    #[command(group(ArgGroup::new("source").required(true).args(["iso", "from_vm"])))]
+    Create {
+        /// Profile name; see `wargame profiles`.
+        name: String,
+        /// Local installation ISO to boot the new VM from.
+        #[arg(long, value_name = "PATH")]
+        iso: Option<PathBuf>,
+        /// UUID of an installed local UTM VM to clone instead (it is never modified).
+        #[arg(long = "from-vm", value_name = "UUID")]
+        from_vm: Option<String>,
+        /// Expected SHA-256 of `--iso`, verified before anything is created.
+        #[arg(long, value_name = "HEX", requires = "iso", conflicts_with = "from_vm")]
+        sha256: Option<String>,
+    },
+    /// Open the installation VM's console (UTM profiles), to install the OS by hand.
+    Console {
+        /// Profile name; see `wargame profiles`.
+        name: String,
+    },
+    /// Build (or rebuild) a profile's reusable image. Slow (tens of minutes) the first time.
     Build {
         /// Profile name; see `wargame profiles` [default: general.default_profile from config].
         name: Option<String>,
@@ -275,6 +303,62 @@ mod tests {
         assert!(matches!(
             Cli::parse_from(["wargame", "ssh"]).command,
             Some(Command::Ssh { id: None })
+        ));
+    }
+
+    /// spec.md §4: "`--iso`, `--from-vm`은 상호 배타적이다", and one of them
+    /// is required.
+    #[test]
+    fn profile_create_requires_exactly_one_source() {
+        assert!(Cli::try_parse_from(["wargame", "profile", "create", "kali"]).is_err());
+        assert!(Cli::try_parse_from([
+            "wargame",
+            "profile",
+            "create",
+            "kali",
+            "--iso",
+            "/a.iso",
+            "--from-vm",
+            "UUID"
+        ])
+        .is_err());
+        assert!(matches!(
+            Cli::parse_from(["wargame", "profile", "create", "kali", "--iso", "/a.iso"]).command,
+            Some(Command::Profile {
+                action: ProfileCommand::Create { iso: Some(_), .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["wargame", "profile", "create", "kali", "--from-vm", "UUID"]).command,
+            Some(Command::Profile {
+                action: ProfileCommand::Create {
+                    from_vm: Some(_),
+                    ..
+                }
+            })
+        ));
+        // `--sha256` is only meaningful for an ISO.
+        assert!(Cli::try_parse_from([
+            "wargame",
+            "profile",
+            "create",
+            "kali",
+            "--from-vm",
+            "UUID",
+            "--sha256",
+            "abc"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn profile_init_needs_a_template_and_a_name() {
+        assert!(Cli::try_parse_from(["wargame", "profile", "init", "kali-arm64"]).is_err());
+        assert!(matches!(
+            Cli::parse_from(["wargame", "profile", "init", "kali-arm64", "--name", "mine"]).command,
+            Some(Command::Profile {
+                action: ProfileCommand::Init { .. }
+            })
         ));
     }
 

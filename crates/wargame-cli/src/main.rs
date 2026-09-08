@@ -13,8 +13,10 @@ use std::time::Instant;
 use clap::{CommandFactory, Parser};
 
 use wargame_core::app::{
-    delete, doctor, doctor_profile, inspect, keep, launch, list_sessions, open, open_gui, prune,
-    resolve_session, resume, search, ssh_command, stop, AppContext, LaunchEvent, LaunchRequest,
+    build_profile_image, create_profile_vm, delete, doctor, doctor_profile, image_status,
+    init_profile, inspect, keep, launch, list_sessions, open, open_gui, open_profile_console,
+    prune, resolve_session, resume, search, ssh_command, stop, AppContext, CreateSource,
+    LaunchEvent, LaunchRequest,
 };
 use wargame_core::domain::{ChallengeRef, KeepPolicy, NetworkMode, SessionState};
 use wargame_core::error::{Result, WargameError};
@@ -311,38 +313,140 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
         }
 
         Command::Profiles { json } => {
+            let profiles = ctx.profiles.list();
+            let mut status = Vec::with_capacity(profiles.len());
+            for profile in &profiles {
+                status.push(profile_image_line(ctx, profile).await);
+            }
             output::print_profiles(
-                &ctx.profiles.list(),
+                &profiles,
+                &status,
                 &ctx.config.general.default_profile,
                 json,
             );
             Ok(0)
         }
 
-        Command::Profile {
-            action: ProfileCommand::Build { name },
-        } => {
-            let name = name.unwrap_or_else(|| ctx.config.general.default_profile.clone());
-            let profile = ctx.profiles.get(&name)?;
-            println!(
-                "Building image for profile {name} (this takes tens of minutes the first time; NAT networking is used for provisioning)…"
-            );
-            let started = Instant::now();
-            let (builder, opts) = wiring::build_profile_image_builder(ctx).await?;
-            let image = builder
-                .build_profile(&profile, &opts, &mut |msg| println!("… {msg}"))
-                .await?;
-            println!(
-                "✓ built {} in {}s. Next: wargame launch <provider:id> --profile {name}",
-                image.0,
-                started.elapsed().as_secs()
-            );
-            Ok(0)
-        }
+        Command::Profile { action } => dispatch_profile(ctx, action).await,
 
         Command::Auth { action } => dispatch_auth(ctx, action).await,
 
         Command::Completions { .. } => unreachable!("handled before the context is built"),
+    }
+}
+
+/// One profile's image readiness for the `profiles` table: what it would
+/// launch from, or why it cannot yet (spec.md §3 FR-1/FR-3).
+async fn profile_image_line(
+    ctx: &AppContext,
+    profile: &wargame_core::domain::Profile,
+) -> Option<String> {
+    let status = image_status(ctx, profile).await.ok()?;
+    let Some(image) = &status.image else {
+        return Some(
+            status
+                .phase
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| "not created".to_string()),
+        );
+    };
+    // A name is not an image: ask the backend whether it is actually there
+    // (a Tart image the user deleted, say).
+    let exists = match ctx.backends.get(status.backend.as_str()) {
+        Ok(vm) => vm.image_exists(image).await.unwrap_or(false),
+        Err(_) => false,
+    };
+    Some(match (exists, status.rebuild_needed) {
+        (false, _) => "not built".to_string(),
+        (true, true) => "rebuild needed".to_string(),
+        (true, false) => "ready".to_string(),
+    })
+}
+
+/// `wargame profile init|create|console|build` (spec.md §4).
+async fn dispatch_profile(ctx: &AppContext, action: ProfileCommand) -> Result<i32> {
+    match action {
+        ProfileCommand::Init { template, name } => {
+            let outcome = init_profile(ctx, &template, &name).await?;
+            println!("✓ created profile {name} from {template}:");
+            println!("  {}", outcome.yaml_path.display());
+            for script in &outcome.scripts {
+                println!("  {}", script.display());
+            }
+            println!("Edit those, then:");
+            if outcome.profile.image.base.is_empty() {
+                println!(
+                    "  wargame profile create {name} --iso <path>   # or --from-vm <utm-uuid>"
+                );
+            } else {
+                println!("  wargame profile build {name}");
+            }
+            Ok(0)
+        }
+
+        ProfileCommand::Create {
+            name,
+            iso,
+            from_vm,
+            sha256,
+        } => {
+            // The guest is told to authorize this key, so it has to exist
+            // before the instructions point at it.
+            wiring::ensure_host_key(ctx).await?;
+            let source = match (iso, from_vm) {
+                (Some(path), None) => CreateSource::Iso { path, sha256 },
+                (None, Some(uuid)) => CreateSource::FromVm { uuid },
+                // clap's argument group already made this unreachable.
+                _ => {
+                    return Err(WargameError::Other(
+                        "pass exactly one of --iso or --from-vm".to_string(),
+                    ))
+                }
+            };
+            let outcome = create_profile_vm(ctx, &name, source).await?;
+            if outcome.reused {
+                println!("Installation VM for {name} already exists.");
+            } else {
+                println!("✓ installation VM for {name} created.");
+            }
+            for line in &outcome.guidance {
+                println!("  {line}");
+            }
+            Ok(0)
+        }
+
+        ProfileCommand::Console { name } => {
+            println!("Opening the installation VM for {name}…");
+            open_profile_console(ctx, &name).await?;
+            println!(
+                "Opened. Install the OS and prepare SSH there, then: wargame profile build {name}"
+            );
+            Ok(0)
+        }
+
+        ProfileCommand::Build { name } => {
+            let name = name.unwrap_or_else(|| ctx.config.general.default_profile.clone());
+            // Both backends need the host key: Tart installs it into the
+            // guest, UTM expects the user to have authorized it.
+            wiring::ensure_host_key(ctx).await?;
+            println!(
+                "Building the image for profile {name} (this takes tens of minutes the first time; NAT networking is used for provisioning)…"
+            );
+            let started = Instant::now();
+            let record = build_profile_image(ctx, &name, &mut |msg| println!("… {msg}")).await?;
+            let image = record
+                .ready_image()
+                .map(|i| i.name.clone())
+                .unwrap_or_else(|| name.clone());
+            println!(
+                "✓ built {image} in {}s. Next: wargame launch <provider:id> --profile {name}",
+                started.elapsed().as_secs()
+            );
+            for failure in &record.cleanup_failures {
+                println!("! {failure}");
+            }
+            Ok(0)
+        }
     }
 }
 

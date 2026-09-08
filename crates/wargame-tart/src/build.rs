@@ -55,10 +55,11 @@ pub struct TartImageBuilder {
     runner: Arc<dyn ProcessRunner>,
     tart: Arc<TartProvider>,
     transport_factory: TransportFactory,
-    /// The host's ed25519 public key (contents of `id_ed25519.pub`),
-    /// installed into the guest's `authorized_keys` so future sessions can
-    /// SSH in without ever needing the build-time password again.
-    pubkey: String,
+    /// Where the host's ed25519 public key lives
+    /// (`$WARGAME_HOME/keys/id_ed25519.pub`). It is read when a build
+    /// actually connects, not when the builder is wired, so a key generated
+    /// between the two is still picked up.
+    pubkey_path: PathBuf,
 }
 
 impl TartImageBuilder {
@@ -66,14 +67,27 @@ impl TartImageBuilder {
         runner: Arc<dyn ProcessRunner>,
         tart: Arc<TartProvider>,
         transport_factory: TransportFactory,
-        pubkey: impl Into<String>,
+        pubkey_path: PathBuf,
     ) -> Self {
         TartImageBuilder {
             runner,
             tart,
             transport_factory,
-            pubkey: pubkey.into(),
+            pubkey_path,
         }
+    }
+
+    /// The host's public key, installed into the guest's `authorized_keys`
+    /// so future sessions never need the build-time password again.
+    fn pubkey(&self) -> Result<String> {
+        std::fs::read_to_string(&self.pubkey_path)
+            .map(|key| key.trim().to_string())
+            .map_err(|e| {
+                WargameError::Other(format!(
+                    "cannot read the host's SSH public key {}: {e}",
+                    self.pubkey_path.display()
+                ))
+            })
     }
 
     /// Installs `pubkey` into the guest's `authorized_keys` over a
@@ -92,7 +106,7 @@ impl TartImageBuilder {
                     reason: "guest.password is required to build a profile image".to_string(),
                 })?;
 
-        let pubkey = &self.pubkey;
+        let pubkey = self.pubkey()?;
         let remote_command = format!(
             "mkdir -p ~/.ssh && chmod 700 ~/.ssh && printf '%s\\n' '{pubkey}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
         );
@@ -373,14 +387,35 @@ mod tests {
         Ok(Output::default())
     }
 
-    fn builder(runner: Arc<FakeRunner>, transport: Arc<FakeTransport>) -> TartImageBuilder {
+    /// A builder plus the temporary key directory it reads its public key
+    /// from (kept alive for the test's duration).
+    struct Fixture {
+        builder: TartImageBuilder,
+        _keys: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for Fixture {
+        type Target = TartImageBuilder;
+
+        fn deref(&self) -> &TartImageBuilder {
+            &self.builder
+        }
+    }
+
+    fn builder(runner: Arc<FakeRunner>, transport: Arc<FakeTransport>) -> Fixture {
+        let keys = tempfile::tempdir().unwrap();
+        let pubkey_path = keys.path().join("id_ed25519.pub");
+        std::fs::write(&pubkey_path, "ssh-ed25519 AAAA... wargame-vm\n").unwrap();
         let tart = Arc::new(TartProvider::new(runner.clone(), TartConfig::default()));
-        TartImageBuilder::new(
-            runner,
-            tart,
-            Box::new(move || transport.clone() as Arc<dyn GuestTransport>),
-            "ssh-ed25519 AAAA... wargame-vm",
-        )
+        Fixture {
+            builder: TartImageBuilder::new(
+                runner,
+                tart,
+                Box::new(move || transport.clone() as Arc<dyn GuestTransport>),
+                pubkey_path,
+            ),
+            _keys: keys,
+        }
     }
 
     fn record(profile: &Profile) -> BuildRecord {
@@ -419,7 +454,7 @@ mod tests {
         let req = request(&profile, &record, Path::new("/tmp"));
         let mut messages = Vec::new();
 
-        let outcome = run_build_flow(&b, &req, &mut |m| messages.push(m))
+        let outcome = run_build_flow(&*b, &req, &mut |m| messages.push(m))
             .await
             .unwrap_or_else(|e| panic!("build failed: {}", e.error));
         assert_eq!(outcome.image.name, "wargame-profile-macos-minimal-arm64");
@@ -571,7 +606,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&b, &req, &mut |_| {})
+        let failure = run_build_flow(&*b, &req, &mut |_| {})
             .await
             .err()
             .expect("the build must fail");
@@ -600,7 +635,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&b, &req, &mut |_| {}).await.err().unwrap();
+        let failure = run_build_flow(&*b, &req, &mut |_| {}).await.err().unwrap();
         assert!(
             matches!(failure.error, WargameError::InvalidProfile { ref name, .. } if name == "macos-minimal-arm64")
         );
@@ -626,7 +661,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&b, &req, &mut |_| {}).await.err().unwrap();
+        let failure = run_build_flow(&*b, &req, &mut |_| {}).await.err().unwrap();
         assert!(
             matches!(failure.error, WargameError::InvalidProfile { ref name, .. } if name == "macos-minimal-arm64")
         );
@@ -663,7 +698,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&b, &req, &mut |_| {}).await.err().unwrap();
+        let failure = run_build_flow(&*b, &req, &mut |_| {}).await.err().unwrap();
         assert!(matches!(failure.error, WargameError::InvalidProfile { .. }));
         assert!(transport.calls().is_empty());
     }
@@ -679,7 +714,7 @@ mod tests {
         let log_dir = tempfile::tempdir().unwrap();
         let req = request(&profile, &record, log_dir.path());
 
-        run_build_flow(&b, &req, &mut |_| {})
+        run_build_flow(&*b, &req, &mut |_| {})
             .await
             .unwrap_or_else(|e| panic!("build failed: {}", e.error));
 
@@ -731,7 +766,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, log_dir.path());
 
-        let failure = run_build_flow(&b, &req, &mut |_| {}).await.err().unwrap();
+        let failure = run_build_flow(&*b, &req, &mut |_| {}).await.err().unwrap();
 
         let WargameError::InvalidProfile { reason, .. } = failure.error else {
             panic!("expected InvalidProfile");

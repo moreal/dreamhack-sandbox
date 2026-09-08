@@ -268,29 +268,62 @@ pub fn print_checks(checks: &[Check], json: bool) {
     }
 }
 
-pub fn print_profiles(profiles: &[Profile], default_profile: &str, json: bool) {
+/// `profiles`, with one image-readiness line per profile (spec.md §3 FR-1:
+/// "profiles ... 화면에 OS/arch/backend/mode와 이미지 준비 상태를 표시한다").
+/// `status` is parallel to `profiles`; `None` means the status could not be
+/// determined (an unsupported combination, say).
+pub fn print_profiles(
+    profiles: &[Profile],
+    status: &[Option<String>],
+    default_profile: &str,
+    json: bool,
+) {
     if json {
         print_json(&profiles);
         return;
     }
     let mut table = table();
-    table.set_header(vec!["name", "description", "guest", "resources", "default"]);
-    for p in profiles {
+    table.set_header(vec![
+        "name",
+        "description",
+        "guest",
+        "backend/mode",
+        "resources",
+        "image",
+        "default",
+    ]);
+    for (i, p) in profiles.iter().enumerate() {
         table.add_row(vec![
             p.name.clone(),
             p.description.clone(),
-            format!("{:?}/{:?}", p.guest.os, p.guest.arch).to_lowercase(),
+            format!(
+                "{:?}/{:?}",
+                p.guest
+                    .distribution
+                    .clone()
+                    .unwrap_or(format!("{:?}", p.guest.os)),
+                p.guest.arch
+            )
+            .replace('"', "")
+            .to_lowercase(),
+            format!("{}/{}", p.vm.backend, p.vm.mode),
             format!(
                 "{} cpu / {} GiB / {} GiB disk",
                 p.resources.cpu,
                 p.resources.memory_mib / 1024,
                 p.resources.disk_gib
             ),
+            status
+                .get(i)
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| "unknown".to_string()),
             if p.name == default_profile { "yes" } else { "" }.to_string(),
         ]);
     }
     println!("{table}");
     println!("Next: wargame profile build <name>   # once per profile; then wargame launch <ref> --profile <name>");
+    println!("      wargame profile init <template> --name <new>   # a UTM template (Kali, Windows) to install yourself");
 }
 
 #[cfg(test)]
