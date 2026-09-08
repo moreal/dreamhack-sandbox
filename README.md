@@ -84,14 +84,20 @@ Your Dreamhack session cookie is stored in the macOS Keychain (service
 ```sh
 $ wargame profiles
 name                  guest           backend/mode     image
-macos-minimal-arm64   macos/arm64     auto/virtualize  ready
-macos-re-arm64        macos/arm64     auto/virtualize  ready
+macos-minimal-arm64   macos/arm64     tart/virtualize  ready
+macos-re-arm64        macos/arm64     tart/virtualize  ready
 kali-arm64            kali/arm64      utm/virtualize   not created
 kali-x86_64           kali/x86_64     utm/emulate      not created
 windows-x86_64        windows/x86_64  utm/emulate      not created
 
 $ wargame profile build macos-re-arm64
 ```
+
+`backend/mode` is what the profile *resolved* to, not what it asked for: a
+profile that says `backend: auto` shows the backend that will actually run
+it. `wargame doctor`, the TUI's profile picker and `wargame launch`'s
+preflight output show the same four answers, and `wargame sessions` /
+`wargame session inspect` name the backend each existing session runs on.
 
 The `image` column is the profile's build state: `ready` (there is an image
 to launch from), `not built`/`not created`, `rebuild needed` (the profile or
@@ -164,6 +170,53 @@ with PowerShell as its default shell — if it is not ready, the wait says
 which of SSH, key authentication or the shell is missing, how long it
 waited and how to raise the timeout.
 
+### Your own tools
+
+Every profile installs its tools with the scripts it lists in
+`provision.scripts` and then proves them with the commands it lists in
+`tools.verify`. The shipped baselines are:
+
+| Profile | Tools | Install source |
+|---|---|---|
+| `macos-*` | Git, Python, uv, curl, wget, jq, vim, tree (+ Ghidra, LLVM for `-re`) | Homebrew |
+| `kali-*` | Python 3 + pip/venv, Git, curl, unzip, file, GDB, binutils, build-essential | `apt-get`, from Kali's own repositories |
+| `windows-*` | OpenSSH Server, Python 3, Git, 7-Zip (PowerShell ships with Windows) | `winget`, plus the OpenSSH Windows capability |
+
+Each script names the install source and the verification command for every
+tool it installs, logs each step with its exit code, and is idempotent, so
+re-running `profile build` against an already provisioned image is a no-op
+for anything already there. A failed install fails the build; nothing is
+skipped silently.
+
+To add your own:
+
+```sh
+$ cp "$WARGAME_HOME/profiles/scripts/custom/my-tools.sh" \
+     "$WARGAME_HOME/profiles/scripts/kali-custom/my-tools.sh"
+# edit it, then add it to the profile after the baseline script:
+#   provision:
+#     scripts:
+#       - scripts/kali-custom/common.sh
+#       - scripts/kali-custom/my-tools.sh
+#   tools:
+#     verify:
+#       - ropper --version
+$ wargame profile build kali-custom      # re-provisions and publishes a new image
+```
+
+`profiles/scripts/custom/my-tools.sh` (and `my-tools.ps1` for Windows) is a
+commented starting point: it is not run by any profile, and it spells out
+the three rules a provisioning script has to keep — idempotent, never
+interactive, non-zero exit fails the build (`exit 3010` on Windows means
+"reboot me first, then carry on").
+
+Everything under `$WARGAME_HOME/profiles/` is yours. A new binary re-seeds
+the profiles and scripts it ships with, but only over a copy that still
+matches what the previous binary wrote: a file you have edited — including
+one of the built-in scripts — is never overwritten. `profile init` goes
+further and gives a copied profile its own `scripts/<name>/` directory, so
+its scripts share no path with the templates at all.
+
 ```sh
 $ wargame search out_of_bound
 $ wargame open dreamhack:11
@@ -201,12 +254,13 @@ When you're done:
 
 ```sh
 $ wargame sessions                            # alias: wargame ls
-┌────────────────────────┬──────────────┬─────────┬──────────┬────────────────┬──────┬─────┐
-│ id                     ┆ title        ┆ state   ┆ network  ┆ profile        ┆ keep ┆ age │
-╞════════════════════════╪══════════════╪═════════╪══════════╪════════════════╪══════╪═════╡
-│ dh-out-of-bound-a1b2c3 ┆ out_of_bound ┆ running ┆ isolated ┆ macos-re-arm64 ┆      ┆ 7m  │
-└────────────────────────┴──────────────┴─────────┴──────────┴────────────────┴──────┴─────┘
-1 session(s), 1 up. Ids may be shortened to any unique prefix.
+┌────────────────────────┬──────────────┬─────────┬─────────┬──────────┬────────────────┬──────┬─────┐
+│ id                     ┆ title        ┆ state   ┆ backend ┆ network  ┆ profile        ┆ keep ┆ age │
+╞════════════════════════╪══════════════╪═════════╪═════════╪══════════╪════════════════╪══════╪═════╡
+│ dh-out-of-bound-a1b2c3 ┆ out_of_bound ┆ running ┆ tart    ┆ isolated ┆ macos-re-arm64 ┆      ┆ 7m  │
+│ dh-rev-basic-9f0e1d    ┆ rev-basic-0  ┆ stopped ┆ utm     ┆ isolated ┆ kali-custom    ┆ yes  ┆ 2h  │
+└────────────────────────┴──────────────┴─────────┴─────────┴──────────┴────────────────┴──────┴─────┘
+2 session(s), 1 up. Ids may be shortened to any unique prefix.
 
 $ wargame delete out_of          # discard the clone (alias: rm)
 $ wargame keep out_of            # or: mark it to survive `prune` (delete then needs --force)
