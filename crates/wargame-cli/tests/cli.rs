@@ -602,6 +602,136 @@ fn empty_session_list_points_at_the_next_command() {
     assert!(combined_of(&out).contains("no sessions exist yet"));
 }
 
+/// A session record as the pre-multi-OS build wrote it: no
+/// `guest_distribution`, `vm_mode`, `connection` or `workspace_root`, and a
+/// `vm_ref` naming a VM but carrying no stable id.
+const LEGACY_SESSION_JSON: &str = r#"{
+  "id": "dh-legacy-000001",
+  "display_name": "legacy",
+  "challenge": {
+    "ref": {"provider": "fixture", "id": "1"},
+    "slug": "legacy", "title": "legacy", "categories": [], "difficulty": null
+  },
+  "challenge_snapshot": {
+    "summary": {
+      "ref": {"provider": "fixture", "id": "1"},
+      "slug": "legacy", "title": "legacy", "categories": [], "difficulty": null
+    },
+    "description": "", "tags": [], "assets": [], "remote_endpoints": [],
+    "source_url": "https://example.invalid"
+  },
+  "vm_provider": "tart",
+  "profile": "macos-re-arm64",
+  "guest_os": "macos",
+  "guest_arch": "arm64",
+  "network": "isolated",
+  "resources": {"cpu": 2, "memory_mib": 4096, "disk_gib": 20},
+  "created_at": "2026-01-01T00:00:00Z",
+  "state": "stopped",
+  "vm_ref": {"backend": "tart", "name": "wg-dh-legacy-000001"},
+  "assets": [],
+  "keep": "discard",
+  "last_error": null,
+  "runner_pid": null,
+  "guest_ip": null
+}"#;
+
+fn write_legacy_session(home: &Path) {
+    let dir = home.join("sessions/dh-legacy-000001");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("metadata.json"), LEGACY_SESSION_JSON).unwrap();
+}
+
+/// spec.md §7 AC-08: a host with a UTM session, a Tart session and a record
+/// written before either existed lists, inspects and deletes all three, and
+/// the table says which backend each belongs to.
+#[test]
+fn mixed_backend_and_legacy_sessions_list_inspect_and_delete() {
+    let home = tempfile::tempdir().unwrap();
+    let fresh = launch_fixture(home.path());
+    write_legacy_session(home.path());
+
+    let out = fixture_fake_cmd(home.path())
+        .args(["sessions"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let table = stdout_of(&out);
+    assert!(table.contains("backend"), "{table}");
+    assert!(table.contains("dh-legacy-000001"), "{table}");
+    assert!(table.contains(&fresh), "{table}");
+    assert!(table.contains("tart"), "{table}");
+
+    // The legacy record's missing fields come back as the pre-multi-OS
+    // defaults rather than failing to parse.
+    let out = fixture_fake_cmd(home.path())
+        .args(["session", "inspect", "dh-legacy-000001", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let session: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    assert_eq!(session["vm_mode"], "virtualize");
+    assert_eq!(session["connection"]["user"], "admin");
+    assert_eq!(session["connection"]["shell"], "posix");
+    assert_eq!(session["vm_ref"]["id"], "wg-dh-legacy-000001");
+
+    // The human view names the backend, the mode and the guest.
+    let out = fixture_fake_cmd(home.path())
+        .args(["session", "inspect", "dh-legacy-000001"])
+        .output()
+        .unwrap();
+    let rendered = stdout_of(&out);
+    assert!(
+        rendered.contains("backend:   tart/virtualize"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("macos/arm64"), "{rendered}");
+
+    // `ssh` on a stopped session is refused before anything is exec'd, so
+    // the routing is exercised without reaching for the network.
+    let out = fixture_fake_cmd(home.path())
+        .args(["ssh", "dh-legacy-000001"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{:?}", out);
+
+    // resume / gui / stop all route on the record's own backend.
+    for args in [
+        vec!["resume", "dh-legacy-000001"],
+        vec!["gui", "dh-legacy-000001"],
+        vec!["stop", "dh-legacy-000001"],
+    ] {
+        let out = fixture_fake_cmd(home.path()).args(&args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    }
+
+    // Neither session's VM is an orphan, on either backend.
+    let out = fixture_fake_cmd(home.path())
+        .args(["prune", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    assert!(
+        stdout_of(&out).contains("No orphaned VMs"),
+        "{}",
+        stdout_of(&out)
+    );
+
+    for id in [fresh.as_str(), "dh-legacy-000001"] {
+        let out = fixture_fake_cmd(home.path())
+            .args(["delete", id, "--force"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{id}: {out:?}");
+    }
+    let out = fixture_fake_cmd(home.path())
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    let sessions: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    assert!(sessions.as_array().unwrap().is_empty(), "{sessions}");
+}
+
 #[test]
 fn completions_print_a_script_without_needing_a_home() {
     let out = Command::new(bin())

@@ -368,3 +368,28 @@ fn transport_calls(transport: &Arc<FakeTransport>) -> (Vec<Vec<String>>, Vec<(St
     }
     (execs, copies)
 }
+
+/// spec.md §3 FR-1: the preflight output says what the profile resolved to
+/// -- guest, architecture, backend and execution mode -- and which image the
+/// launch will clone, before anything is created.
+#[tokio::test]
+async fn preflight_names_the_resolved_backend_mode_and_image() {
+    let (ctx, _vm, wargame) = context();
+    wargame.set_authenticated("tester");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    launch(&ctx, request(), tx).await.expect("launch succeeds");
+
+    let mut preflight = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let LaunchEvent::Preflight(msg) = event {
+            preflight.push(msg);
+        }
+    }
+    let joined = preflight.join("\n");
+    assert!(joined.contains("macos/arm64"), "{joined}");
+    assert!(joined.contains("tart/virtualize"), "{joined}");
+    assert!(
+        joined.contains(&format!("image ready: {}", profile().image_name())),
+        "{joined}"
+    );
+}

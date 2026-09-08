@@ -158,7 +158,7 @@ impl SshGuestTransport {
 
         let cmd = Cmd::new("ssh", args);
         let out = self.runner.run(&cmd).await?;
-        let (status, stderr) = restore_exit_code(out.status, out.stderr);
+        let (status, stderr) = restore_exit_code(endpoint.shell, out.status, out.stderr);
         Ok(ExecResult {
             status,
             stdout: out.stdout,
@@ -358,11 +358,15 @@ pub fn shell_quote(s: &str) -> String {
 /// Puts back an exit code that could not survive `ssh`'s 8-bit exit status,
 /// and removes the marker line that carried it.
 ///
-/// Only `ssh`'s own 255 is examined, and only when the wrapper's marker is
-/// actually present, so a genuine 255 (or a genuine 194) is never
-/// reinterpreted.
-fn restore_exit_code(status: i32, stderr: String) -> (i32, String) {
-    if status != 255 {
+/// Three conditions, all required. The endpoint has to be a PowerShell one,
+/// because the marker only exists in the wrapper this crate generates for
+/// those -- a POSIX guest is never wrapped, so a POSIX command that exits
+/// exactly 255 while printing a marker-shaped line cannot have its status or
+/// its stderr rewritten. Only `ssh`'s own 255 is examined, and only when the
+/// marker is actually present, so a genuine 255 (or a genuine 194) is never
+/// reinterpreted either.
+fn restore_exit_code(shell: GuestShell, status: i32, stderr: String) -> (i32, String) {
+    if shell != GuestShell::PowerShell || status != 255 {
         return (status, stderr);
     }
     match powershell::take_exit_code_marker(&stderr) {

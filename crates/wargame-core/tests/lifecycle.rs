@@ -11,7 +11,8 @@ use time::OffsetDateTime;
 
 use wargame_core::app::profiles::ProfileStore;
 use wargame_core::app::{
-    delete, keep, prune, resume, stop, AppContext, BackendRegistry, TransportRegistry,
+    delete, inspect, keep, list_sessions, open_gui, prune, resume, ssh_command, stop, AppContext,
+    BackendRegistry, TransportRegistry,
 };
 use wargame_core::domain::{
     Challenge, ChallengeRef, ChallengeSummary, ExecutionMode, GuestArch, GuestConnection, GuestOs,
@@ -20,24 +21,36 @@ use wargame_core::domain::{
 use wargame_core::error::WargameError;
 use wargame_core::infra::fs::AppDirs;
 use wargame_core::infra::process::ProcessRunner;
-use wargame_core::ports::{ImageRef, VmProvider, VmSpec};
-use wargame_core::testing::{
-    FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider, MemoryRepo,
-};
+use wargame_core::infra::JsonSessionRepository;
+use wargame_core::ports::{ImageRef, StartOptions, VmProvider, VmSpec};
+use wargame_core::testing::{FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider};
 
 fn tmp_path() -> std::path::PathBuf {
     tempfile::tempdir().unwrap().keep()
 }
 
 fn context() -> (AppContext, Arc<FakeVmProvider>) {
-    let vm = Arc::new(FakeVmProvider::new());
+    let (ctx, tart, _utm) = mixed_context();
+    (ctx, tart)
+}
+
+/// An [`AppContext`] with *both* backends wired, which is what a host that
+/// has run a macOS profile and a Kali one looks like (spec.md §3 FR-5's
+/// "혼합 백엔드 세션").
+fn mixed_context() -> (AppContext, Arc<FakeVmProvider>, Arc<FakeVmProvider>) {
+    let tart = Arc::new(FakeVmProvider::new());
+    let utm = Arc::new(FakeVmProvider::with_backend("utm"));
+    let repo_dir = tmp_path();
     let ctx = AppContext {
         config: Default::default(),
         dirs: AppDirs { root: tmp_path() },
         wargame: Arc::new(FakeWargameProvider::new()),
-        backends: BackendRegistry::new(vec![vm.clone() as Arc<dyn VmProvider>]),
+        backends: BackendRegistry::new(vec![
+            tart.clone() as Arc<dyn VmProvider>,
+            utm.clone() as Arc<dyn VmProvider>,
+        ]),
         transports: TransportRegistry::new(Arc::new(FakeTransport::new())),
-        repo: Arc::new(MemoryRepo::new()),
+        repo: Arc::new(JsonSessionRepository::new(repo_dir)),
         builds: Arc::new(MemoryBuildRepo::new()),
         builders: BuilderRegistry::default(),
         disk: Arc::new(HostDiskSpace),
@@ -45,7 +58,7 @@ fn context() -> (AppContext, Arc<FakeVmProvider>) {
         runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
         bootstrap: wargame_core::app::BootstrapScripts::new("#!/bin/bash\n", "# ps\n"),
     };
-    (ctx, vm)
+    (ctx, tart, utm)
 }
 
 fn small_resources() -> Resources {
@@ -193,4 +206,223 @@ async fn prune_finds_an_orphan_vm_but_leaves_a_tracked_one_alone() {
     let orphans = prune(&ctx, false).await.unwrap();
     assert_eq!(orphans, vec!["tart/wg-orphan".to_string()]);
     assert_eq!(vm.vm_names(), vec!["wg-tracked".to_string()]);
+}
+
+// --- mixed backends and pre-multi-OS records (spec.md §7 AC-08) -----------
+
+/// A session record as the pre-multi-OS build wrote it: no
+/// `guest_distribution`, `vm_mode`, `connection` or `workspace_root`, and a
+/// `vm_ref` naming a VM but carrying no stable id.
+const LEGACY_SESSION_JSON: &str = r#"{
+  "id": "dh-legacy-000001",
+  "display_name": "legacy",
+  "challenge": {
+    "ref": {"provider": "dreamhack", "id": "1"},
+    "slug": "legacy", "title": "legacy", "categories": [], "difficulty": null
+  },
+  "challenge_snapshot": {
+    "summary": {
+      "ref": {"provider": "dreamhack", "id": "1"},
+      "slug": "legacy", "title": "legacy", "categories": [], "difficulty": null
+    },
+    "description": "", "tags": [], "assets": [], "remote_endpoints": [],
+    "source_url": "https://example.invalid"
+  },
+  "vm_provider": "tart",
+  "profile": "macos-re-arm64",
+  "guest_os": "macos",
+  "guest_arch": "arm64",
+  "network": "isolated",
+  "resources": {"cpu": 2, "memory_mib": 4096, "disk_gib": 20},
+  "created_at": "2026-01-01T00:00:00Z",
+  "state": "ready",
+  "vm_ref": {"backend": "tart", "name": "wg-dh-legacy-000001"},
+  "assets": [],
+  "keep": "discard",
+  "last_error": null,
+  "runner_pid": null,
+  "guest_ip": null
+}"#;
+
+/// Creates a VM on `vm` and stores a session pointing at it.
+async fn session_on(
+    ctx: &AppContext,
+    vm: &Arc<FakeVmProvider>,
+    id: &str,
+    state: SessionState,
+) -> Session {
+    let vm_ref = vm
+        .create(&VmSpec::new(
+            format!("wg-{id}"),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
+        .await
+        .unwrap();
+    if state.is_up() {
+        // `reconcile` trusts the backend over the record, so a session that
+        // says it is up needs a VM that is actually running.
+        vm.start(
+            &vm_ref,
+            &StartOptions {
+                network: NetworkMode::Isolated,
+                headless: true,
+                log_path: tmp_path().join("run.log"),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let mut s = session(id, state, KeepPolicy::Discard);
+    s.vm_provider = vm_ref.backend.clone();
+    if vm_ref.backend == "utm" {
+        s.guest_os = GuestOs::Linux;
+        s.guest_distribution = Some("kali".to_string());
+        s.vm_mode = ExecutionMode::Emulate;
+        s.guest_arch = GuestArch::X86_64;
+    }
+    s.vm_ref = Some(vm_ref);
+    ctx.repo.save(&s).await.unwrap();
+    s
+}
+
+/// Every lifecycle verb routes on the *session's* backend, so a Tart and a
+/// UTM session on the same host never touch each other's VMs.
+#[tokio::test]
+async fn stop_resume_and_delete_act_only_on_the_sessions_own_backend() {
+    let (ctx, tart, utm) = mixed_context();
+    session_on(&ctx, &tart, "mac-1", SessionState::Ready).await;
+    session_on(&ctx, &utm, "kali-1", SessionState::Ready).await;
+
+    let listed = list_sessions(&ctx).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    let mut backends: Vec<&str> = listed.iter().map(|s| s.backend_name()).collect();
+    backends.sort_unstable();
+    assert_eq!(backends, vec!["tart", "utm"]);
+
+    // Stopping the UTM session leaves the Tart one running.
+    assert_eq!(
+        stop(&ctx, "kali-1").await.unwrap().state,
+        SessionState::Stopped
+    );
+    assert_eq!(
+        inspect(&ctx, "mac-1").await.unwrap().state,
+        SessionState::Ready
+    );
+    assert_eq!(
+        resume(&ctx, "kali-1").await.unwrap().state,
+        SessionState::Running
+    );
+
+    // ... and deleting it removes exactly one VM, from one backend.
+    delete(&ctx, "kali-1", false).await.unwrap();
+    assert!(utm.vm_names().is_empty(), "{:?}", utm.vm_names());
+    assert_eq!(tart.vm_names(), vec!["wg-mac-1".to_string()]);
+    assert_eq!(list_sessions(&ctx).await.unwrap().len(), 1);
+}
+
+/// `prune` asks each wired backend for its own VMs and only deletes the ones
+/// no session claims -- on that backend (spec.md §3 FR-5: "다른 백엔드의 같은
+/// VM 이름을 혼동하지 않는다").
+#[tokio::test]
+async fn prune_keeps_tracked_vms_on_both_backends_and_names_the_backend() {
+    let (ctx, tart, utm) = mixed_context();
+    session_on(&ctx, &tart, "mac-1", SessionState::Ready).await;
+    session_on(&ctx, &utm, "kali-1", SessionState::Ready).await;
+    // The same VM *name* on both backends: only the untracked one goes.
+    for provider in [&tart, &utm] {
+        provider
+            .create(&VmSpec::new(
+                "wg-orphan".to_string(),
+                ImageRef("img".to_string()),
+                small_resources(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let mut orphans = prune(&ctx, false).await.unwrap();
+    orphans.sort();
+    assert_eq!(
+        orphans,
+        vec!["tart/wg-orphan".to_string(), "utm/wg-orphan".to_string()]
+    );
+    assert_eq!(tart.vm_names(), vec!["wg-mac-1".to_string()]);
+    assert_eq!(utm.vm_names(), vec!["wg-kali-1".to_string()]);
+}
+
+/// spec.md §3 FR-5: "과거 세션의 누락값은 기존 Tart/arm64/virtualize/admin
+/// 동작으로 복원한다" -- and every verb still works on such a record.
+#[tokio::test]
+async fn a_pre_multi_os_session_record_still_runs_the_whole_lifecycle() {
+    let (ctx, tart, _utm) = mixed_context();
+    tart.create(&VmSpec::new(
+        "wg-dh-legacy-000001".to_string(),
+        ImageRef("img".to_string()),
+        small_resources(),
+    ))
+    .await
+    .unwrap();
+    let legacy: Session = serde_json::from_str(LEGACY_SESSION_JSON).unwrap();
+    tart.start(
+        legacy.vm_ref.as_ref().unwrap(),
+        &StartOptions {
+            network: NetworkMode::Isolated,
+            headless: true,
+            log_path: tmp_path().join("run.log"),
+        },
+    )
+    .await
+    .unwrap();
+    ctx.repo.save(&legacy).await.unwrap();
+
+    let loaded = inspect(&ctx, "dh-legacy-000001").await.unwrap();
+    assert_eq!(loaded.backend_name(), "tart");
+    assert_eq!(loaded.vm_mode, ExecutionMode::Virtualize);
+    assert_eq!(loaded.connection, GuestConnection::default());
+    assert_eq!(loaded.connection.user, "admin");
+    assert_eq!(
+        loaded.vm_ref.as_ref().unwrap().id,
+        "wg-dh-legacy-000001",
+        "a record with no VM id addresses the VM by name, as Tart does"
+    );
+    assert!(loaded.workspace_root.is_empty());
+
+    assert_eq!(list_sessions(&ctx).await.unwrap().len(), 1);
+    assert_eq!(
+        stop(&ctx, "dh-legacy-000001").await.unwrap().state,
+        SessionState::Stopped
+    );
+    let resumed = resume(&ctx, "dh-legacy-000001").await.unwrap();
+    assert_eq!(resumed.state, SessionState::Running);
+    assert!(resumed.guest_ip.is_some());
+
+    // `gui` and `ssh` both go through the session's saved connection.
+    open_gui(&ctx, "dh-legacy-000001").await.unwrap();
+    let cmd = ssh_command(&ctx, "dh-legacy-000001").await.unwrap();
+    let rendered = format!("{cmd:?}");
+    assert!(rendered.contains("admin@"), "{rendered}");
+
+    delete(&ctx, "dh-legacy-000001", false).await.unwrap();
+    assert!(tart.vm_names().is_empty());
+    assert!(list_sessions(&ctx).await.unwrap().is_empty());
+}
+
+/// `gui` and `ssh` on a UTM session go to the UTM backend, addressing it by
+/// the stable id rather than the display name.
+#[tokio::test]
+async fn gui_and_ssh_use_the_utm_sessions_own_backend_and_connection() {
+    let (ctx, _tart, utm) = mixed_context();
+    let mut s = session_on(&ctx, &utm, "kali-1", SessionState::Ready).await;
+    s.connection = GuestConnection::new("kali", GuestOs::Linux);
+    ctx.repo.save(&s).await.unwrap();
+
+    open_gui(&ctx, "kali-1").await.unwrap();
+    assert!(
+        utm.calls().iter().any(|c| c.starts_with("start")),
+        "{:?}",
+        utm.calls()
+    );
+    let rendered = format!("{:?}", ssh_command(&ctx, "kali-1").await.unwrap());
+    assert!(rendered.contains("kali@"), "{rendered}");
 }

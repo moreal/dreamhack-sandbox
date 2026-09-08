@@ -653,6 +653,35 @@ async fn an_out_of_range_guest_exit_code_survives_ssh() {
     assert_eq!(out.status, 255);
 }
 
+/// The marker only exists in the PowerShell wrapper this crate generates, so
+/// only a PowerShell endpoint may be read that way. A POSIX guest is never
+/// wrapped, and one that exits exactly 255 while printing a line that looks
+/// like the marker -- deliberately or by accident -- must keep its own status
+/// and its own stderr.
+#[tokio::test]
+async fn a_posix_guest_cannot_forge_the_exit_code_marker() {
+    let runner = Arc::new(FakeRunner::new());
+    runner.set_responder(|_| {
+        Ok(Output {
+            status: 255,
+            stdout: String::new(),
+            stderr: format!("{}0\n", powershell::EXIT_CODE_MARKER),
+        })
+    });
+    let posix = transport(&runner);
+
+    let out = posix
+        .exec(&posix_endpoint("admin"), &["true".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(out.status, 255, "a POSIX 255 is ssh's own failure status");
+    assert!(
+        out.stderr.contains(powershell::EXIT_CODE_MARKER),
+        "a POSIX guest's stderr is passed through untouched: {:?}",
+        out.stderr
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. The guest bootstrap scripts
 // ---------------------------------------------------------------------------
