@@ -1,0 +1,16 @@
+[package]
+name = "wargame-utm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "UTM (QEMU) VM backend for wargame-vm"
+
+[dependencies]
+wargame-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

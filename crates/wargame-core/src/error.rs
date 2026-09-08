@@ -67,6 +67,11 @@ pub enum WargameError {
     Config(String),
     #[error("credential store error: {0}")]
     CredentialStore(String),
+    /// The backend has no VM with this id: it was deleted outside wargame,
+    /// or never existed. Never a reason to create one (spec.md §3 FR-5's
+    /// "외부에서 VM 삭제 ... 관계없는 VM 생성/삭제 금지").
+    #[error("virtual machine not found: {0}")]
+    VmNotFound(String),
     /// macOS refused an Apple Event to `app` (TCC "Automation" grant
     /// missing), e.g. AppleScript error -1743 (spec.md §6's "UTM
     /// 미설치·자동화 권한 거부" row).

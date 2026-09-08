@@ -4,6 +4,7 @@ members = [
     "crates/wargame-core",
     "crates/wargame-dreamhack",
     "crates/wargame-tart",
+    "crates/wargame-utm",
     "crates/wargame-cli",
 ]
 
@@ -18,6 +19,7 @@ rust-version = "1.85"
 wargame-core = { path = "crates/wargame-core" }
 wargame-dreamhack = { path = "crates/wargame-dreamhack" }
 wargame-tart = { path = "crates/wargame-tart" }
+wargame-utm = { path = "crates/wargame-utm" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time", "sync"] }
 async-trait = "0.1"
