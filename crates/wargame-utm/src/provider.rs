@@ -40,7 +40,7 @@ use wargame_core::ports::{
 use crate::automation::{Automation, MakeVmParams, OrphanQemu, StopMethod, UtmStatus, UtmVm};
 use crate::config::{
     architecture, display_hardware, meets_minimum, network_mode, parse_version, UtmConfig,
-    BUNDLED_UTMCTL, ISOLATED_NETWORK_DETAIL, MIN_UTM_VERSION, VERIFIED_UTM_VERSION,
+    ISOLATED_NETWORK_DETAIL, MIN_UTM_VERSION, VERIFIED_UTM_VERSION,
 };
 use crate::console;
 
@@ -565,9 +565,15 @@ impl VmProvider for UtmProvider {
 
     async fn start(&self, vm: &VmRef, opts: &StartOptions) -> Result<RuntimeInfo> {
         if opts.headless {
-            // T7: `--hide` emits -10004 and hides nothing; there is no
-            // headless start. The window is part of the deal.
-            tracing::debug!(vm = %vm.id, "UTM has no headless start; the VM window will open");
+            // T7: `--hide` emits -10004 twice and hides nothing; there is
+            // no headless start at all. Say so at `warn`, which is the most
+            // visible channel an adapter has (it reaches
+            // `$WARGAME_HOME/logs/wargame.log` and `-v`'s stderr): a caller
+            // that asked for headless is getting something else.
+            tracing::warn!(
+                vm = %vm.id,
+                "UTM has no headless start (`utmctl --hide` is broken in 4.7.5); this VM's window will open"
+            );
         }
         let status = self.automation.status(&vm.id).await?;
         if status == UtmStatus::Missing {
@@ -710,16 +716,21 @@ impl VmProvider for UtmProvider {
     }
 
     async fn status(&self, vm: &VmRef) -> Result<VmStatus> {
+        // Exhaustive over UTM's status enumeration, so a new state in a
+        // future release is a compile error rather than a silent
+        // "stopped" (docs/utm-compatibility.md §2's state machine).
         Ok(match self.automation.status(&vm.id).await? {
-            // `starting`/`started`/`pausing`/`paused`/`resuming` all have a
-            // live backend; a paused VM is still occupying its resources.
-            status if status.is_live() => VmStatus::Running,
-            // `stopping` is reported as stopped-in-progress: nothing may be
+            // These five all have a live backend; a paused VM is still
+            // occupying its resources.
+            UtmStatus::Starting
+            | UtmStatus::Started
+            | UtmStatus::Pausing
+            | UtmStatus::Paused
+            | UtmStatus::Resuming => VmStatus::Running,
+            // `stopping` counts as stopped-in-progress: nothing may be
             // written to the configuration in that state either.
             UtmStatus::Stopped | UtmStatus::Stopping => VmStatus::Stopped,
             UtmStatus::Missing => VmStatus::Missing,
-            // `is_live` covers the rest; this keeps the match total.
-            _ => VmStatus::Stopped,
         })
     }
 
@@ -741,11 +752,18 @@ impl VmProvider for UtmProvider {
     }
 
     fn console(&self, vm: &VmRef) -> ConsoleDescriptor {
-        let utmctl = self
-            .automation
-            .utmctl_path()
-            .unwrap_or_else(|_| BUNDLED_UTMCTL.to_string());
-        console::console(&utmctl, &vm.id)
+        // Without UTM there is no console at all. Handing back an argv
+        // pointing at a `utmctl` that is not there would fail as "no such
+        // file or directory", which tells the user nothing; `None` is the
+        // honest answer, and `open_console` (which can return an error)
+        // names UTM properly.
+        match self.automation.utmctl_path() {
+            Ok(utmctl) => console::console(&utmctl, &vm.id),
+            Err(e) => {
+                tracing::warn!(vm = %vm.id, error = %e, "no UTM console: utmctl was not found");
+                ConsoleDescriptor::None
+            }
+        }
     }
 }
 

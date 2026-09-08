@@ -200,7 +200,14 @@ const DELETE_BODY: &str = r#"delete vm
 const DUPLICATE_PROLOGUE: &str = r#"set newName to item 2 of argv"#;
 // `duplicate` returns nothing at all (T2), so the caller finds the new UUID
 // by comparing the registry before and after.
-const DUPLICATE_BODY: &str = r#"duplicate vm with properties {configuration:{name:newName}}
+//
+// Unlike every other verb here, `duplicate` cannot take the loop's own
+// reference: `duplicate vm` (and `duplicate (contents of vm)`) fails with
+// `Handler only handles single objects. (-10014)`, verified on UTM 4.7.5.
+// It needs a single-object specifier, so the loop stays as the existence
+// check -- which is what produces the not-found sentinel -- and the copy
+// itself addresses the VM by `whose id is`, still never by name (T3).
+const DUPLICATE_BODY: &str = r#"duplicate (first virtual machine whose id is vmId) with properties {configuration:{name:newName}}
 				return "ok""#;
 
 const HARDWARE_PROLOGUE: &str = r#"set memMib to (item 2 of argv) as integer
@@ -323,16 +330,41 @@ fn is_vm_not_found(stderr: &str) -> bool {
     stderr.contains("Virtual machine not found")
 }
 
+/// Whether `stderr` carries the OSStatus/AppleScript error `code` as a
+/// *number* rather than as a substring: `-609` must not be found inside
+/// `-6091`, and a path or a UUID that happens to contain those digits is
+/// not an error code (§1 says to match on the number).
+fn has_error_code(stderr: &str, code: &str) -> bool {
+    let bytes = stderr.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = stderr[from..].find(code) {
+        let start = from + offset;
+        let end = start + code.len();
+        // A real code stands alone: UTM writes `error -609.)` or `(-1712)`,
+        // so the characters around it are punctuation or whitespace, never
+        // part of a longer number, identifier or path segment.
+        let boundary = |byte: Option<&u8>| match byte {
+            None => true,
+            Some(b) => !(b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_'),
+        };
+        if boundary(start.checked_sub(1).map(|i| &bytes[i])) && boundary(bytes.get(end)) {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
 /// A denied macOS Automation grant, by error number only -- the prose
 /// carries typographic apostrophes and is not matchable (§1).
 fn is_automation_denied(stderr: &str) -> bool {
-    stderr.contains("-1743") || stderr.contains("errAEEventNotPermitted")
+    has_error_code(stderr, "-1743") || stderr.contains("errAEEventNotPermitted")
 }
 
 /// The app was not up (`-609`) or was wedged (`-1712`) -- the two shapes
 /// T8 says to retry once after re-handshaking.
 fn is_transient_app_error(stderr: &str) -> bool {
-    stderr.contains("-609") || stderr.contains("-1712")
+    has_error_code(stderr, "-609") || has_error_code(stderr, "-1712")
 }
 
 /// The single line of `stderr` worth showing, or the whole thing when it is
@@ -578,35 +610,53 @@ impl Automation {
         })
     }
 
-    pub async fn start(&self, id: &str) -> Result<()> {
+    /// Runs an id-addressed script that acts on the VM and returns `"ok"`,
+    /// after making sure the app is up (T8).
+    ///
+    /// **The sentinel is an error here.** Every id-addressed script falls
+    /// through its `repeat` loop when no VM carries that UUID and returns
+    /// [`VM_NOT_FOUND`] with exit 0 -- a perfectly successful `osascript`
+    /// run. Discarding that would turn "the VM is gone" into a silent
+    /// no-op reported as success: a `set_network_mode` that never ran while
+    /// an isolated session boots on whatever the source VM had, a delete
+    /// that deleted nothing. Only [`Automation::status`] interprets the
+    /// sentinel itself, because there "missing" is the answer rather than a
+    /// failure.
+    async fn run_on_vm(&self, id: &str, script: &str, args: &[&str]) -> Result<()> {
         self.ensure_app_running().await?;
-        self.osascript(&vm_script("", START_BODY), &[id]).await?;
+        let mut argv = vec![id];
+        argv.extend_from_slice(args);
+        let out = self.osascript(script, &argv).await?;
+        if out.trim() == VM_NOT_FOUND {
+            return Err(WargameError::VmNotFound(format!(
+                "UTM has no virtual machine with id {id}"
+            )));
+        }
         Ok(())
+    }
+
+    pub async fn start(&self, id: &str) -> Result<()> {
+        self.run_on_vm(id, &vm_script("", START_BODY), &[]).await
     }
 
     pub async fn stop(&self, id: &str, method: StopMethod) -> Result<()> {
-        self.ensure_app_running().await?;
-        self.osascript(&vm_script(STOP_PROLOGUE, STOP_BODY), &[id, method.as_str()])
-            .await?;
-        Ok(())
+        self.run_on_vm(id, &vm_script(STOP_PROLOGUE, STOP_BODY), &[method.as_str()])
+            .await
     }
 
     pub async fn delete(&self, id: &str) -> Result<()> {
-        self.ensure_app_running().await?;
-        self.osascript(&vm_script("", DELETE_BODY), &[id]).await?;
-        Ok(())
+        self.run_on_vm(id, &vm_script("", DELETE_BODY), &[]).await
     }
 
     /// `duplicate`, which returns nothing (T2). The caller resolves the new
     /// UUID by comparing the registry before and after.
     pub async fn duplicate(&self, source_id: &str, new_name: &str) -> Result<()> {
-        self.ensure_app_running().await?;
-        self.osascript(
+        self.run_on_vm(
+            source_id,
             &vm_script(DUPLICATE_PROLOGUE, DUPLICATE_BODY),
-            &[source_id, new_name],
+            &[new_name],
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// `make new virtual machine`, returning `(id, name)` read back from
@@ -652,52 +702,49 @@ impl Automation {
         memory_mib: u64,
         hypervisor: bool,
     ) -> Result<()> {
-        self.osascript(
+        self.run_on_vm(
+            id,
             &vm_script(HARDWARE_PROLOGUE, HARDWARE_BODY),
             &[
-                id,
                 &memory_mib.to_string(),
                 &cpu_cores.to_string(),
                 &hypervisor.to_string(),
             ],
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// `host` (isolated) or `shared` (NAT) on the first interface.
     pub async fn set_network_mode(&self, id: &str, mode: &str) -> Result<()> {
-        self.osascript(&vm_script(NETWORK_PROLOGUE, NETWORK_BODY), &[id, mode])
-            .await?;
-        Ok(())
+        self.run_on_vm(id, &vm_script(NETWORK_PROLOGUE, NETWORK_BODY), &[mode])
+            .await
     }
 
     /// Gives the VM exactly one display, so UTM opens a window for it (§3).
     pub async fn set_display(&self, id: &str, hardware: &str) -> Result<()> {
-        self.osascript(&vm_script(DISPLAY_PROLOGUE, DISPLAY_BODY), &[id, hardware])
-            .await?;
-        Ok(())
+        self.run_on_vm(id, &vm_script(DISPLAY_PROLOGUE, DISPLAY_BODY), &[hardware])
+            .await
     }
 
     /// Appends a removable drive backed by `iso` (the Windows guest-tools
     /// CD case, §2).
     pub async fn attach_iso(&self, id: &str, iso: &Path) -> Result<()> {
-        self.osascript(
+        self.run_on_vm(
+            id,
             &vm_script(ATTACH_ISO_PROLOGUE, ATTACH_ISO_BODY),
-            &[id, &iso.display().to_string()],
+            &[&iso.display().to_string()],
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Points the first removable drive at another ISO.
     pub async fn replace_iso(&self, id: &str, iso: &Path) -> Result<()> {
-        self.osascript(
+        self.run_on_vm(
+            id,
             &vm_script(REPLACE_ISO_PROLOGUE, REPLACE_ISO_BODY),
-            &[id, &iso.display().to_string()],
+            &[&iso.display().to_string()],
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// The guest's address, via the QEMU guest agent. `Ok(None)` means the
@@ -921,6 +968,24 @@ mod tests {
     }
 
     #[test]
+    fn error_codes_are_matched_as_numbers_not_as_substrings() {
+        assert!(has_error_code("(OSStatus error -609.)", "-609"));
+        assert!(has_error_code("execution error: … (-1712)", "-1712"));
+        // A longer code that merely contains ours is not ours.
+        assert!(!has_error_code("(OSStatus error -6091.)", "-609"));
+        assert!(!has_error_code("(-17120)", "-1712"));
+        // Nor is a path or a name that happens to carry the digits.
+        assert!(!has_error_code(
+            "file.filename=/Users/x/iso/kali-609-installer.iso",
+            "-609"
+        ));
+        assert!(!is_transient_app_error(ERR_NOT_RUNNING));
+        assert!(is_transient_app_error(
+            "Error from event: … (OSStatus error -609.)"
+        ));
+    }
+
+    #[test]
     fn the_status_enumeration_is_complete_and_stopping_is_not_live() {
         for state in [
             "stopped", "starting", "started", "pausing", "paused", "resuming", "stopping",
@@ -955,6 +1020,18 @@ mod tests {
             let tell = script.find("tell application").expect("a tell block");
             assert!(posix < tell, "{script}");
         }
+    }
+
+    /// `duplicate` needs a single-object specifier: the loop reference every
+    /// other verb uses fails with -10014 on UTM 4.7.5. The loop stays (it is
+    /// what produces the sentinel), the copy addresses the VM by id.
+    #[test]
+    fn the_duplicate_script_addresses_the_source_by_id_not_by_the_loop_reference() {
+        let script = vm_script(DUPLICATE_PROLOGUE, DUPLICATE_BODY);
+        assert!(script.contains("duplicate (first virtual machine whose id is vmId)"));
+        assert!(!script.contains("duplicate vm "));
+        assert!(!script.contains("virtual machine named"));
+        assert!(script.contains(VM_NOT_FOUND));
     }
 
     /// T4: `protocol:TCP` collides with the `serial interface` enumerator.

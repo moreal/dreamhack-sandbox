@@ -23,7 +23,7 @@ use wargame_core::ports::{
 };
 use wargame_core::testing::FakeRunner;
 
-use wargame_utm::{UtmConfig, UtmProvider, BUNDLED_UTMCTL};
+use wargame_utm::{Automation, StopMethod, UtmConfig, UtmProvider, BUNDLED_UTMCTL};
 
 // --- fixtures (real output, byte-exact) ------------------------------------
 
@@ -1173,4 +1173,108 @@ async fn image_readiness_without_a_build_record_is_not_ready() {
         .image_exists(&ImageRef("wargame-profile-kali".to_string()))
         .await
         .unwrap());
+}
+
+// --- a VM that vanished mid-operation --------------------------------------
+
+/// An id-addressed script whose `repeat` loop finds nothing returns the
+/// sentinel with **exit 0** -- a perfectly successful `osascript` run. Every
+/// verb has to turn that into an error: a silent no-op reported as success
+/// is how an isolated session comes up on the source VM's network, or a
+/// delete reports it deleted something it did not.
+#[tokio::test]
+async fn every_id_addressed_verb_errors_when_the_vm_is_gone() {
+    macro_rules! assert_vanished {
+        ($call:expr, $what:literal) => {{
+            let err = $call
+                .await
+                .expect_err(concat!($what, " must not silently succeed"));
+            assert!(
+                matches!(err, WargameError::VmNotFound(_)),
+                "{}: {err:?}",
+                $what
+            );
+            assert!(err.to_string().contains(UNKNOWN_ID), "{}: {err}", $what);
+        }};
+    }
+
+    let fake = runner(|cmd| {
+        // Everything but the version probe falls through its repeat loop.
+        (cmd.program == "osascript" && !script_of(cmd).contains("UTM version"))
+            .then(|| ok("wargame-utm:vm-not-found\n"))
+    });
+    let a = Automation::new(fake as Arc<dyn ProcessRunner>, UtmConfig::default());
+    let iso = Path::new("/iso/tools.iso");
+
+    // lifecycle verbs
+    assert_vanished!(a.start(UNKNOWN_ID), "start");
+    assert_vanished!(a.stop(UNKNOWN_ID, StopMethod::Force), "stop");
+    assert_vanished!(a.delete(UNKNOWN_ID), "delete");
+    assert_vanished!(a.duplicate(UNKNOWN_ID, "wg-copy"), "duplicate");
+    // configuration writes
+    assert_vanished!(a.set_hardware(UNKNOWN_ID, 4, 8192, false), "set_hardware");
+    assert_vanished!(a.set_network_mode(UNKNOWN_ID, "host"), "set_network_mode");
+    assert_vanished!(a.set_display(UNKNOWN_ID, "virtio-vga"), "set_display");
+    // drive writes
+    assert_vanished!(a.attach_iso(UNKNOWN_ID, iso), "attach_iso");
+    assert_vanished!(a.replace_iso(UNKNOWN_ID, iso), "replace_iso");
+
+    // `status` is the one verb that interprets the sentinel itself: there,
+    // "gone" is the answer rather than a failure.
+    assert_eq!(
+        a.status(UNKNOWN_ID).await.unwrap(),
+        wargame_utm::UtmStatus::Missing
+    );
+}
+
+/// The realistic race: the VM is there when `start` reads its status and
+/// gone by the time the network mode is written. The session must not boot
+/// on whatever network the source VM had.
+#[tokio::test]
+async fn start_fails_when_the_vm_vanishes_before_its_network_is_applied() {
+    let fake = runner(|cmd| {
+        if is_osascript(cmd, "status of vm") {
+            return Some(ok("stopped\tqemu\n"));
+        }
+        is_osascript(cmd, "network interfaces").then(|| ok("wargame-utm:vm-not-found\n"))
+    });
+    let p = provider(fake.clone());
+
+    let err = p
+        .start(&vm_ref(X86_ID, "wg-x"), &start_opts(NetworkMode::Isolated))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WargameError::VmNotFound(_)), "{err:?}");
+    assert!(
+        !fake.calls().iter().any(|c| is_osascript(c, "start vm")),
+        "the VM must not be started after the network write was lost"
+    );
+}
+
+/// Same shape one level up: `delete` may not report success when the
+/// `delete vm` script found nothing to delete.
+#[tokio::test]
+async fn delete_errors_when_the_delete_script_finds_nothing() {
+    let listing = owned_list(X86_ID, "stopped", "wg-x");
+    let fake = runner(move |cmd| {
+        if utmctl_sub(cmd) == Some("list") {
+            return Some(ok(&listing));
+        }
+        if is_osascript(cmd, "status of vm") {
+            return Some(ok("stopped\tqemu\n"));
+        }
+        is_osascript(cmd, "delete vm").then(|| ok("wargame-utm:vm-not-found\n"))
+    });
+    let p = provider(fake);
+    let err = p.delete(&vm_ref(X86_ID, "wg-x")).await.unwrap_err();
+    assert!(matches!(err, WargameError::VmNotFound(_)), "{err:?}");
+}
+
+/// Without UTM there is no console; an argv pointing at a `utmctl` that is
+/// not installed would fail as "no such file or directory".
+#[test]
+fn console_without_utm_installed_is_no_console_at_all() {
+    let fake = Arc::new(FakeRunner::new()); // no `which` entries
+    let p = UtmProvider::new(fake as Arc<dyn ProcessRunner>, UtmConfig::default());
+    assert_eq!(p.console(&vm_ref(X86_ID, "wg-x")), ConsoleDescriptor::None);
 }
