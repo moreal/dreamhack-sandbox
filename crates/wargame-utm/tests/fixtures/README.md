@@ -8,8 +8,13 @@ command/output/exit-code log covering create → attach a second ISO → replace
 quirks → `qemu additional arguments` round-trip → network mode `host` with the host-side `ifconfig`
 before and after → serial address → input automation → the full suspend/resume/stop status walk →
 export/import (and the duplicate-name trap) → `hypervisor` true-vs-false on x86_64 with both the
-configuration readback and the generated `-accel` → `--attach` → the orphan-QEMU trap and its
-recovery → cleanup. Every other file here is a single capture pulled out for direct matching.
+configuration readback and the generated `-accel` → cleanup.
+
+Two behaviours are captured elsewhere because they turn on *which stream* a line arrives on and on
+the un-piped exit status, which that transcript's merged `2>&1` cannot show:
+[`attach-and-default-drives.txt`](attach-and-default-drives.txt) (the `--attach` stub and the
+drives UTM invents on its own) and [`orphan-qemu-process.txt`](orphan-qemu-process.txt) (trap T12,
+a one-off). Every other file here is a single capture pulled out for direct matching.
 
 **Matching rule:** UTM emits typographic apostrophes (U+2019) — `couldn’t`, `Can’t`. These files
 are byte-exact. Match on the error **number** (`-1700`, `-2700`, `-1743`, …) or on an ASCII-only
@@ -42,7 +47,7 @@ where a "post-processing" note says so. All VMs used were app-owned temporaries 
 | `utmctl-list-empty.txt` | `utmctl list` after every temp VM was deleted — header row only | 0 |
 | `utmctl-status-stopped.txt` | `utmctl status wargame-t1-kali-arm64` | 0 |
 | `utmctl-status-started.txt` | `utmctl status wargame-t1-kali-arm64` while running | 0 |
-| `utmctl-attach-not-implemented.txt` | `utmctl attach wargame-t1-kali-arm64` (running) | 0 — command is a stub |
+| `utmctl-attach-not-implemented.txt` | `utmctl attach wargame-t1-kali-arm64` (running) | 0 — command is a stub; the stream-separated version is in `attach-and-default-drives.txt` §4 |
 
 ## Error shapes
 
@@ -54,7 +59,7 @@ is a non-zero exit. Apple-Event failures are reported on stderr with **exit 0**.
 | `utmctl-error-vm-not-found.stderr.txt` | `utmctl status wargame-t1-does-not-exist` | **1** |
 | `utmctl-error-not-running.stderr.txt` | `utmctl stop wargame-t1-kali-arm64` while stopped | **0** |
 | `utmctl-error-guest-agent-missing.stderr.txt` | `utmctl ip-address wargame-t1-kali-arm64` while running, no guest agent | **0** |
-| `utmctl-error-orphan-qemu-lock.stderr.txt` | `utmctl start wargame-t1-attach` while an orphaned QEMU process from the previous `stop --kill` still held `efi_vars.fd` (trap T12) | **0** |
+| `utmctl-error-orphan-qemu-lock.stderr.txt` | `utmctl start wargame-t1-attach` while an orphaned QEMU process from the previous `stop --kill` still held `efi_vars.fd` (trap T12; context in `orphan-qemu-process.txt`) | **0** |
 | `applescript-error-vm-not-found.txt` | `osascript -e 'tell application "UTM" to return id of virtual machine named "wargame-t1-does-not-exist"'` | 1 |
 | `applescript-error-appleevents-denied.txt` | `osascript -e 'tell application "System Events" to tell process "UTM" to return name of every window'` | 1 |
 | `applescript-error-unknown-property-tpm.txt` | `update configuration … with (configuration & {tpm:true})` | 1 |
@@ -119,12 +124,15 @@ ps -Aww -o command | grep 'qemu-x86_64-softmmu'  | grep -v grep     # x86_64 VMs
 | `qemu-argv-x86_64-emulate-hypervisor-off.txt` | `architecture:"x86_64", hypervisor:false` → `-accel tcg,tb-size=1024` |
 | `qemu-argv-x86_64-emulate-hypervisor-on-ignored.txt` | same VM with `hypervisor:true` → still `-accel tcg,tb-size=1024` |
 
-## Consolidated readback log
+## Consolidated logs and their drivers
 
 | File | How |
 |---|---|
-| `readback-transcript.txt` | `./readback-transcript.sh > readback-transcript.txt 2>&1` — sections are numbered `## 0.` … `## 16.` and are cited by number from `docs/utm-compatibility.md`. Read the PROVENANCE note at the top: §14 and §15 were transcribed by hand from runs with stdout and stderr captured separately, because those two sections are *about* stream and exit-code behaviour that an inline `2>&1` would hide. |
+| `readback-transcript.txt` | `./readback-transcript.sh > readback-transcript.txt 2>&1` — sections `## 0.` … `## 13.` plus `## 14.` (cleanup), cited by number from `docs/utm-compatibility.md`. Fully driver-captured; nothing hand-written. Because the driver merges stdout and stderr, anything that turns on *which* stream a line came from lives in its own fixture instead (next two rows). |
 | `readback-transcript.sh` | the driver itself, with `AS` (defaults to `./applescript`) and `OUT` (defaults to `$TMPDIR`) parameterised. It creates two `wargame-t1-*` VMs; delete them by UUID afterwards. |
+| `attach-and-default-drives.txt` | `./attach-probe.sh > attach-and-default-drives.txt 2>&1` — keeps stdout and stderr apart and records the un-piped exit status and wall-clock seconds. Covers (a) the two drives UTM invents when `make` omits the `drives` key, argv included, and (b) `utmctl attach` plus three consecutive `utmctl start --attach` runs. Ends with an ANOMALY note about two earlier `--attach` runs that blocked instead. |
+| `attach-probe.sh` | that driver. Creates one VM, `wargame-t1-attach2`, and deletes it. |
+| `orphan-qemu-process.txt` | trap T12. **One-off observation, transcribed command by command** — see its own PROVENANCE header. Every quoted line is byte-exact; the trigger is unknown and it has not been reproduced deliberately. |
 
 ## Boot evidence
 

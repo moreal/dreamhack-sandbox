@@ -1,15 +1,18 @@
 ### Consolidated readback transcript — UTM 4.7.5 / macOS 26.6.2 / 2026-09-08T17:24:46Z
 
-# PROVENANCE. Sections 0-13 and 16 are captured verbatim by the driver
-# (readback-transcript.sh): it echoes each command, runs it, and prints its exit code.
-# Sections 14 and 15 were TRANSCRIBED BY HAND from separate runs made with stdout and
-# stderr captured to different files, because the point of those two sections is which
-# stream each line arrives on and what the real exit code is -- information the inline
-# `2>&1` driver destroys. The quoted lines are byte-exact from those runs; the `$ ...`
-# lines above them are the commands that produced them.
-# The committed readback-transcript.sh is that same driver with two paths parameterised
-# (AS defaults to ./applescript, OUT to $TMPDIR); the run recorded here used absolute
-# scratchpad paths, which is why they appear in full below.
+# PROVENANCE. Every section below is captured verbatim by readback-transcript.sh: the
+# driver echoes each command, runs it with stdout and stderr merged, and prints its exit
+# code. Nothing here is hand-written. The committed driver is the same script with two
+# paths parameterised (AS defaults to ./applescript, OUT to $TMPDIR); the run recorded
+# here used absolute scratchpad paths, which is why they appear in full below.
+#
+# Because this driver merges the streams, it cannot show WHICH stream a line arrived on
+# or the un-piped exit status. Two behaviours that turn on exactly that are captured in
+# their own fixtures instead, each with its own driver or provenance note:
+#   attach-and-default-drives.txt  -- `utmctl attach` / `utmctl start --attach`, and the
+#                                     drives UTM invents when `make` omits the key
+#   orphan-qemu-process.txt        -- trap T12, a one-off observation
+# Section numbering therefore runs 0..13 then 14 (cleanup); there is no 15.
 
 ## 0. app handshake (trap T8)
 $ open -a UTM
@@ -323,63 +326,9 @@ exit=0
 
 
 
-## 14. `utmctl start --attach` and `utmctl attach` are both the same stub
-$ osascript -e 'tell application "UTM" to make new virtual machine with properties {backend:qemu, configuration:{name:"wargame-t1-attach", architecture:"aarch64", memory:1024, cpu cores:1}}'
-7633A4A1-8256-4D65-8405-07E327886D78 wargame-t1-attach
-exit=0
-
-$ time timeout 15 utmctl start wargame-t1-attach --attach </dev/null
-timeout 15 utmctl start "$V" --attach < /dev/null  0.02s user 0.02s system 0% cpu 15.015 total
-exit=124  # not 124: the command returns at once instead of streaming the serial port
-
-$ utmctl status wargame-t1-attach
-started
-exit=0
-
-# the VM did start; the serial port is still only reachable by reading the ptty yourself
-$ osascript serial-port-address.applescript wargame-t1-attach
-/dev/ttys002
-exit=0
-
-$ utmctl stop wargame-t1-attach --kill
-exit=0
-stopped after 1s
-
-## 14. `utmctl start --attach` is the same stub as `utmctl attach`
-$ utmctl start wargame-t1-attach --attach </dev/null   # stdout
-WARNING: attach command is not implemented yet!
-exit=0   # returns at once; the VM does start, but no serial data is streamed
-
-$ utmctl attach wargame-t1-attach </dev/null           # stdout, VM already running
-WARNING: attach command is not implemented yet!
-PTTY: /dev/ttys002
-exit=0
-
-## 15. NEW TRAP: `stop --kill` can leave an orphan QEMU process that UTM reports as stopped
-$ utmctl stop wargame-t1-attach --kill && utmctl status wargame-t1-attach
-stopped
-
-$ ps -o pid,ppid,stat,etime,command -p $(pgrep -f qemu-aarch64-softmmu)
-  PID  PPID STAT ELAPSED
-58445 92742 R      03:40
-  ... QEMULauncher .../qemu-aarch64-softmmu ... -name wargamet1attach -uuid 7633A4A1-8256-4D65-8405-07E327886D78
-# parent is UTM's QEMUHelper XPC service; state R (spinning); still alive minutes later
-
-# every later start of that VM then fails on the firmware variable store, with exit 0:
-$ utmctl start wargame-t1-attach   # stderr
-Error from event: The operation couldn’t be completed. (OSStatus error -2700.)
-QEMU error: QEMU exited from an error: Is another process using the image [/Users/moreal/Library/Containers/com.utmapp.UTM/Data/Documents/wargame-t1-attach.utm/Data/efi_vars.fd]?
-exit=0
-
-$ utmctl status wargame-t1-attach
-stopped
-
-# waiting does not help: the same failure reproduced after 0 s, 3 s and 10 s of extra wait.
-# recovery on this host was: kill the orphan pid, then start again.
-$ kill -9 <orphan-pid>; utmctl start wargame-t1-attach; utmctl status wargame-t1-attach
-started
-
-## 16. final cleanup — delete by UUID, skipping any VM whose name is not ours
+## 14. final cleanup — delete by UUID, skipping any VM whose name is not ours
+# (appended after the driver finished; the VM listed here is wargame-t1-attach, created
+#  by hand for the --attach and orphan work described in orphan-qemu-process.txt)
 UUID                                 Status   Name
 7633A4A1-8256-4D65-8405-07E327886D78 stopped  wargame-t1-attach
 deleted 7633A4A1-8256-4D65-8405-07E327886D78 (wargame-t1-attach)

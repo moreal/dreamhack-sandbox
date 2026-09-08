@@ -1,0 +1,71 @@
+### Trap T12 — `stop --kill` left an orphan QEMU process while UTM reported `stopped`
+### UTM 4.7.5 / macOS 26.6.2 / 2026-09-09, VM wargame-t1-attach (7633A4A1-8256-4D65-8405-07E327886D78)
+
+# PROVENANCE. This was a ONE-OFF observation, not a scripted run, so the blocks below are
+# transcribed from the individual commands as they were issued. Every quoted line is byte-exact
+# from its command's output; nothing is reconstructed. It has NOT been reproduced deliberately —
+# the trigger is unknown. The stderr block is also committed on its own as
+# utmctl-error-orphan-qemu-lock.stderr.txt, captured live with `2> <file>`.
+
+## 1. the stop, and what utmctl reported
+
+$ utmctl stop wargame-t1-attach --kill
+exit=0
+$ utmctl status wargame-t1-attach
+stopped
+
+## 2. ...while the QEMU process was still alive, minutes later
+
+$ ps -o pid,ppid,lstart,stat,etime,command -p 58445
+  PID  PPID STARTED                      STAT ELAPSED COMMAND
+58445 92742 Wed Sep  9 02:27:32 2026     R      03:07 /Applications/UTM.app/Contents/XPCServices/QEMUHelper.xpc/Contents/MacOS/QEMULauncher.app/Contents/MacOS/QEMULauncher /Applications/UTM.app/Contents/Frameworks/qemu-aarch64-softmmu.framework/Versions/A/qemu
+
+# ppid 92742 is UTM's own QEMUHelper XPC service:
+$ ps -o pid,command -p 92742
+  PID COMMAND
+92742 /Applications/UTM.app/Contents/XPCServices/QEMUHelper.xpc/Contents/MacOS/QEMUHelper
+
+# the orphan's argv identifies the VM unambiguously by UUID (excerpt of
+# `ps -Aww -o command -p 58445`; the full line is ~2.9 KB):
+#
+#   ... qemu-aarch64-softmmu ... -nographic -chardev pty,id=term0 -serial chardev:term0
+#   -cpu host -smp cpus=1,sockets=1,cores=1,threads=1 -machine virt -accel hvf
+#   -drive if=pflash,unit=1,file.filename=/Users/moreal/Library/Containers/com.utmapp.UTM/Data/Documents/wargame-t1-attach.utm/Data/efi_vars.fd
+#   ... -name wargamet1attach -uuid 7633A4A1-8256-4D65-8405-07E327886D78
+#
+# NOTE the QEMU `-uuid` equals UTM's VM id exactly, so an adapter can match an orphan to a VM
+# without any name matching. `-name` is the display name with non-alphanumerics stripped and is
+# NOT a reliable key.
+
+## 3. every later start of that VM failed on the firmware variable store — with exit 0
+
+$ utmctl start wargame-t1-attach          # stderr; stdout empty
+Error from event: The operation couldn’t be completed. (OSStatus error -2700.)
+QEMU error: QEMU exited from an error: Is another process using the image [/Users/moreal/Library/Containers/com.utmapp.UTM/Data/Documents/wargame-t1-attach.utm/Data/efi_vars.fd]?
+exit=0
+$ utmctl status wargame-t1-attach
+stopped
+
+## 4. waiting does not help
+
+# A probe loop started the VM, killed it, waited for status==stopped, then waited an extra
+# 0 s / 3 s / 10 s before restarting. All three attempts produced the identical stderr above,
+# and `pgrep -f qemu-aarch64-softmmu` returned the same pid 58445 every time:
+#
+#   === wait 0 s after status==stopped ===
+#     status stopped after 0s; qemu_pids now=58445
+#     after an extra 0s wait: qemu_pids=58445
+#     restart stderr: Error from event: ... Is another process using the image [...efi_vars.fd]?
+#     status=stopped
+#   === wait 3 s ===   (identical)
+#   === wait 10 s ===  (identical)
+
+## 5. recovery
+
+$ kill -9 58445
+$ pgrep -f qemu-aarch64-softmmu
+(no output)
+$ utmctl start wargame-t1-attach
+exit=0
+$ utmctl status wargame-t1-attach
+started

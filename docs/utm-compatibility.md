@@ -130,13 +130,13 @@ Never match a sentence containing an apostrophe.
 | Suspend + save state | both | `utmctl suspend <id> --save-state` | **verified**, transcript §10 → also `paused`, no distinct status |
 | Resume | both | `utmctl start <id>` / `start vm` | **verified**, transcript §10, `paused` → `started` |
 | Stop (ACPI/force) | both | `utmctl stop <id>` / `stop vm by force` | **verified** for arm64 `virt` (1 s); **hung in `stopping` > 60 s** for x86_64 `q35` sitting in GRUB |
-| Stop (kill) | both | `utmctl stop <id> --kill` / `stop vm by kill` | **verified**, `stopped` immediately, QEMU process gone within seconds |
+| Stop (kill) | both | `utmctl stop <id> --kill` / `stop vm by kill` | **verified**, `stopped` reported immediately — but see **T12**: `stopped` does not mean the QEMU process is gone, and once it was still alive minutes later |
 | Stop (guest request) | both | `utmctl stop <id> --request` | **unverified** (needs an installed OS) |
 | Delete | both | `utmctl delete <id>` / `delete virtual machine …` | **verified**, no confirmation |
 | Export bundle | **AS only** | `export virtual machine named … to POSIX file "…/x.utm"` | **verified**, transcript §11 — 964 KB for a VM whose disk is an untouched sparse qcow2 |
 | Import bundle | **AS only** | `import new virtual machine from POSIX file "…/x.utm"` | **verified**, transcript §11 — returns a specifier, but **keeps the source display name**, so `utmctl list` then showed two VMs called `wargame-t1-evidence` |
-| Serial console address | **AS only** | `address of first serial port of vm` | **verified**, `/dev/ttys010` while running, **empty string while stopped** |
-| Serial console attach | — | `utmctl attach <id>`, `utmctl start <id> --attach` | **verified BROKEN**, transcript §14: both print `WARNING: attach command is not implemented yet!` on stdout and exit 0; `attach` adds the ptty path and neither streams anything |
+| Serial console address | **AS only** | `address of first serial port of vm` | **verified**: a `/dev/ttysNNN` path while running, **empty string while stopped**. The number is allocated per run — `ttys010`, `ttys002` and `ttys003` all appear across the captures — so never cache it across a stop |
+| Serial console attach | — | `utmctl attach <id>`, `utmctl start <id> --attach` | **verified BROKEN**, `attach-and-default-drives.txt` §4–§5: both print `WARNING: attach command is not implemented yet!` on **stdout**, exit 0, and stream nothing; `attach` adds the ptty path, `start --attach` still starts the VM |
 | Graphical console | app UI | display device configured → UTM opens a window named after the VM | **verified** (§3) |
 | Guest IP | both | `utmctl ip-address <id>` / `query ip of vm` | **verified failure** pre-install: `The QEMU guest agent is not running or not installed on the guest` |
 | Guest exec | both | `utmctl exec <id> --cmd …` / `execute of vm at …` | **verified failure** pre-install, same reason |
@@ -217,12 +217,38 @@ for.
 - **Verified:** the serial ptty is the machine-readable console. Get it from
   `address of first serial port of vm` **after** the VM reports `started` (it is `""` while
   stopped) and read the device directly.
-- **Verified:** there is no working attach verb. `utmctl attach <id>` **and**
-  `utmctl start <id> --attach` (help text: "Attach to the first serial port after start") are the
-  same stub — both print `WARNING: attach command is not implemented yet!` on **stdout** and exit
-  0, `attach` additionally prints `PTTY: /dev/ttysNNN`, and neither streams a byte
-  (`readback-transcript.txt` §14). `start --attach` does still start the VM, so it is not inert —
-  it is a normal start with a misleading warning. Use plain `start` and read the ptty yourself.
+- **Verified:** there is no working attach verb, and it does not block — it is a no-op with a
+  warning. Captured in `attach-and-default-drives.txt` with stdout and stderr kept apart and the
+  un-piped exit status recorded:
+
+  ```
+  ## 4  $ utmctl attach wargame-t1-attach2 </dev/null          # VM already running
+  exit=0   elapsed=0s
+  --- stdout (67 bytes) ---
+  WARNING: attach command is not implemented yet!
+  PTTY: /dev/ttys003
+  --- stderr (0 bytes) ---
+
+  ## 5  $ utmctl start wargame-t1-attach2 --attach </dev/null  # VM stopped, 3 consecutive runs
+  exit=0   elapsed=2s        (run 1, run 2 and run 3 are identical)
+  --- stdout (48 bytes) ---
+  WARNING: attach command is not implemented yet!
+  --- stderr (0 bytes) ---
+  $ utmctl status wargame-t1-attach2
+  started
+  ```
+
+  So `start --attach` is **a normal start with a misleading warning**: it returns in ~2 s, exits 0,
+  writes only that one line to stdout, and the VM is `started`. It never streams serial data.
+  Use plain `start` and read the ptty yourself.
+- **Anomaly, recorded not resolved:** two earlier `timeout 15 utmctl start <vm> --attach` runs
+  against a *different* VM instead ran the full 15 s and were killed by the timeout (exit 124)
+  having written nothing to either stream. Both happened while that VM had the orphaned QEMU
+  process of T12 holding its `efi_vars.fd`, i.e. in the wedged-app situation of T8. The three
+  clean runs above did not reproduce it. Treat a blocked `--attach` as a symptom of T8/T12, and
+  put a timeout on the call regardless.
+- **Verified:** the `serial ports` list of a *configuration record* reads back empty (T5), so the
+  ptty path is only reachable through the VM element, never through the configuration.
 - **Verified:** the `serial ports` list of a *configuration record* reads back empty (T5), so the
   ptty path is only reachable through the VM element, never through the configuration.
 
@@ -321,10 +347,27 @@ Three related quirks, all in `readback-transcript.txt` §4:
 - `POSIX file <variable>` must be evaluated **outside** the `tell application "UTM"` block,
   otherwise UTM resolves the path in its own sandbox and fails with `-1728 Can't get POSIX file "…"`.
 
-One more shape worth knowing: `make` with the `drives` key omitted entirely still produces a VM
-with a removable CD (no image) plus a blank disk — visible in the orphan VM's argv in
-`readback-transcript.txt` §15 as `-drive if=none,media=cdrom,id=…,readonly=on` with no
-`file.filename`. Always pass `drives` explicitly.
+One more shape worth knowing: **`make` with the `drives` key omitted entirely still produces two
+drives** — a removable CD with no image plus a blank qcow2. Captured live in
+`attach-and-default-drives.txt` §2–§3 for a VM created with only `{name, architecture, memory,
+cpu cores}`:
+
+```
+$ osascript applescript/show-drives.applescript wargame-t1-attach2
+drives (2):
+  [1] id=73DA22FF-B99C-4842-926E-45CD98F102A0 removable=true iface=USB hostMiB=0
+  [2] id=ACB23102-DE86-41CB-BEE3-F0FCA3F30482 removable=false iface=VirtIO hostMiB=0
+
+$ ps -Aww -o command | grep qemu-aarch64-softmmu | grep -v grep | tr ' ' '\n' \
+    | grep -E 'media=cdrom|media=disk|usb-storage|virtio-blk'
+usb-storage,drive=drive73DA22FF-…,removable=true,bootindex=0,bus=usb-bus.0
+if=none,media=cdrom,id=drive73DA22FF-…,readonly=on
+virtio-blk-pci,drive=driveACB23102-…,serial=ACB23102DE8641CBBEE3,bootindex=1
+if=none,media=disk,id=driveACB23102-…,file.filename=…/wargame-t1-attach2.utm/Data/ACB23102-….qcow2
+```
+
+Note the CD has **no `file.filename`** at all. Always pass `drives` explicitly rather than
+inheriting this.
 
 ### T6. `hypervisor` is silently ignored for a non-matching architecture
 
@@ -406,7 +449,10 @@ an observed `stopped`. But `stopped` is still not sufficient — see T12.
 ### T10. `qemu additional arguments` is a real escape hatch
 
 `set qemu additional arguments of c to {{argument string:"-device"}, {argument string:"virtio-balloon-pci"}}`
-round-tripped (**verified**). Each argv element is its own record. This is the only scriptable way
+round-tripped (**verified**, `readback-transcript.txt` §5 — `readback: -device virtio-balloon-pci`,
+then setting it back to `{}` gives `cleared, length=0`). Each argv element is its own record.
+Reading it back needs `set c2 to configuration of vm` first; the inline
+`qemu additional arguments of (configuration of vm)` form fails with `-1700`. This is the only scriptable way
 to reach QEMU features UTM's dictionary omits — but see §6: it is *not* a usable path to TPM.
 
 ### T11. Silent fallback on an unknown display hardware name
@@ -419,18 +465,33 @@ used"), so an invalid value is not reported.
 
 ### T12. `stop --kill` can leave an orphan QEMU process that UTM reports as stopped
 
-Reproduced on a small aarch64 VM (`readback-transcript.txt` §15). After `utmctl stop … --kill`,
-`utmctl status` said `stopped` **within 1 s while the QEMU process was still alive** — parented to
-UTM's `QEMUHelper` XPC service, in state `R`, still there minutes later. Every subsequent start of
-that VM then failed on the firmware variable store, and (per T1) still exited 0:
+**Observed once, on 2026-09-09, on a small aarch64 VM; not reproduced deliberately since — the
+trigger is unknown.** Full evidence in `orphan-qemu-process.txt`, whose header records that it is a
+one-off transcription of individual commands rather than a scripted run; the stderr block is also
+committed on its own as `utmctl-error-orphan-qemu-lock.stderr.txt`, captured live with `2> <file>`.
+
+After `utmctl stop … --kill`, `utmctl status` said `stopped` **within 1 s while the QEMU process
+was still alive** — parented to UTM's `QEMUHelper` XPC service, in state `R`, still there minutes
+later:
 
 ```
-$ utmctl stop wargame-t1-attach --kill && utmctl status wargame-t1-attach
+$ utmctl stop wargame-t1-attach --kill
+exit=0
+$ utmctl status wargame-t1-attach
 stopped
-$ ps -o pid,ppid,stat,etime -p $(pgrep -f qemu-aarch64-softmmu)
-  PID  PPID STAT ELAPSED
-58445 92742 R      03:07          # ppid 92742 = UTM's QEMUHelper
-$ utmctl start wargame-t1-attach                        # stderr; exit 0
+$ ps -o pid,ppid,lstart,stat,etime,command -p 58445
+  PID  PPID STARTED                      STAT ELAPSED COMMAND
+58445 92742 Wed Sep  9 02:27:32 2026     R      03:07 /Applications/UTM.app/Contents/XPCServices/…/QEMULauncher …/qemu
+$ ps -o pid,command -p 92742
+  PID COMMAND
+92742 /Applications/UTM.app/Contents/XPCServices/QEMUHelper.xpc/Contents/MacOS/QEMUHelper
+```
+
+Every subsequent start of that VM then failed on the firmware variable store, and (per T1) still
+exited 0:
+
+```
+$ utmctl start wargame-t1-attach                        # stderr; stdout empty; exit 0
 Error from event: The operation couldn't be completed. (OSStatus error -2700.)
 QEMU error: QEMU exited from an error: Is another process using the image
 [/Users/moreal/Library/Containers/com.utmapp.UTM/Data/Documents/wargame-t1-attach.utm/Data/efi_vars.fd]?
@@ -438,19 +499,27 @@ $ utmctl status wargame-t1-attach
 stopped
 ```
 
-Waiting did not help — the same failure reproduced after 0 s, 3 s and 10 s of extra wait. Recovery
-was `kill -9 <orphan pid>`, after which `utmctl start` succeeded and `status` went to `started`.
+Waiting did not help — identical output after 0 s, 3 s and 10 s of extra wait, with `pgrep`
+returning the same pid each time. Recovery was `kill -9 58445`, after which `utmctl start`
+succeeded and `status` went to `started`.
 
 This is the mirror image of the existing Tart bug 13 in `docs/verification.md`: there the record
 said `running` while the VM had stopped; here UTM says `stopped` while the backend is still up.
 
 *Resolution:* the adapter must not treat `status == stopped` as "the VM's files are free". After a
-stop, before any restart, clone, `update configuration` or delete, confirm no
-`qemu-*-softmmu` process carries this VM's `-uuid`; `ps -Aww -o command` shows the full argv, and
-the QEMU `-uuid` matches UTM's VM id exactly, so ownership is unambiguous and no name matching is
-needed. Surface the `Is another process using the image` text as a distinct, recoverable error with
-the orphan pid in the message rather than a generic start failure. FR-5's "실패 시 단계별 정리와
-정리 실패를 기록한다" should cover this case explicitly.
+stop — and before any restart, clone, `update configuration` or delete — confirm that no
+`qemu-*-softmmu` process carries this VM's `-uuid`. `ps -Aww -o command` shows the full argv, and
+QEMU's `-uuid` equals UTM's VM id exactly, so ownership is unambiguous and no name matching is
+needed (`-name` is the display name with non-alphanumerics stripped, and is not a reliable key).
+
+**On detection, fail the stop; do not kill.** Report the stop as incomplete, naming the orphan pid
+and quoting the `Is another process using the image` line verbatim, and tell the user that
+`kill -9 <pid>` clears it. `wargame` must not send signals to a process it did not spawn: the
+process belongs to UTM's `QEMUHelper`, the user may be looking at that VM in the UTM window, and
+FR-5 already forbids acting on VMs we do not own. A `--force`-style opt-in that kills a
+UUID-matched orphan on the user's explicit instruction is acceptable later; silent `kill -9` is
+not. FR-5's "실패 시 단계별 정리와 정리 실패를 기록한다" covers exactly this: record the cleanup
+failure, do not paper over it.
 
 ## 5. Network modes (FR-6)
 
@@ -477,27 +546,57 @@ argv for each is committed. Additional **verified** facts:
   vmnet bridges existed; starting it in `host` mode added `bridge104`, and only then
   (`readback-transcript.txt` §6–§7):
 
+  §6, with the VM stopped — `BRIDGES` below is the awk one-liner
+  `ifconfig | awk '/^bridge1[0-9][0-9]:/{b=substr($1,1,length($1)-1)} /inet /{if(b!=""){print b, $2; b=""}}'`:
+
   ```
-  $ ifconfig | awk '/^bridge1[0-9][0-9]:/{b=substr($1,1,length($1)-1)} /inet /{if(b!=""){print b, $2; b=""}}'
-  bridge100 192.168.139.3          # before start
+  $ osascript applescript/set-network-mode.applescript wargame-t1-evidence host
+  mode=host hardware=virtio-net-pci hostif=
+  exit=0
+
+  $ utmctl status wargame-t1-evidence
+  stopped
+  exit=0
+
+  $ BRIDGES
+  bridge100 192.168.139.3
   bridge101 192.168.194.0
   bridge102 192.168.215.0
   bridge103 192.168.117.0
-  $ utmctl start wargame-t1-evidence && sleep 8 && utmctl status wargame-t1-evidence
+  exit=0
+  ```
+
+  §7, after starting it — note `bridge104` is the only new line:
+
+  ```
+  $ utmctl start wargame-t1-evidence
+  exit=0
+
+  $ utmctl status wargame-t1-evidence
   started
+  exit=0
+
   $ ps -Aww -o command | grep qemu-aarch64-softmmu | grep -v grep | grep -oE '\-netdev [^ ]+'
   -netdev vmnet-host,id=net0
-  $ ifconfig | awk '…'                # after start — bridge104 is new
+  exit=0
+
+  $ BRIDGES
   bridge100 192.168.139.3
   bridge101 192.168.194.0
   bridge102 192.168.215.0
   bridge103 192.168.117.0
   bridge104 192.168.128.1
+  exit=0
+
   $ ifconfig bridge104
   bridge104: flags=8a63<UP,BROADCAST,SMART,RUNNING,ALLMULTI,SIMPLEX,MULTICAST> mtu 1500
-      inet 192.168.128.1 netmask 0xffffff00 broadcast 192.168.128.255
-      member: vmenet4 flags=3<LEARNING,DISCOVER>
+  	inet 192.168.128.1 netmask 0xffffff00 broadcast 192.168.128.255
+  	member: vmenet4 flags=3<LEARNING,DISCOVER>
+  exit=0
   ```
+
+  (`ifconfig bridge104` prints more lines than the three kept here; the full output is in the
+  transcript.)
 
   So **macOS `vmnet` host mode gives the host `.1` on the guest's own segment**, which is the "host
   management connection" half of FR-6. The guest-side half (that the guest cannot reach the LAN or

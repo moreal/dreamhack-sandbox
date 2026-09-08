@@ -1,0 +1,95 @@
+### utmctl --attach probe + default-drive shape — UTM 4.7.5 / macOS 26.6.2 / 2026-09-08T17:42:44Z
+# Every run below records stdout and stderr separately and the real exit status of
+# utmctl itself (no pipeline, no 2>&1), plus wall-clock seconds.
+
+## 1. app handshake
+$ open -a UTM; until utmctl version >/dev/null 2>&1; do sleep 1; done; utmctl version
+4.7.5
+exit=0
+
+## 2. create a VM with NO `drives` key at all
+$ osascript -e 'tell application "UTM" to make new virtual machine with properties {backend:qemu, configuration:{name:"wargame-t1-attach2", architecture:"aarch64", memory:1024, cpu cores:1}}'
+E4698D94-6FBC-4665-AB87-EDC65F463A94 wargame-t1-attach2
+exit=0
+
+$ osascript applescript/show-drives.applescript wargame-t1-attach2
+drives (2):
+  [1] id=73DA22FF-B99C-4842-926E-45CD98F102A0 removable=true iface=USB hostMiB=0
+  [2] id=ACB23102-DE86-41CB-BEE3-F0FCA3F30482 removable=false iface=VirtIO hostMiB=0
+
+exit=0
+
+## 3. the generated QEMU command line for that driveless VM
+$ utmctl status wargame-t1-attach2
+started
+
+$ ps -Aww -o command | grep qemu-aarch64-softmmu | grep -v grep | tr ' ' '\n' | grep -E 'media=cdrom|media=disk|usb-storage|virtio-blk'
+usb-storage,drive=drive73DA22FF-B99C-4842-926E-45CD98F102A0,removable=true,bootindex=0,bus=usb-bus.0
+if=none,media=cdrom,id=drive73DA22FF-B99C-4842-926E-45CD98F102A0,readonly=on
+virtio-blk-pci,drive=driveACB23102-DE86-41CB-BEE3-F0FCA3F30482,serial=ACB23102DE8641CBBEE3,bootindex=1
+if=none,media=disk,id=driveACB23102-DE86-41CB-BEE3-F0FCA3F30482,file.filename=/Users/moreal/Library/Containers/com.utmapp.UTM/Data/Documents/wargame-t1-attach2.utm/Data/ACB23102-DE86-41CB-BEE3-F0FCA3F30482.qcow2,discard=unmap,detect-zeroes=unmap
+exit=0
+# -> UTM adds a removable CD with NO file.filename plus a blank qcow2, unasked.
+
+## 4. `utmctl attach` on the RUNNING VM
+$ utmctl attach wargame-t1-attach2 </dev/null   (stdout and stderr captured separately)
+exit=0   elapsed=0s
+--- stdout (67 bytes) ---
+WARNING: attach command is not implemented yet!
+PTTY: /dev/ttys003
+--- stderr (0 bytes) ---
+  (stopped after 0s)
+
+## 5. `utmctl start --attach` on a STOPPED VM, three consecutive runs
+
+### run 1
+$ utmctl start wargame-t1-attach2 --attach </dev/null   (20 s timeout, streams separate)
+exit=0   elapsed=2s   (124 = the timeout fired, i.e. utmctl was still running)
+--- stdout (48 bytes) ---
+WARNING: attach command is not implemented yet!
+--- stderr (0 bytes) ---
+$ utmctl status wargame-t1-attach2
+started
+  (stopped after 0s)
+
+### run 2
+$ utmctl start wargame-t1-attach2 --attach </dev/null   (20 s timeout, streams separate)
+exit=0   elapsed=2s   (124 = the timeout fired, i.e. utmctl was still running)
+--- stdout (48 bytes) ---
+WARNING: attach command is not implemented yet!
+--- stderr (0 bytes) ---
+$ utmctl status wargame-t1-attach2
+started
+  (stopped after 0s)
+
+### run 3
+$ utmctl start wargame-t1-attach2 --attach </dev/null   (20 s timeout, streams separate)
+exit=0   elapsed=2s   (124 = the timeout fired, i.e. utmctl was still running)
+--- stdout (48 bytes) ---
+WARNING: attach command is not implemented yet!
+--- stderr (0 bytes) ---
+$ utmctl status wargame-t1-attach2
+started
+  (stopped after 0s)
+
+## 6. cleanup
+$ utmctl list
+UUID                                 Status   Name
+E4698D94-6FBC-4665-AB87-EDC65F463A94 stopped  wargame-t1-attach2
+
+$ utmctl list | tail -n +2 | while read; do case name in wargame-t1*) utmctl delete <uuid>;; *) skip;; esac; done
+deleted E4698D94-6FBC-4665-AB87-EDC65F463A94 (wargame-t1-attach2)
+
+$ utmctl list
+UUID                                 Status   Name
+
+$ pgrep -lf 'qemu-(aarch64|x86_64)-softmmu'
+(none)
+
+# ANOMALY, recorded for completeness and NOT reproduced by the three runs above:
+# on 2026-09-09 at ~02:27 UTC+9, two `timeout 15 utmctl start <vm> --attach </dev/null`
+# invocations against a different VM (wargame-t1-attach) instead ran the full 15 s and were
+# killed by the timeout (exit 124) having written 0 bytes to both streams. Both happened
+# while that VM had an orphaned QEMU process holding its efi_vars.fd (see
+# orphan-qemu-process.txt), i.e. in the wedged-app situation of trap T8. Treat the 2 s /
+# exit 0 behaviour above as the normal one and the block as another face of T8.
