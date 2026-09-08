@@ -1,468 +1,374 @@
-# wargame-vm MVP Implementation Plan
+# Multi-OS VM Feature PRD & Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-> This plan is executed by the multi-agent workflow described in §"Execution workflow" at the bottom: one Sonnet implementer per task, one reviewer per task, sequential commits between stages.
+> **Claude 인계용:** 사용자는 이 기능의 구현을 Claude에게 일임했다. 이 문서를 요구사항과 작업 순서의 기준으로 사용한다. 사용 가능한 경우 `superpowers:executing-plans`로 단계별 구현·검증을 진행한다. 체크박스는 검증 후에만 완료 표시한다.
 
-**Goal:** Ship the `wargame` CLI/TUI that searches Dreamhack, launches a disposable Tart macOS VM from a declarative profile, injects challenge files safely, and manages session lifecycle, reproducibly built with a Nix flake.
+**Goal:** macOS 호스트에서 macOS·Windows·Kali Linux VM을 생성하고, 사용자 도구를 추가한 재사용 이미지를 빌드하며, x86_64 게스트를 `emulate` 모드로 실행한다.
 
-**Architecture:** Hexagonal Rust workspace. `wargame-core` owns domain types, ports (traits), application services, security helpers and infra adapters. `wargame-dreamhack` and `wargame-tart` implement the two ports and depend only on core. `wargame-cli` is the composition root with clap commands and a ratatui TUI that call the same application services.
+**Architecture:** 기존 Tart 경로를 유지하고 UTM/QEMU adapter를 추가한다. 프로필과 저장된 세션으로 백엔드·실행 모드를 결정하며, OS별 프로비저닝과 게스트 연결을 공통 애플리케이션 서비스에서 사용한다.
 
-**Tech Stack:** Rust 2021 (nixpkgs rustc 1.97), tokio, reqwest (rustls, cookies), serde/serde_json/serde_yaml/toml, clap 4 (derive), ratatui 0.29 + crossterm 0.28, sha2, tempfile, tracing, thiserror, async-trait, secrecy, time, rand, fs2, rpassword. Nix flake for build/dev/check. External runtime tools: `tart`, `ssh`, `scp`, `ssh-keygen`, `security`, `sshpass` (build only).
+**Tech Stack:** 기존 Rust workspace, tokio, clap, ratatui, serde, ProcessRunner, Nix. 추가 런타임은 UTM의 `utmctl`·AppleScript 자동화이며 디스크 변환에 필요한 경우에만 `qemu-img`를 사용한다.
 
-**Spec:** `DESIGN.md` (implements `MVP.md`). Executors read both.
+**Spec:** 이 문서의 §1–§7이 기능 PRD, §8–§10이 구현 및 검증 계획이다. 기존 구조는 `DESIGN.md`, 현재 사용법은 `README.md`, 실제 MVP 검증 기록은 `docs/verification.md`를 함께 읽는다.
 
-**Status (2026-09-05):** all nine tasks executed by `.claude/workflows/mvp-build.js` and merged on `feat/mvp`; real-VM verification and the fixes it forced are recorded in `docs/verification.md`.
+**Status:** 구현 전 / 2026-09-08 작성. 이 문서 작성에는 코드 구현, 도구 설치, 실제 VM 생성이 포함되지 않았다.
 
-## Global Constraints
+**이전 계획:** 완료된 MVP의 기존 `PLAN.md`는 [docs/archive/2026-09-05-mvp-plan.md](docs/archive/2026-09-05-mvp-plan.md)에 보존했다. `.claude/workflows/mvp-build.js`는 과거 Task 1–9 전용이므로 새 계획 실행에 그대로 사용하지 않는다. 기존 문서에서 MVP 작업을 뜻하는 `PLAN.md` 참조는 보관본을 가리키는 것으로 해석한다.
 
-- Host: macOS on Apple Silicon (`aarch64-darwin`); tests (non-e2e) must also pass on `x86_64-linux` via `cargo test` so `nix flake check` is portable. Anything macOS-only (Keychain, Tart) is behind a trait with a fake used in tests.
-- No shell strings for subprocesses: `Command::new(bin).args([...])` only.
-- No secret ever appears in argv, logs, session metadata, or config files (DESIGN §3.6).
-- Host never extracts, previews, mounts, or executes challenge artifacts (MVP §4.1).
-- `wargame-dreamhack` must not depend on `wargame-tart` and vice versa (NFR-05). Cargo enforces it: their `Cargo.toml` list only `wargame-core` from the workspace.
-- All user-facing errors go through `WargameError` and carry a `hint()` (DESIGN §3.1, MVP §23).
-- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace` must pass at the end of every task.
-- Dependencies are pre-declared in Task 0; implementers must not add crates without stating why in their report (Cargo.lock is frozen for reproducibility; adding a crate is allowed only if genuinely needed, and then `Cargo.lock` must be regenerated inside `nix develop`).
-- Do not commit from inside implementer/reviewer agents; the workflow's commit step does it.
-- All paths below are relative to the repository root.
+## 1. 사용자 요구와 범위
 
----
+사용자의 요구: “필요한 도구를 추가해서 VM을 만들 수 있어야 하며, macOS뿐 아니라 Windows와 Kali Linux도 실행하고, emulate 모드로 x86도 지원해야 한다.”
 
-## File map
+이 PRD의 Windows 지원은 **Windows 게스트** 지원이다. Windows 호스트용 포팅은 범위 밖이다. x86의 필수 범위는 **x86_64 전체 시스템 에뮬레이션**이며 32비트 i386 전용 게스트는 후속 범위로 둔다. Rosetta·Wine·컨테이너로 전체 VM 요구를 대체하지 않는다.
 
-| Path | Responsibility | Task |
+### 지원 매트릭스
+
+| 게스트 | 아키텍처 | 모드 | 백엔드 | 출시 기준 |
+|---|---|---|---|---|
+| 기존 macOS | arm64 | virtualize | Tart | 기존 두 프로필 회귀 검증 필수 |
+| Kali Linux | arm64 | virtualize | UTM/QEMU + 하드웨어 가속 | 필수 |
+| Kali Linux | x86_64 | emulate | UTM/QEMU, hypervisor off | 필수 |
+| Windows 11 | x86_64 | emulate | UTM/QEMU, hypervisor off | 필수 |
+| Windows 11 | arm64 | virtualize | UTM/QEMU + 하드웨어 가속 | 후속 기능 |
+
+- 호스트 기준은 macOS / Apple Silicon이다. macOS·UTM 최소 지원 버전은 Task 1에서 실제 API 확인 후 정확한 버전으로 기록하고 검사한다.
+- 같은 아키텍처라도 `emulate`를 지정하면 소프트웨어 에뮬레이션을 사용한다. `virtualize` 불가 시 모드를 조용히 바꾸지 않는다.
+- 첫 OS 설치는 UTM 콘솔을 통한 수동 설치를 허용한다. ISO 연결과 VM 생성만으로 이미지 빌드 성공을 표시하지 않는다.
+- macOS x86_64 에뮬레이션, GPU 가속 보장, 스냅샷 UI, 원격 호스트, 범용 무인 OS 설치 엔진은 범위 밖이다.
+- 프로필 YAML만 추가하거나 fake 테스트만 통과한 상태는 기능 완료가 아니다.
+
+### 성공하는 사용자 흐름
+
+1. 프로필에서 OS·아키텍처·모드·리소스를 선택한다.
+2. 설치 ISO로 새 VM을 만들거나 설치된 UTM VM을 원본으로 복제한다.
+3. OS 설치와 게스트 연결을 준비한 후 사용자 도구 설치 스크립트를 실행해 재사용 이미지를 만든다.
+4. 해당 프로필로 Dreamhack 문제를 일회용 VM에 배치하고 콘솔·셸로 접근한다.
+5. 중지·재개·삭제 후에도 원본 이미지와 다른 사용자의 VM은 보존된다.
+
+## 2. 확인된 현재 구조
+
+| 현재 파일 | 확인된 제약 | 필요한 변화 |
 |---|---|---|
-| `flake.nix`, `flake.lock`, `Cargo.toml`, `rust-toolchain.toml`, `.gitignore`, `crates/*/Cargo.toml` | build system, workspace, dependency pins | 0 |
-| `crates/wargame-core/src/domain/{challenge,profile,session,compat}.rs` | domain types + state machine + compatibility | 1 |
-| `crates/wargame-core/src/ports/{wargame_provider,vm_provider,guest_transport,credential_store,session_repo}.rs` | traits everything else implements | 1 |
-| `crates/wargame-core/src/{error,config}.rs` | user-facing errors, TOML config | 1 |
-| `crates/wargame-core/src/security/{filename,hash,staging,redact}.rs` | safe download plumbing | 2 |
-| `crates/wargame-core/src/infra/{process,fs,keychain,json_repo,ssh}.rs` | subprocess runner, dirs, credential stores, session repo, ssh transport | 2 |
-| `crates/wargame-core/src/testing/*.rs` | fakes: `FakeRunner`, `FakeVmProvider`, `FakeWargameProvider`, `FakeTransport`, `MemoryStore`, `MemoryRepo` | 2 |
-| `crates/wargame-dreamhack/src/*` + `fixtures/*` | Dreamhack adapter | 3 |
-| `crates/wargame-tart/src/{args,list,image,provider,console}.rs` | Tart adapter | 4 |
-| `crates/wargame-core/src/app/{search,launch,lifecycle,console,doctor,profiles}.rs` | application services | 5 |
-| `crates/wargame-tart/src/build.rs`, `profiles/*.yaml`, `profiles/scripts/macos/*.sh`, `guest/bootstrap.sh` | image build + profiles + guest bootstrap | 6 |
-| `crates/wargame-cli/src/{main,cli,wiring,output,fixture_provider}.rs` | CLI + composition root | 7 |
-| `crates/wargame-cli/src/tui/*.rs` | TUI | 8 |
-| `README.md`, `scripts/e2e-smoke.sh`, `crates/wargame-tart/tests/e2e.rs`, flake wrapper | docs + integration | 9 |
+| `crates/wargame-core/src/domain/profile.rs` | Linux/Windows와 x86_64 자료형은 있으나 backend/mode 없음 | 기존 YAML과 호환되는 선택 필드 |
+| `crates/wargame-core/src/domain/compat.rs` | OS 집합 × arch 집합으로 지원 표현 | 실제 OS/arch/mode 조합 검증 |
+| `crates/wargame-core/src/ports/vm_provider.rs` | VmSpec은 이미지·리소스 중심 | 선택된 실행 설정 전달 |
+| `crates/wargame-core/src/app/mod.rs` | AppContext에 provider/transport가 각각 하나 | 프로필·세션별 선택 |
+| `crates/wargame-cli/src/wiring.rs` | Tart 고정, SSH 사용자 admin 고정 | backend registry와 guest 설정 기반 연결 |
+| `crates/wargame-tart/src/build.rs` | Tart와 Bash/SSH 키 설치에 종속 | 공통 빌드 흐름과 OS/backend 세부 처리 분리 |
+| `crates/wargame-core/src/infra/ssh.rs` | IP 중심 연결 | 사용자·포트·게스트 셸 반영 |
+| `guest/bootstrap.sh` | POSIX 도구·경로 가정 | Kali 검증과 Windows PowerShell 구현 |
+| `crates/wargame-core/src/domain/session.rs` | backend는 저장하나 mode/user 등 부족 | 재개용 실행 설정 스냅샷 |
 
----
+Tart 자체는 macOS와 Linux를 지원하지만 현재 프로젝트의 실제 경로는 macOS에 맞춰져 있다. 이번에는 Kali를 UTM으로 통일해 에뮬레이션과 같은 관리 흐름을 제공한다.
 
-### Task 0: Scaffold workspace and Nix flake (done by the orchestrator, not an agent)
+## 3. 기능 요구사항
 
-**Files:**
-- Create: `flake.nix`, `Cargo.toml`, `rust-toolchain.toml`, `.gitignore`, `crates/wargame-core/{Cargo.toml,src/lib.rs}`, `crates/wargame-dreamhack/{Cargo.toml,src/lib.rs}`, `crates/wargame-tart/{Cargo.toml,src/lib.rs}`, `crates/wargame-cli/{Cargo.toml,src/main.rs}`
-- Create: `crates/wargame-dreamhack/fixtures/{search.json,detail.json,search_page.json}` (sanitized captures)
+### FR-1. 프로필 및 호환성
 
-**Produces:** a workspace where `nix develop -c cargo test --workspace` and `nix build` succeed with stub crates; every dependency below is already in `Cargo.lock`.
+- VM 설정에 `backend: auto|tart|utm`, `mode: virtualize|emulate`를 추가한다.
+- 기존 `wargame.vm/v1` macOS YAML은 수정 없이 Tart/virtualize로 해석한다. 기존 기본 프로필을 유지한다.
+- `auto`는 macOS/arm64/virtualize → Tart, 지원되는 Kali·Windows 조합 → UTM으로 결정한다. 실행 중 다른 백엔드로 fallback하지 않는다.
+- `os: linux`는 유지하고 `distribution: kali`로 구분한다. arch 이름은 `arm64`, `x86_64`를 사용한다.
+- 양수 리소스, 메모리 변환 overflow, 경로, 지원 조합을 VM 생성 전에 검사한다.
+- profiles 및 TUI 선택 화면에 OS/arch/backend/mode와 이미지 준비 상태를 표시한다.
+- 불가 조합은 요청값·불가 이유·사용 가능한 조합을 포함한 오류로 반환한다.
 
-Workspace dependencies (exact crates):
+### FR-2. VM 생성과 이미지 소스
 
-```toml
-[workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time", "sync"] }
-async-trait = "0.1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-toml = "0.8"
-thiserror = "2"
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-secrecy = { version = "0.10", features = ["serde"] }
-sha2 = "0.10"
-hex = "0.4"
-tempfile = "3"
-time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
-rand = "0.8"
-fs2 = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "json", "stream", "gzip"] }
-futures-util = "0.3"
-url = "2"
-clap = { version = "4", features = ["derive", "env"] }
-ratatui = "0.29"
-crossterm = "0.28"
-rpassword = "7"
-comfy-table = "7"
-libc = "0.2"
+- 기존 Tart OCI/base image 입력을 유지한다.
+- UTM 입력은 로컬 설치 ISO 또는 설치된 로컬 UTM VM UUID이다. 기존 원본은 복제만 하며 원본에서 프로비저닝하지 않는다.
+- `profile init`은 내장 템플릿을 사용자 이름으로 복사한다. `profile create --iso`는 빈 디스크와 설치 미디어를 갖는 설치용 VM을 만든다.
+- 설치용 UUID, 콘솔 여는 방법, OS 설치 후 SSH/guest tools 준비, build 재개 명령을 출력한다.
+- 설치 진행은 앱 소유 build record에 저장한다. 같은 명령을 다시 실행하면 설치 VM을 재사용·안내하고 중복 VM/디스크를 만들지 않는다.
+- `.utm` 번들 import, 원격 이미지 자동 다운로드는 후속 기능이다.
+- ISO 존재·읽기 가능 여부를 검사한다. 사용자가 제공한 SHA-256은 검증한다. 확인되지 않은 ISO OS/arch를 검증 완료로 표시하지 않는다.
+- Windows ISO는 사용자가 제공한다. 라이선스 구매·자동 활성화·설치 요건 우회는 구현하지 않는다. 선택한 Windows 버전에 필요한 펌웨어·TPM·드라이버 구성을 실제 설치로 검증한다.
+
+### FR-3. 사용자 도구와 이미지 빌드
+
+- 기존 `provision.scripts`, `tools.verify`를 유지한다. 스크립트는 프로필 디렉터리 기준으로 찾아 게스트에 복사한다.
+- macOS/Kali는 Bash, Windows는 PowerShell로 실행한다. 설치 스크립트는 반드시 게스트에서 실행한다.
+- 사용자 스크립트를 추가하고 build를 재실행하면 도구를 포함한 새 재사용 이미지를 생성한다.
+- 사용자 편집 프로필·사용자 스크립트를 내장 파일 배포 과정에서 덮어쓰지 않는다.
+- Kali 기본 도구: Python 3, pip/venv, Git, curl, unzip, file, GDB, binutils, build-essential.
+- Windows 기본 도구: PowerShell, OpenSSH Server, Python 3, Git, 7-Zip. 설치 출처와 검증 명령을 스크립트에 명시한다.
+- NAT에서 의존성을 설치하고 단계·종료 코드·실패한 검증 명령을 로그에 남긴다. 설치 중 재부팅 필요 상태를 처리하고 다시 연결한다.
+- 모든 검증 및 정상 종료 후에만 이미지를 ready로 게시한다. 새 빌드 실패 시 이전 정상 이미지를 보존한다.
+- 소스, OS/arch/mode, 프로필·스크립트 해시, 검증 결과를 build record에 저장한다. 프로필 변경과 이미지 불일치는 재빌드를 안내한다.
+
+### FR-4. 게스트 연결과 문제 배치
+
+- 게스트 접속은 우선 SSH/SFTP로 통일하되 Windows 명령은 PowerShell에 맞게 인코딩한다. UTM guest agent는 주소 조회 등 필요한 기능에 사용한다.
+- endpoint에는 host, port, user, key 경로를 포함한다. admin을 고정하지 않는다. 포트 포워딩을 쓰면 세션마다 충돌 없는 포트를 할당하고 저장한다.
+- Windows OpenSSH/PowerShell 및 UTM guest tools 준비 절차를 제공한다. 서비스 미준비를 성공으로 처리하지 않는다.
+- Windows 경로, 공백, 작은따옴표·큰따옴표·한글 경로를 지원한다. Unix shell quoting을 Windows에 재사용하지 않는다.
+- `incoming`, `work`, `notes`, `output`과 문제 메타데이터를 만든다. 게스트 파일 해시는 호스트 staging 해시와 같아야 한다.
+- 압축 해제는 게스트에서만 수행한다. 절대 경로, `..`, symlink/hardlink 및 Windows 경로 우회가 작업 디렉터리 밖에 쓰지 못하도록 검증한다. 안전한 처리가 불가능한 포맷은 원본을 유지하고 이유를 표시한다.
+- 문제 파일을 자동 실행하지 않는다. 호스트에서는 문제 파일을 압축 해제·마운트·미리보기·실행하지 않는다.
+
+### FR-5. 생명주기와 이전 데이터 호환성
+
+- launch/inspect/list/stop/resume/delete/prune/gui/ssh를 CLI/TUI 공통 서비스로 제공한다.
+- 과거 세션 JSON에 migration/default를 정의한다. 과거 세션의 누락값은 기존 Tart/arm64/virtualize/admin 동작으로 복원한다.
+- 새 세션은 backend, 안정적인 VM ID, mode, guest user, 연결 설정, workspace를 저장한다. 프로필 편집·기본 백엔드 변경 후에도 저장된 설정으로 재개한다.
+- UTM UUID를 provider ID로 사용하고 표시 이름과 구분한다. 다른 백엔드의 같은 VM 이름을 혼동하지 않는다.
+- UTM 창을 닫거나 앱 밖에서 VM을 중지한 경우 실제 상태와 세션을 재조정한다.
+- 앱 기록의 UUID와 소유권을 대조한다. 이름 prefix만으로 외부 VM을 삭제하지 않는다. 사용자 VM `kindle-vm`과 원본 VM은 수정·중지·삭제하지 않는다.
+- 부팅·명령·중지 timeout을 구분한다. emulate 부팅 기본값은 1800초, virtualize는 기존 300초를 기준으로 override를 지원한다. 수동 OS 설치 대기는 별도 상태이다.
+- 실패 시 단계별 정리와 정리 실패를 기록한다. 설치용 VM은 재개할 수 있도록 보존하고 문제 세션 복제본은 기존 keep 정책에 따른다.
+
+### FR-6. 네트워크와 의존성
+
+- 기본 실행 네트워크는 기존 `isolated`, 이미지 빌드는 NAT이다.
+- UTM isolated는 외부 통신을 막고 호스트 관리 연결을 허용해야 한다. 다른 LAN 장치·인터넷 접근 차단을 실제 VM으로 검사한다.
+- 해당 구성에서 isolated가 불가능하면 VM 시작 전에 거부한다. NAT로 자동 변경하지 않는다. 사용자가 `--network nat`을 지정하면 실행한다.
+- Tart macOS 실행에 UTM 설치를 요구하지 않는다.
+- doctor에 `--profile`을 추가한다. 필요한 backend, 실제 경로·버전, 자동화 권한, 이미지 준비, 디스크 용량, 연결 도구 및 네트워크 지원을 검사한다.
+- utmctl 탐색 순서: 설정 경로 → PATH → `/Applications/UTM.app/Contents/MacOS/utmctl`. 공백 포함 경로를 지원한다.
+- 누락 도구는 공식 설치 경로와 재검증 방법을 안내한다. 일반 실행 명령이 패키지 설치·권한 변경을 몰래 수행하지 않는다. 구현자는 필요한 개발·검증 도구를 설치할 수 있으나 환경 권한 정책을 따른다.
+- Nix가 UTM.app을 제공한다고 가정하지 않는다. 빌드 의존성과 macOS 앱 런타임 의존성을 구분한다.
+
+## 4. 목표 CLI와 프로필 계약
+
+다음은 새로 구현할 인터페이스다. 현재 지원되는 명령이라고 가정하지 않는다. 기존 명령과 alias는 보존한다.
+
+```bash
+# ISO 기반 Kali 설치
+wargame profile init kali-x86_64 --name kali-custom
+wargame profile create kali-custom --iso /path/to/kali-amd64.iso
+wargame profile console kali-custom
+# 콘솔에서 OS 설치·SSH/guest tools 준비, 프로필에 사용자 스크립트 추가
+wargame profile build kali-custom
+wargame doctor --profile kali-custom
+wargame launch dreamhack:15 --profile kali-custom
+
+# ISO 기반 Windows 설치
+wargame profile init windows-x86_64 --name windows-custom
+wargame profile create windows-custom --iso /path/to/windows-x64.iso
+wargame profile console windows-custom
+wargame profile build windows-custom
+
+# ISO 대신 이미 설치된 UTM VM을 복제하는 대안
+wargame profile init windows-x86_64 --name windows-from-base
+wargame profile create windows-from-base --from-vm <utm-uuid>
+wargame profile build windows-from-base
 ```
 
-- [ ] Write the files, run `nix develop -c cargo test --workspace`, run `nix build`, commit `chore: scaffold workspace and nix flake`.
+- init은 기존 이름과 충돌하면 중단한다. `--iso`, `--from-vm`은 상호 배타적이다.
+- 연결된 설치 VM이 있는 프로필에 다른 소스를 지정하면 충돌 오류와 새 프로필 생성 방법을 안내한다.
+- create 성공은 설치용 VM 생성/복제 성공, build 성공은 게스트 준비와 검증을 마친 재사용 이미지 생성 성공이다.
+- TUI는 프로필 선택·문제 실행·세션 관리를 지원한다. 첫 ISO 설치 마법사는 CLI+UTM 콘솔로 제공해도 된다.
 
----
+프로필 확장 예시:
 
-### Task 1: Core domain, ports, errors, config
-
-**Files:**
-- Create: `crates/wargame-core/src/domain/mod.rs`, `domain/challenge.rs`, `domain/profile.rs`, `domain/session.rs`, `domain/compat.rs`
-- Create: `crates/wargame-core/src/ports/mod.rs`, `ports/wargame_provider.rs`, `ports/vm_provider.rs`, `ports/guest_transport.rs`, `ports/credential_store.rs`, `ports/session_repo.rs`
-- Create: `crates/wargame-core/src/error.rs`, `crates/wargame-core/src/config.rs`
-- Modify: `crates/wargame-core/src/lib.rs` (declare modules, re-export `WargameError`, `Result`)
-- Tests: inline `#[cfg(test)]` modules in each file.
-
-**Interfaces (Produces — later tasks rely on these exact names):**
-
-```rust
-// error.rs
-#[derive(Debug, thiserror::Error)]
-pub enum WargameError {
-    #[error("authentication required for {provider}")] AuthenticationRequired { provider: String },
-    #[error("authentication failed: {reason}")] AuthenticationFailed { reason: String },
-    #[error("provider {provider} unavailable: {reason}")] ProviderUnavailable { provider: String, reason: String },
-    #[error("provider {provider} response changed: {what}")] ProviderChanged { provider: String, what: String },
-    #[error("challenge {0} not found")] ChallengeNotFound(String),
-    #[error("download failed for {filename}: {reason}")] DownloadFailed { filename: String, reason: String },
-    #[error("hash or write failure: {0}")] HashOrWrite(String),
-    #[error("incompatible environment: {0}")] Incompatible(String),
-    #[error("image {image} missing for profile {profile}")] ImageMissing { profile: String, image: String },
-    #[error("insufficient resources: {0}")] InsufficientResources(String),
-    #[error("VM backend {backend} unavailable: {reason}")] BackendUnavailable { backend: String, reason: String },
-    #[error("VM creation failed: {0}")] VmCreationFailed(String),
-    #[error("guest boot timed out after {0:?}")] GuestBootTimeout(std::time::Duration),
-    #[error("guest bootstrap failed: {0}")] GuestBootstrapFailed(String),
-    #[error("copy into guest failed: {0}")] CopyFailed(String),
-    #[error("network unavailable: {0}")] NetworkUnavailable(String),
-    #[error("cleanup failed: {0}")] CleanupFailed(String),
-    #[error("session {0} not found")] SessionNotFound(String),
-    #[error("invalid session state transition {from:?} -> {to:?}")] InvalidTransition { from: SessionState, to: SessionState },
-    #[error("profile {0} not found")] ProfileNotFound(String),
-    #[error("invalid profile {name}: {reason}")] InvalidProfile { name: String, reason: String },
-    #[error("configuration error: {0}")] Config(String),
-    #[error("credential store error: {0}")] CredentialStore(String),
-    #[error("{0}")] Io(#[from] std::io::Error),
-    #[error("{0}")] Other(String),
-}
-impl WargameError { pub fn hint(&self) -> Option<String>; }   // e.g. ImageMissing -> "Run: wargame profile build <profile>"
-pub type Result<T> = std::result::Result<T, WargameError>;
+```yaml
+apiVersion: wargame.vm/v1
+kind: Profile
+metadata:
+  name: kali-custom
+  description: Kali with custom analysis tools
+vm:
+  backend: utm
+  mode: emulate
+guest:
+  os: linux
+  distribution: kali
+  arch: x86_64
+  user: kali
+image:
+  base: "" # UTM은 create의 build record 사용; Tart에서는 기존 base 필수
+resources:
+  cpu: 4
+  memory_gib: 8
+  disk_gib: 80
+provision:
+  scripts:
+    - scripts/kali/common.sh
+    - scripts/custom/my-tools.sh
+tools:
+  verify:
+    - python3 --version
+    - gdb --version
+workspace:
+  root: /home/kali/wargame
 ```
 
-Domain (DESIGN §3.2) — implement exactly:
+- ISO 경로·원본 UUID·설치 진행은 build record에 저장한다. YAML의 빈 UTM base는 build record가 있어야만 build/launch 가능하다는 뜻이다.
+- Windows 템플릿은 `os: windows`, `arch: x86_64`, `mode: emulate`, user `wargame`, workspace `C:\wargame`, 4 CPU/8 GiB RAM/80 GiB disk, `scripts/windows/common.ps1`을 사용한다. 설치 계정과 user를 일치시킨다.
+- Kali arm64 템플릿은 같은 리소스에서 `arch: arm64`, `mode: virtualize`로 제공한다.
 
-```rust
-// challenge.rs
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)] pub struct ChallengeRef { pub provider: String, pub id: String }
-impl ChallengeRef { pub fn parse(s: &str) -> Result<Self> /* "dreamhack:11"; bare number → provider "dreamhack" */; }
-impl Display for ChallengeRef // "dreamhack:11"
-pub struct ChallengeSummary { pub r#ref: ChallengeRef, pub slug: String, pub title: String, pub categories: Vec<String>, pub difficulty: Option<String> }
-pub struct Challenge { pub summary: ChallengeSummary, pub description: String, pub tags: Vec<String>, pub assets: Vec<ChallengeAsset>, pub remote_endpoints: Vec<String>, pub source_url: String }
-pub struct ChallengeAsset { pub id: String, pub filename: String, pub size: Option<u64>, pub descriptor: serde_json::Value, pub expected_sha256: Option<String> }
-pub fn slugify(title: &str) -> String   // lowercase, [a-z0-9-], collapse dashes, max 40 chars, "challenge" if empty
+## 5. 설계 방향과 경계
 
-// profile.rs
-pub enum GuestOs { Macos, Linux, Windows }      // serde rename_all = "lowercase"
-pub enum GuestArch { Arm64, X86_64 }             // serde: "arm64", "x86_64"
-pub struct Resources { pub cpu: u32, pub memory_mib: u64, pub disk_gib: u64 }
-pub struct Profile { pub name: String, pub description: String, pub guest: GuestSpec, pub image: ImageSpec, pub resources: Resources, pub provision: ProvisionSpec, pub tools: ToolsSpec, pub workspace: WorkspaceSpec }
-pub struct GuestSpec { pub os: GuestOs, pub arch: GuestArch, pub user: String, pub password: Option<String> }
-pub struct ImageSpec { pub base: String }
-pub struct ProvisionSpec { pub scripts: Vec<String> }
-pub struct ToolsSpec { pub verify: Vec<String> }
-pub struct WorkspaceSpec { pub root: String }
-impl Profile { pub fn from_yaml(s: &str) -> Result<Profile>; pub fn image_name(&self) -> String /* "wargame-profile-<name>" */ }
-// YAML schema is DESIGN §6: apiVersion must be "wargame.vm/v1", kind "Profile"; memory_gib in YAML → memory_mib in struct.
+**선택: Tart + UTM adapter.** 기존 macOS 경로를 보존하고 UTM에서 Windows/Kali와 콘솔을 관리한다. 실제 utmctl 명령을 먼저 확인하고 생성·복제·설정은 공식 AppleScript API로 보완한다. 문서에 없는 CLI 명령을 추측하지 않는다.
 
-// session.rs
-pub enum NetworkMode { Isolated, Nat }           // serde lowercase; FromStr
-pub enum KeepPolicy { Discard, Keep }
-pub enum SessionState { Creating, Downloading, Booting, Provisioning, Ready, Running, Stopped, Failed, Deleting, Deleted }
-impl SessionState { pub fn can_transition_to(self, to: SessionState) -> bool; pub fn is_up(self) -> bool /* Ready|Running */; pub fn is_terminal(self) -> bool /* Deleted */ }
-pub struct SessionAsset { pub filename: String, pub sha256: String, pub size: u64 }
-pub struct VmRef { pub backend: String, pub name: String }
-pub struct Session { /* fields per DESIGN §3.2 */ }
-impl Session { pub fn new_id(provider_short: &str, slug: &str, rand6: &str) -> String /* "dh-<slug>-<rand6>" */;
-               pub fn transition(&mut self, to: SessionState) -> Result<()>; }
-// transitions per DESIGN §3.2 table; Failed allowed from every non-terminal state; Stopped→Booting for resume.
+**대안: Tart + 직접 QEMU.** 헤드리스 제어는 단순해질 수 있지만 디스플레이, QMP, 펌웨어, TPM과 프로세스 관리를 직접 맡아야 한다. UTM에서 필수 요구가 불가능하다는 재현 증거가 있을 때만 검토한다. 새 백엔드를 둘 다 구현하는 것은 범위 밖이다.
 
-// compat.rs
-pub struct ProviderCapabilities { pub guest_os: Vec<GuestOs>, pub guest_arch: Vec<GuestArch>, pub graphical_console: bool, pub ssh: bool, pub snapshots: bool, pub copy_in: bool, pub remote: bool }
-pub fn check(profile: &Profile, backend_name: &str, caps: &ProviderCapabilities) -> Result<()>  // Err(Incompatible(msg)) with the MVP §25 message shape
-```
+1. backend resolver는 launch에는 profile, 기존 세션 작업에는 저장된 backend/VM ID를 사용한다. 전역 단일 provider에 우회 분기를 누적하지 않는다.
+2. 새 `wargame-utm` crate는 VM 생성·복제·구성·시작·상태·종료·삭제·콘솔을 담당하며 Dreamhack에 의존하지 않는다.
+3. endpoint 및 명령 전략은 OS/세션별로 정한다. 앱 서비스가 utmctl/AppleScript를 직접 호출하지 않는다.
+4. 공통 이미지 빌드는 준비→복제→부팅→연결→프로비저닝→검증→정상 종료→게시 순서를 갖는다. Tart 세부 처리는 Tart adapter에 남긴다.
+5. 설치 build record와 문제 session record를 분리한다. 소유 UUID·단계·오류를 저장해 재실행 시 복구한다.
+6. 외부 프로세스는 ProcessRunner를 사용한다. 호스트 shell 문자열 조합을 금지한다. AppleScript/게스트 스크립트는 신뢰된 템플릿에 입력을 데이터로 전달하고 escaping 테스트를 둔다.
+7. 새 비밀번호 필드를 확대하지 않는다. 기존 password 호환성이 필요하면 비밀값을 argv·로그·session/build record에 남기지 않고 런타임에서만 사용한다.
 
-Ports (DESIGN §3.3) — copy the signatures verbatim from DESIGN.md §3.3 into the five port files, plus:
+## 6. 오류 UX
 
-```rust
-pub struct SearchQuery { pub text: String, pub category: Option<String>, pub page: u32, pub page_size: u32 }
-pub struct SearchPage { pub items: Vec<ChallengeSummary>, pub next_page: Option<u32>, pub total: u64 }
-pub enum AuthState { Anonymous, Authenticated { display: String } }
-pub struct ProviderStatus { pub reachable: bool, pub auth: AuthState, pub detail: String }
-pub struct DownloadResult { pub files: Vec<DownloadedFile> }     // one asset may yield several files
-pub struct DownloadedFile { pub filename: String, pub path: PathBuf, pub sha256: String, pub size: u64 }
-#[async_trait] pub trait AssetSink: Send { async fn begin(&mut self, server_filename: &str) -> Result<()>; async fn write(&mut self, chunk: &[u8]) -> Result<()>; async fn finish(&mut self) -> Result<DownloadedFile>; }
-pub struct ImageRef(pub String);
-pub struct VmSpec { pub name: String, pub image: ImageRef, pub resources: Resources }
-pub struct StartOptions { pub network: NetworkMode, pub headless: bool, pub log_path: PathBuf }
-pub struct RuntimeInfo { pub pid: Option<u32> }
-pub enum VmStatus { Running, Stopped, Missing }
-pub struct BackendStatus { pub available: bool, pub version: Option<String>, pub detail: String }
-pub enum ConsoleDescriptor { Window { argv: Vec<String> }, Vnc { url: String }, None }
-pub struct ExecResult { pub status: i32, pub stdout: String, pub stderr: String }
-#[async_trait] pub trait SessionRepository: Send + Sync { async fn save(&self, s: &Session) -> Result<()>; async fn load(&self, id: &str) -> Result<Session>; async fn list(&self) -> Result<Vec<Session>>; async fn delete(&self, id: &str) -> Result<()>; fn session_dir(&self, id: &str) -> PathBuf; }
-```
-
-Config (DESIGN §3.5): `Config::load(path: Option<&Path>) -> Result<Config>` (missing file → defaults), `Config::default()`, serde with `#[serde(default)]` on every struct.
-
-- [ ] **Step 1:** Write failing tests: `ChallengeRef::parse("dreamhack:11")`, `parse("11")`, `parse("")` errors; `slugify("Out Of Bound!!")=="out-of-bound"`; `Profile::from_yaml` on the DESIGN §6 sample maps `memory_gib: 8` → `memory_mib == 8192`, rejects wrong `apiVersion`; every allowed transition passes and `Ready→Creating` fails; `compat::check` accepts macos/arm64 and rejects windows/x86_64 with a message containing "supports:"; `Config::load(None)` gives `default_network == Isolated`; `Config` parses the DESIGN §3.5 TOML.
-- [ ] **Step 2:** Run `cargo test -p wargame-core` → compile failures/red.
-- [ ] **Step 3:** Implement the modules above.
-- [ ] **Step 4:** `cargo test -p wargame-core`, `cargo clippy -p wargame-core --all-targets -- -D warnings`, `cargo fmt` → green.
-
----
-
-### Task 2: Core security helpers, infra adapters, and test fakes
-
-**Files:**
-- Create: `crates/wargame-core/src/security/{mod,filename,hash,staging,redact}.rs`
-- Create: `crates/wargame-core/src/infra/{mod,process,fs,keychain,json_repo,ssh}.rs`
-- Create: `crates/wargame-core/src/testing/{mod,fake_runner,fake_vm,fake_wargame,fake_transport,memory_store,memory_repo}.rs` (public module, behind no feature flag so downstream crates can use it in tests)
-- Modify: `crates/wargame-core/src/lib.rs`
-
-**Interfaces (Consumes Task 1; Produces):**
-
-```rust
-// security/filename.rs
-pub fn sanitize_filename(server_name: &str, fallback_id: &str) -> String   // DESIGN §3.6 rules; fallback "asset-<id>.bin"
-// security/hash.rs
-pub struct Sha256Writer<W: Write> { .. }  impl Write; fn finish(self) -> (W, String /*hex*/, u64 /*bytes*/)
-pub fn sha256_file(path: &Path) -> Result<(String, u64)>
-// security/staging.rs
-pub struct StagingDir { pub path: PathBuf, keep: bool }
-impl StagingDir { pub fn create(root: &Path, keep: bool) -> Result<Self> /* root/staging/<random>, mode 0700 */; pub fn sink(&self, asset_id: &str) -> StagingSink; }
-impl Drop for StagingDir { /* remove_dir_all unless keep */ }
-pub struct StagingSink { .. }   // impl AssetSink: begin() opens "<safe>.part" mode 0600; write() streams into Sha256Writer; finish() fsyncs, renames to "<safe>", returns DownloadedFile; drop without finish removes the .part
-// security/redact.rs
-pub fn redact(s: &str) -> String   // masks: "sessionid=…", "csrftoken=…", "Bearer …", "password=…", "-----BEGIN … PRIVATE KEY-----…-----END", values after "Cookie:"/"Authorization:" (case-insensitive) → "<redacted>"
-pub fn init_tracing(verbose: bool, log_file: Option<&Path>)  // fmt layer whose event formatter runs `redact` on the message; RUST_LOG/env-filter respected
-// infra/process.rs
-pub struct Cmd { pub program: String, pub args: Vec<String>, pub env: Vec<(String,String)>, pub stdin: Option<Vec<u8>>, pub cwd: Option<PathBuf> }
-pub struct Output { pub status: i32, pub stdout: String, pub stderr: String }
-#[async_trait] pub trait ProcessRunner: Send + Sync {
-    async fn run(&self, cmd: &Cmd) -> Result<Output>;                            // captures both streams; logs program+args via tracing::debug
-    async fn spawn_detached(&self, cmd: &Cmd, log_path: &Path) -> Result<u32>;   // new session (setsid via pre_exec on unix), stdout+stderr appended to log_path, stdin null; returns pid
-    fn which(&self, program: &str) -> Option<PathBuf>;
-    fn pid_alive(&self, pid: u32) -> bool;                                       // libc::kill(pid, 0)
-}
-pub struct RealRunner;
-// infra/fs.rs
-pub struct AppDirs { pub root: PathBuf }
-impl AppDirs { pub fn resolve() -> Result<Self> /* $WARGAME_HOME else ~/Library/Application Support/wargame-vm (macOS) else ~/.local/share/wargame-vm */;
-               pub fn config_file(&self)->PathBuf; pub fn profiles_dir(&self)->PathBuf; pub fn sessions_dir(&self)->PathBuf; pub fn cache_dir(&self)->PathBuf; pub fn logs_dir(&self)->PathBuf; pub fn keys_dir(&self)->PathBuf; pub fn ensure_layout(&self)->Result<()> /* mkdir -p all, 0700 */ }
-pub fn disk_free_bytes(path: &Path) -> Result<u64>   // fs2::available_space
-// infra/keychain.rs
-pub struct KeychainStore { runner: Arc<dyn ProcessRunner>, service: String }   // "wargame-vm"; uses `security -i` with stdin script lines; get → `find-generic-password -a <key> -s <service> -w` via run (argv has no secret); set → stdin "add-generic-password -U -a <key> -s <service> -w <value>\n" (value escaped with quotes); delete → "delete-generic-password -a <key> -s <service>"
-pub struct FileStore { path: PathBuf }   // JSON map, file mode 0600, warns via tracing::warn at construction ("plaintext credential store")
-// infra/json_repo.rs
-pub struct JsonSessionRepository { root: PathBuf }   // impl SessionRepository; sessions/<id>/metadata.json; atomic write (tmp + rename); list sorted by created_at desc; load of missing → SessionNotFound
-// infra/ssh.rs
-pub struct SshGuestTransport { runner: Arc<dyn ProcessRunner>, user: String, key_path: PathBuf }
-// impl GuestTransport: base args = ["-i", key, "-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=/dev/null","-o","ConnectTimeout=5","-o","LogLevel=ERROR","-o","BatchMode=yes"]
-// wait_ready: loop `ssh … user@ip true` every 3s until success or timeout → GuestBootTimeout
-// exec: `ssh … user@ip -- <argv shell-escaped>` (single-quote escaping helper `shell_quote`); copy_in: `scp -r … <src> user@ip:<dest>`; interactive_shell_cmd: std::process::Command for `ssh -t …`
-pub fn shell_quote(s: &str) -> String
-```
-
-Fakes (`testing/`): `FakeRunner` records every `Cmd` (`calls: Mutex<Vec<Cmd>>`) and answers from a FIFO/`responder: Box<dyn Fn(&Cmd)->Output>`; `FakeVmProvider`, `FakeWargameProvider` (returns a fixture `Challenge` with one asset whose bytes are `b"PK\x03\x04fake"`), `FakeTransport` (records exec/copy calls, `ready: bool`), `MemoryStore` (CredentialStore), `MemoryRepo` (SessionRepository). All configurable via `Arc<Mutex<…>>` fields so app tests can assert calls and inject failures (`fail_on: Option<&'static str>`).
-
-- [ ] **Step 1:** Tests first: `sanitize_filename("../../etc/passwd","7")=="passwd"`, `("", "7")=="asset-7.bin"`, `(".hidden","7")=="hidden"`, control chars stripped, 300-byte name truncated to 255; `StagingSink` writes `.part` then final name and sha256 matches `sha2` of the bytes; dropping a sink mid-write leaves no `.part`; `StagingDir` drop removes dir unless keep; `redact` masks all patterns and leaves normal text; `KeychainStore::set` sends the secret through stdin and never in argv (assert via `FakeRunner`); `JsonSessionRepository` round-trips a `Session` and lists newest first; `SshGuestTransport::exec` argv has the base options and `shell_quote("a'b")=="'a'\\''b'"`; `AppDirs::resolve()` honours `WARGAME_HOME`.
-- [ ] **Step 2:** Run → red. **Step 3:** Implement. **Step 4:** `cargo test -p wargame-core`, clippy, fmt → green.
-
----
-
-### Task 3: Dreamhack provider crate
-
-**Files:**
-- Create: `crates/wargame-dreamhack/src/{lib,client,api,model,normalize,provider,auth,download}.rs`
-- Create: `crates/wargame-dreamhack/fixtures/{login_401.json,download_401.json}` (search/detail fixtures exist from Task 0)
-- Tests: `crates/wargame-dreamhack/tests/fixtures.rs` (parsing/normalization), inline unit tests for header construction.
-
-**Interfaces (Consumes Task 1 ports + `CredentialStore`; Produces):**
-
-```rust
-pub struct DreamhackConfig { pub base_url: Url, pub user_agent: String }
-pub struct DreamhackProvider { .. }
-impl DreamhackProvider { pub fn new(cfg: DreamhackConfig, store: Arc<dyn CredentialStore>) -> Result<Self>; }
-impl WargameProvider for DreamhackProvider   // name() == "dreamhack"
-pub const CREDENTIAL_KEY: &str = "dreamhack.session";
-// model.rs: SearchResponse{count,next,previous,results:Vec<ChallengeListItem>}, ChallengeListItem{id:u64,title,tags:Vec<String>,tier_display:Option<String>,repository:Option<String>,needs_vm:bool,is_public:bool}, ChallengeDetail{ + description:String }, all with #[serde(default)] except id/title
-// normalize.rs: pub fn summary(item:&ChallengeListItem)->ChallengeSummary (slug = repository.unwrap_or(slugify(title)); difficulty = tier_display; categories = tags); pub fn challenge(d:&ChallengeDetail)->Challenge (source_url = base/wargame/challenges/<id>; assets = vec![ChallengeAsset{id: id.to_string(), filename: format!("{slug}.zip"), descriptor: json!({"kind":"dreamhack-download","challenge_id":id}), ..}] when needs_vm || description contains "file"/"파일"/"binary"/"바이너리"; remote_endpoints = lines of description matching `nc <host> <port>` or `http(s)://…`)
-// auth.rs: login(): GET base/ to obtain csrftoken cookie (ignore failures), POST /api/v1/auth/login/ json {email, password} with X-CSRFToken + Referer; on 2xx serialize cookie jar (name,value,domain,path) as JSON → store.set(CREDENTIAL_KEY); on 401 → AuthenticationFailed; password is `SecretString` and never logged
-// download.rs: POST /api/v1/wargame/challenges/<id>/download/ with headers X-CSRFToken (from cookie "csrftoken"), Referer base/wargame/challenges/<id>/; 401/403 → AuthenticationRequired; 404 → ChallengeNotFound; if content-type JSON: find url in ["url","file","download_url"] or array "files"[i]["url"|"file"] (+ "name"/"filename") → GET each, stream into sink; else if body is a file (Content-Disposition present or content-type octet-stream/zip): stream response directly; else ProviderChanged{what:"download response shape"}. Filename from Content-Disposition (RFC 6266 `filename=` / `filename*=UTF-8''`) or from the URL path or the JSON name; passed to sink.begin() which sanitizes.
-```
-
-Cookie persistence: on `new()`, read `store.get(CREDENTIAL_KEY)`; if present, parse and add cookies to a `reqwest::cookie::Jar` for `base_url`. `auth_state()` → Authenticated if a `sessionid` cookie is stored (display = "session cookie"). `healthcheck()` → GET search with page_size 1; reachable if 2xx.
-
-- [ ] **Step 1:** Fixture tests: `fixtures/search.json` parses to 1 item with id 11, title `out_of_bound`, slug `out-of-bound`, difficulty `Bronze 4`, categories `["pwnable"]`; `search_page.json` yields `next_page == Some(2)`; `detail.json` normalizes with description non-empty, one asset with descriptor kind `dreamhack-download`, `remote_endpoints` empty; `login_401.json`/`download_401.json` map to the right errors; `Content-Disposition` parser handles `attachment; filename="a.zip"` and `filename*=UTF-8''%ED%95%9C.zip`; CSRF header equals the cookie value.
-- [ ] **Step 2:** red. **Step 3:** Implement (HTTP via `reqwest::Client` built with `cookie_provider(jar)`, `use_rustls_tls`, `timeout 30s`). No live network in tests. **Step 4:** green + clippy + fmt.
-
----
-
-### Task 4: Tart provider crate
-
-**Files:**
-- Create: `crates/wargame-tart/src/{lib,args,list,image,provider,console}.rs`
-- Tests: inline, all through `FakeRunner`.
-
-**Interfaces (Consumes Task 1 `VmProvider`, Task 2 `ProcessRunner`/`FakeRunner`; Produces):**
-
-```rust
-pub struct TartConfig { pub binary: String /* "tart" */, pub vm_prefix: String /* "wg-" */, pub boot_timeout: Duration }
-pub struct TartProvider { runner: Arc<dyn ProcessRunner>, cfg: TartConfig }
-impl TartProvider { pub fn new(runner: Arc<dyn ProcessRunner>, cfg: TartConfig) -> Self; pub fn vm_name(&self, session_id: &str) -> String; }
-impl VmProvider for TartProvider   // name() == "tart"; capabilities per DESIGN §5
-// args.rs (pure, unit-tested):
-pub fn clone_args(src:&str, dst:&str)->Vec<String>;                       // ["clone", src, dst]
-pub fn set_args(vm:&str, r:&Resources)->Vec<String>;                       // ["set", vm, "--cpu", n, "--memory", mib, "--disk-size", gib]
-pub fn run_args(vm:&str, o:&StartOptions)->Vec<String>;                    // ["run", vm, "--no-clipboard", "--no-audio", (+"--no-graphics" if headless), (+"--net-host" if Isolated)]
-pub fn ip_args(vm:&str)->Vec<String>; pub fn stop_args; pub fn delete_args; pub fn list_args /* ["list","--format","json"] */; pub fn pull_args(image:&str);
-// list.rs: #[derive(Deserialize)] pub struct TartVm { #[serde(rename="Name")] pub name:String, #[serde(rename="Source")] pub source:String, #[serde(rename="State")] pub state:String, #[serde(rename="Running")] pub running:bool, #[serde(rename="Size")] pub size_gib:u64, #[serde(rename="Disk")] pub disk_gib:u64 }
-pub fn parse_list(json:&str)->Result<Vec<TartVm>>
-// image.rs: pub fn is_oci(name:&str)->bool /* contains '/' or ':' */; image_exists = list contains Name == image (OCI names compare exactly, e.g. "ghcr.io/cirruslabs/macos-sequoia-vanilla:latest")
-// provider.rs: create() = clone + set (on set failure: delete the clone, return VmCreationFailed); start() = spawn_detached(run_args, log_path) → RuntimeInfo{pid}; wait_ip() polls `tart ip <vm>` every 2s until it prints an IPv4 (parse) or boot_timeout → GuestBootTimeout; status() from list (Missing if absent); healthcheck() runs `tart --version`; delete() on a running VM: stop first (ignore error), then delete; list() returns VmRefs whose name starts with vm_prefix
-// console.rs: console(vm) → ConsoleDescriptor::Window{ argv: [binary, "run", vm, "--no-clipboard", "--no-audio"] } (network flag appended by the caller via run_args)
-```
-
-- [ ] **Step 1:** Tests: every `*_args` exact vector; `parse_list` on the real sample from DESIGN §1 (3 entries, one running); `create()` issues clone then set and returns `VmRef{backend:"tart", name:"wg-<id>"}`; `create()` deletes on set failure; `wait_ip` returns `10.0.0.5` when the fake answers "10.0.0.5\n" after two failures; `start()` passes `--net-host` only for Isolated and `--no-graphics` only when headless; `status()` Missing for unknown VM; `delete()` stops a running VM first.
-- [ ] **Step 2:** red. **Step 3:** implement. **Step 4:** green + clippy + fmt.
-
----
-
-### Task 5: Application services (search, launch, lifecycle, console, doctor, profiles)
-
-**Files:**
-- Create: `crates/wargame-core/src/app/{mod,search,launch,lifecycle,console,doctor,profiles}.rs`
-- Modify: `crates/wargame-core/src/lib.rs`
-- Tests: `crates/wargame-core/tests/launch.rs`, `tests/lifecycle.rs` using Task 2 fakes.
-
-**Interfaces (Consumes Tasks 1–2; Produces):**
-
-```rust
-pub struct AppContext { pub config: Config, pub dirs: AppDirs, pub wargame: Arc<dyn WargameProvider>, pub vm: Arc<dyn VmProvider>, pub transport: Arc<dyn GuestTransport>, pub repo: Arc<dyn SessionRepository>, pub profiles: ProfileStore, pub runner: Arc<dyn ProcessRunner>, pub bootstrap_script: &'static str }
-pub struct ProfileStore { builtin: Vec<Profile>, user_dir: PathBuf }   // profiles.rs: load builtin (passed in by cli via include_str!) + *.yaml in user_dir (user overrides builtin by name); fn get(&self,name)->Result<Profile>; fn list(&self)->Vec<Profile>
-pub struct LaunchRequest { pub challenge: ChallengeRef, pub profile: String, pub network: NetworkMode, pub resources: Option<Resources>, pub extract: bool, pub gui: bool }
-pub enum LaunchEvent { Preflight(String), SessionCreated{id:String}, VmCreated{name:String}, Downloading{filename:String}, Downloaded{filename:String,sha256:String,size:u64}, Booting, GuestIp(IpAddr), Bootstrapping, Ready{session_id:String,ssh_hint:String}, Failed{session_id:Option<String>,error:String,hint:Option<String>} }
-pub async fn launch(ctx:&AppContext, req:LaunchRequest, events: tokio::sync::mpsc::Sender<LaunchEvent>) -> Result<Session>   // DESIGN §3.4 exactly, including persisting after every state change and setting Failed + last_error on error
-pub async fn search(ctx:&AppContext, q:SearchQuery)->Result<SearchPage>; pub async fn open(ctx:&AppContext, r:&ChallengeRef)->Result<Challenge>
-// lifecycle.rs
-pub async fn list_sessions(ctx)->Result<Vec<Session>>; pub async fn inspect(ctx,id)->Result<Session>
-pub async fn stop(ctx,id)->Result<Session>        // Ready|Running → vm.stop → Stopped
-pub async fn resume(ctx,id)->Result<Session>      // Stopped → Booting (vm.start headless with saved network) → wait_ip → transport.wait_ready → Running
-pub async fn delete(ctx,id,force:bool)->Result<()> // Keep policy requires force → else Err(Other("session is kept; use --force")); Deleting → vm.delete (Missing is fine) → repo.delete
-pub async fn keep(ctx,id,keep:bool)->Result<Session>
-pub async fn prune(ctx, dry_run:bool)->Result<Vec<String>>   // vm.list() names with prefix not matching any session → delete unless dry_run
-// console.rs
-pub async fn ssh_command(ctx,id)->Result<std::process::Command>   // requires is_up and guest_ip
-pub async fn open_gui(ctx,id)->Result<()>   // if running: vm.stop; then vm.start(StartOptions{headless:false,..}) → wait_ip → wait_ready → update guest_ip/pid; state Running
-// doctor.rs
-pub struct Check { pub name:String, pub ok:bool, pub detail:String, pub hint:Option<String> }
-pub async fn doctor(ctx)->Vec<Check>   // DESIGN §7 list; each check independent; never returns Err
-```
-
-Guest layout written by launch: `<workspace.root>/.wg/bootstrap.sh`, `<workspace.root>/<slug>/incoming/<files>`, `<workspace.root>/<slug>/incoming/.wargame.json` (metadata per MVP §15). Bootstrap exec: `bash <root>/.wg/bootstrap.sh <root>/<slug> --extract=<true|false>`.
-
-- [ ] **Step 1:** Tests with fakes: happy path emits events in order and ends `Ready`, session persisted with `assets[0].sha256` equal to sha256 of the fake bytes, transport `copy_in` called for the asset and bootstrap, `exec` called with `--extract=true`; staging dir removed afterwards; `ImageMissing` when fake `image_exists=false` and no session is created; VM create failure → session `Failed` with `last_error` and `vm_ref == None`; boot timeout → `Failed` with `vm_ref` set (so delete works); anonymous provider + assets → `AuthenticationRequired` before any VM; `delete` refuses `Keep` without force; `prune` finds `wg-orphan`; `compat` rejection produces no session.
-- [ ] **Step 2:** red. **Step 3:** implement. **Step 4:** green + clippy + fmt.
-
----
-
-### Task 6: Profile image builder, profile definitions, guest bootstrap
-
-**Files:**
-- Create: `crates/wargame-tart/src/build.rs`; Modify `crates/wargame-tart/src/lib.rs`
-- Create: `profiles/macos-minimal-arm64.yaml`, `profiles/macos-re-arm64.yaml`, `profiles/scripts/macos/common.sh`, `profiles/scripts/macos/reversing.sh`
-- Create: `guest/bootstrap.sh`
-- Tests: `crates/wargame-tart/src/build.rs` inline (argv/order through `FakeRunner` + `FakeTransport`), `crates/wargame-core/tests/profiles.rs` (both YAML files parse), `guest/bootstrap_test.sh` (bash test runnable on the host with a temp dir; run by `cargo test -p wargame-cli` via `std::process::Command` only when `bash` and `unzip` exist).
-
-**Interfaces (Consumes Tasks 1, 2, 4; Produces):**
-
-```rust
-pub struct BuildOptions { pub scripts_dir: PathBuf /* repo profiles/ dir or $WARGAME_HOME/profiles */, pub pubkey: String, pub log_path: PathBuf }
-pub struct ProfileImageBuilder { runner: Arc<dyn ProcessRunner>, tart: Arc<TartProvider>, transport_factory: Box<dyn Fn(&str /*user*/) -> Arc<dyn GuestTransport> + Send + Sync> }
-pub async fn build_profile(&self, profile:&Profile, opts:&BuildOptions, progress: &mut dyn FnMut(String)) -> Result<ImageRef>
-// steps: 1 ensure base pulled (image_exists else pull); 2 if "wargame-profile-<name>" exists → delete it; 3 clone base → profile image name; 4 set resources; 5 start headless with Nat, log to opts.log_path; 6 wait_ip; 7 password bootstrap: run `sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@ip "mkdir -p ~/.ssh && chmod 700 ~/.ssh && printf '%s\n' '<pubkey>' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"` with env SSHPASS=<profile.guest.password> (env, never argv) retrying every 5s up to 10 min; 8 transport.wait_ready; 9 copy_in scripts dir → ~/wg-provision/; 10 exec each `bash ~/wg-provision/<script>`; 11 exec each tools.verify (fail → InvalidProfile{reason}); 12 exec `rm -rf ~/wg-provision`; 13 stop; return ImageRef(profile.image_name())
-```
-
-`common.sh`: idempotent; installs Homebrew non-interactively if missing (`NONINTERACTIVE=1`), writes `eval "$(/opt/homebrew/bin/brew shellenv)"` into `~/.zprofile`, `brew install git python uv curl wget jq vim tree`, disables screen lock/sleep (`sudo pmset -a sleep 0 displaysleep 0`), creates `~/wargame`. `reversing.sh`: `brew install --cask temurin`, `brew install ghidra llvm binutils hexyl file`, `brew install --cask ghidra` if formula absent.
-
-`guest/bootstrap.sh <workspace-dir> --extract=<true|false>`: creates `incoming/ work/ notes/ output/`, moves nothing, when extract=true unpacks `incoming/*.zip` via `unzip -n -q` into `incoming/extracted/<name>/`, `*.tar.gz|*.tgz|*.tar` via `tar -xf … -C` (bsdtar refuses absolute/`..`), never runs anything else, writes `notes/README.md` with the metadata summary from `incoming/.wargame.json` (via `python3 -c` if python3 exists, else raw copy), prints the welcome block. Exit non-zero on any error (`set -euo pipefail`).
-
-- [ ] **Step 1:** Tests: builder call order recorded on `FakeRunner` (`clone`, `set`, `run`, `ip`, sshpass with `SSHPASS` in env and not in args, scripts executed in profile order, `verify` commands executed, `stop` last); verify failure → `InvalidProfile`; both YAMLs parse and `macos-re-arm64.provision.scripts.len()==2`; `bootstrap_test.sh`: zip with `../evil.txt` entry is not written outside the workspace; directories exist; `--extract=false` leaves the zip untouched.
-- [ ] **Step 2:** red. **Step 3:** implement. **Step 4:** green + clippy + fmt + `shellcheck`-clean if available.
-
----
-
-### Task 7: CLI binary and composition root
-
-**Files:**
-- Create: `crates/wargame-cli/src/{main,cli,wiring,output,fixture_provider}.rs`; `crates/wargame-cli/src/profiles_builtin.rs` (`include_str!` of both YAMLs and `guest/bootstrap.sh`)
-- Tests: `crates/wargame-cli/tests/cli.rs` (uses `std::process::Command` on `env!("CARGO_BIN_EXE_wargame")` with `WARGAME_HOME` = tempdir and `WARGAME_PROVIDER=fixture`, `WARGAME_VM=fake`).
-
-**Interfaces (Consumes Tasks 1–6; Produces the `wargame` binary):**
-
-```
-wargame                                  → TUI (Task 8; until then prints "TUI not built yet" and exits 2)
-wargame search <query> [--category c] [--page n] [--json]
-wargame open <provider:id|id> [--json]
-wargame launch <ref> [--profile P] [--network isolated|nat] [--cpu n] [--memory-gib n] [--no-extract] [--gui] [--yes]
-wargame sessions [--json]
-wargame session inspect <id> [--json]
-wargame ssh <id>            (exec replaces process)
-wargame gui <id>
-wargame stop <id> | resume <id> | keep <id> [--off] | delete <id> [--force] | prune [--dry-run]
-wargame doctor [--json]
-wargame profiles [--json] | wargame profile build <name>
-wargame auth login [--email e] | auth status | auth logout
-global: --verbose, --config <path>, --home <path>
-```
-
-`wiring.rs`: `build_context(cli_globals) -> Result<AppContext>`: `AppDirs::resolve` (+`--home`), `ensure_layout`, copy builtin profile YAMLs into `profiles_dir` if absent, `Config::load`, credential store from config (`keychain` → `KeychainStore`, `file` → `FileStore`), provider from `WARGAME_PROVIDER` env (`fixture` → `FixtureProvider`, else Dreamhack), VM from `WARGAME_VM` env (`fake` → `FakeVmProvider` + `FakeTransport`, else `TartProvider` + `SshGuestTransport` with key `keys/id_ed25519`), `init_tracing(verbose, logs/wargame.log)`.
-
-`fixture_provider.rs`: `FixtureProvider` implementing `WargameProvider` with one challenge `fixture:1` (`hello-fixture`) whose asset is an in-memory zip built at runtime with the `zip`-free approach: a stored (uncompressed) ZIP written by hand (local header + central directory + EOCD for a single file `hello.txt` containing `hello wargame\n`). This is what the E2E smoke test uses.
-
-NAT confirmation (MVP §18): without `--yes`, `launch --network nat` prints the warning and asks `Continue? [y/N]` on the TTY. Errors: print `Error: <msg>` and `Try: <hint>` on stderr, exit 1. `launch` prints each `LaunchEvent` on its own line with `✓`/`…` markers.
-
-- [ ] **Step 1:** CLI tests: `wargame --help` lists all commands; `wargame profiles --json` lists both builtin profiles; `wargame search hello --json` with fixture provider returns `fixture:1`; `wargame launch fixture:1 --profile macos-minimal-arm64 --yes` with fake VM prints `Ready` and `wargame sessions --json` then shows one session in state `ready` with `assets[0].sha256` set; `wargame delete <id>` removes it; `wargame doctor --json` returns an array and exits 0 even when tart is missing; `wargame launch fixture:1 --network nat` without `--yes` and without a TTY exits 1 with "Continue".
-- [ ] **Step 2:** red. **Step 3:** implement. **Step 4:** green + clippy + fmt.
-
----
-
-### Task 8: TUI
-
-**Files:**
-- Create: `crates/wargame-cli/src/tui/{mod,app,search,problem,launch,sessions,widgets}.rs`; Modify `main.rs` (no subcommand → `tui::run(ctx)`)
-- Tests: `tui/app.rs` inline tests for the pure state reducer (`App::handle(Event) -> Vec<Effect>`); no terminal needed.
-
-**Design:** Elm-style. `App { screen: Screen, search: SearchState, problem: Option<ProblemState>, launch: Option<LaunchState>, sessions: Vec<Session>, status: String }`. `Screen::{Search, Problem, Launching, Sessions}`. Input events (`crossterm::event::KeyEvent`) and async results (`Msg::{SearchResults(SearchPage), Challenge(Challenge), Launch(LaunchEvent), Sessions(Vec<Session>), Error(String)}`) go through one `update(&mut self, Msg) -> Vec<Effect>`; effects (`Effect::{Search(SearchQuery), Open(ChallengeRef), Launch(LaunchRequest), LoadSessions, Stop(id), Resume(id), Delete(id), ExecSsh(id), OpenGui(id), Quit}`) are executed by the runtime loop with `tokio::spawn` and results sent back through an `mpsc` channel. Key map per DESIGN §7 and MVP §6 mockups (`/` search, `Enter` open, `Tab` cycle profile/network fields, `n` toggles network with the NAT warning shown in red, `l` launch, `s` sessions screen, `Esc` back, `q` quit, on sessions: `x` stop, `r` resume, `d` delete (asks y/N), `Enter` ssh). `ExecSsh` suspends the TUI (leave alternate screen, run ssh, re-enter).
-
-- [ ] **Step 1:** Reducer tests: typing then Enter emits `Effect::Search`; `SearchResults` fills the list and `Enter` emits `Open`; on Problem, `n` toggles Nat and status shows the warning; `l` emits `Launch` with the selected profile/network; `Launch(Ready)` sets screen Launching with ready flag; `q` emits Quit.
-- [ ] **Step 2:** red. **Step 3:** implement, and run `wargame` once with `WARGAME_PROVIDER=fixture WARGAME_VM=fake` under `script -q /dev/null` to check it draws without panicking (exit with `q`). **Step 4:** green + clippy + fmt.
-
----
-
-### Task 9: README, e2e smoke, nix wrapper, doctor polish
-
-**Files:**
-- Create: `README.md` (install via `nix run github:…`/`nix build`, first-run walkthrough per MVP §7.1, security notes, what "isolated" means with `--net-host`, troubleshooting), `scripts/e2e-smoke.sh`, `crates/wargame-tart/tests/e2e.rs` (`#[ignore]`, requires `WARGAME_E2E=1`), `CHANGELOG.md`
-- Modify: `flake.nix` (wrap binary with `makeWrapper --prefix PATH : ${lib.makeBinPath [tart sshpass openssh]}`; `checks.{fmt,clippy,tests}`), `crates/wargame-core/src/app/doctor.rs` if any check is missing from DESIGN §7.
-
-`scripts/e2e-smoke.sh`: `export WARGAME_HOME=$(mktemp -d) WARGAME_PROVIDER=fixture`; builds with `cargo build`; `wargame doctor`; `wargame launch fixture:1 --profile <profile from $1, default macos-minimal-arm64> --yes`; `wargame ssh <id>`-less verification via `wargame session inspect --json` → guest_ip, then `ssh -i $WARGAME_HOME/keys/id_ed25519 admin@ip 'cat ~/wargame/hello-fixture/incoming/extracted/hello-fixture/hello.txt'` must print `hello wargame`; `wargame delete <id> --force`. `tests/e2e.rs` does the M0 flow directly against the vanilla image with password auth (documented; only runs when `WARGAME_E2E=1`).
-
-- [ ] Write files; `nix flake check`; `nix build`; `./result/bin/wargame --help`; `./result/bin/wargame doctor`.
-
----
-
-## Execution workflow
-
-Stages (each stage's tasks run in parallel; stages are sequential; each task = implement → review → fix-if-needed → re-review; a single commit agent commits after each stage):
-
-| Stage | Tasks |
+| 상황 | 기대 결과 |
 |---|---|
-| A | 1 |
-| B | 2, 3, 4 |
-| C | 5, 6 |
-| D | 7 |
-| E | 8, 9 |
+| UTM 미설치·자동화 권한 거부 | 원인·복구 절차, Tart 작업은 계속 가능 |
+| 불가 조합·ISO 없음·해시 불일치 | VM/세션 생성 전 실패 |
+| OS 설치 미완료 | 설치·SSH 준비·build 재개 명령 안내 |
+| SSH/guest agent 미준비 | 필요한 서비스를 구분하고 단계·timeout 표시 |
+| 도구 검증 실패 | 명령·exit code·로그 표시, 이전 이미지 보존 |
+| 외부에서 VM 삭제 | missing 반영, 관계없는 VM 생성/삭제 금지 |
+| 프로필 변경 후 resume | 저장된 설정 사용 |
+| isolated 불가 | 사전 오류, NAT는 명시 선택 |
+| 긴 emulate 부팅 | 단계·경과 시간·로그 위치·timeout 설정 방법 |
 
-Reviewer gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` all green inside `nix develop`; task acceptance tests present and passing; global constraints honoured; no secret in argv; no host-side extraction. Verdict schema `{approved: bool, issues: [{severity, file, description}], summary}`.
+## 7. 인수 기준
 
-After Stage E the orchestrator runs: `nix flake check`, `nix build`, `wargame doctor`, `scripts/e2e-smoke.sh` against the local vanilla image (M0 proof), and records results in `docs/verification.md`.
+| ID | 기대 결과 | 검증 수준 |
+|---|---|---|
+| AC-01 | 기존 두 macOS 프로필과 과거 세션 사용 | 자동화 + 실VM 회귀 |
+| AC-02 | Windows/Kali x86_64 게스트이고 hypervisor off | 구성 확인 + 실VM 시스템 정보 |
+| AC-03 | Kali arm64 virtualize 부팅 | 구성 확인 + 실VM |
+| AC-04 | ISO 생성→수동 설치→build→재사용 launch | 필수 세 게스트 실VM |
+| AC-05 | 원본 UTM VM 복제 후 원본 보존 | 실VM |
+| AC-06 | 사용자 스크립트 추가→재빌드→도구 검증 | Kali/Windows 실VM |
+| AC-07 | OS별 명령·경로·파일 해시·작업 폴더 정상 | 자동화 + 실VM |
+| AC-08 | 혼합 백엔드 세션과 설정 변경 후 생명주기 정상 | fake 통합 + 실VM |
+| AC-09 | 실패 빌드의 이전 이미지 보존·부분 실패 복구 | fault injection |
+| AC-10 | isolated 차단 또는 사전 거부, NAT 명시 선택 | 실VM 네트워크 |
+| AC-11 | 외부 VM 삭제·인젝션·압축 탈출 방지 | 자동화 + 실VM 표본 |
+| AC-12 | Nix build/fmt/lint/tests 통과, UTM 없이 비실VM 테스트 | 자동화 |
+
+isolated가 불가능한 환경은 “NAT 지원, isolated 사전 거부”로 표시한다. 이를 isolated 지원 완료로 주장하지 않는다. 외부 조건으로 실제 게스트 검증을 못 하면 해당 AC를 unverified로 남긴다.
+
+## 8. 구현 작업 순서
+
+각 작업은 관련 실패 테스트 작성→실패 이유 확인→구현→대상 테스트 및 회귀 검사 순서로 진행한다. 새 파일명은 책임을 유지하는 범위에서 조정할 수 있으며 변경 이유를 기록한다.
+
+### Task 1. UTM 자동화 계약과 호스트 검증
+
+**추가:** `docs/utm-compatibility.md`, 이후 `crates/wargame-utm/tests/fixtures/`.
+
+- [ ] UTM/utmctl 버전·help·AppleScript dictionary를 확인하고 지원 최소 버전을 기록한다.
+- [ ] 앱 소유 임시 VM으로 ISO 연결, x86_64 설정, hypervisor off, UUID 조회, 복제, 시작/중지, 콘솔, 삭제를 확인한다.
+- [ ] Windows 11 펌웨어/TPM/드라이버와 guest agent/SSH 주소 조회 경로를 검증한다.
+- [ ] isolated/NAT와 호스트 연결의 지원 범위 및 불가 시 거부 경로를 기록한다.
+- [ ] 비밀값 없는 명령/응답 fixture를 확보한다.
+
+**산출 계약:** 재현 명령·버전·가능한 조합이 문서화되어 있다. 필수 OS 부팅을 막는 문제는 재현 증거와 해결안을 확보해 다음 작업에 반영한다.
+
+### Task 2. 프로필·세션과 backend resolver
+
+**수정:** core `domain/{profile,compat,session}.rs`, `config.rs`, `ports/{vm_provider,guest_transport}.rs`, `app/mod.rs`, `testing/*`, CLI `wiring.rs`.
+**추가:** core `app/backends.rs`, `tests/backends.rs`.
+
+- [ ] 과거 YAML/JSON을 그대로 읽는 테스트와 지원 조합 표 테스트를 작성한다.
+- [ ] FR-1 스키마, endpoint, session snapshot과 resolver를 구현한다.
+- [ ] 같은 이름의 Tart/UTM VM, 기본 설정 변경 후 resume, 서로 다른 user/port 세션 라우팅을 테스트한다.
+- [ ] Tart/fake 구현을 갱신하고 core/CLI 회귀 테스트를 통과시킨다.
+
+**산출 계약:** 신규 실행은 profile, 재개·삭제는 session으로 provider/connection을 선택한다. 호환성 검사는 부작용 전에 끝난다.
+
+### Task 3. UTM provider와 doctor
+
+**추가:** `crates/wargame-utm/Cargo.toml`, `src/{lib,provider,automation,config,console}.rs`, `tests/provider.rs`.
+**수정:** workspace/CLI `Cargo.toml`, CLI `wiring.rs`, core `app/doctor.rs`/`error.rs`, 필요한 경우 `flake.nix`.
+
+- [ ] fixture 기반 정상·잘못된 출력·권한 거부·timeout 테스트를 작성한다.
+- [ ] create/clone/start/wait/status/stop/delete/list/console과 UUID 매핑을 구현한다.
+- [ ] emulate hypervisor off와 virtualize 호환성 검사를 연결한다.
+- [ ] prefix가 같아도 소유 record에 없는 VM 삭제가 거부되는지 검사한다.
+- [ ] doctor 경로 탐색·버전·프로필별 의존성 검사를 검증한다.
+
+**산출 계약:** UTM은 core VM port 구현체이며 외부 명령은 fake runner로 검증된다.
+
+### Task 4. 설치 VM과 재사용 이미지 빌드
+
+**추가:** core `app/profile_build.rs`, `domain/build.rs`, `ports/image_builder.rs`, `tests/profile_build.rs`; UTM `src/build.rs`.
+**수정:** Tart `src/build.rs`, core exports/저장소, CLI `cli.rs`/`main.rs`/`wiring.rs`.
+
+- [ ] create 재실행·소스 충돌·미설치 build·해시 오류·이전 이미지 보존 테스트를 작성한다.
+- [ ] init/create/console과 소유 build record를 구현한다. 내장 템플릿은 Task 6에서 완성한다.
+- [ ] ISO 및 UTM 원본 복제 경로를 연결하고 Tart build를 공통 계약에 맞춘다.
+- [ ] 설치 대기·프로비저닝·검증·정상 종료·게시를 구분하고 해시를 저장한다.
+- [ ] 재부팅·중단·디스크 부족·정리 실패를 주입해 복구를 검사한다.
+
+**산출 계약:** build 성공은 검증된 정지 이미지 게시이며 실패·설치 대기를 ready로 표시하지 않는다.
+
+### Task 5. OS별 연결과 bootstrap
+
+**추가:** core `infra/powershell.rs`, `tests/guest_transport.rs`, `guest/bootstrap.ps1`.
+**수정:** core `infra/ssh.rs`, `app/{launch,lifecycle,console}.rs`, `guest/bootstrap.sh`, CLI `profiles_builtin.rs`.
+
+- [ ] Windows 인코딩, 공백/따옴표/한글 경로, 비기본 user/port 테스트를 작성한다.
+- [ ] PowerShell 실행·Windows 전송·게스트 준비 검사·OS별 bootstrap을 구현한다.
+- [ ] 작업 폴더·메타데이터·해시·도구 검증을 검사한다.
+- [ ] 악성 압축 경로 및 링크 fixture로 디렉터리 탈출과 호스트 실행이 없음을 검증한다.
+
+**산출 계약:** OS가 명령·경로 의미를 결정하고 프로비저닝 스크립트만 실행하며 문제 파일은 실행하지 않는다.
+
+### Task 6. 프로필·사용자 도구·CLI/TUI
+
+**추가:** `profiles/kali-arm64.yaml`, `profiles/kali-x86_64.yaml`, `profiles/windows-x86_64.yaml`, `profiles/scripts/kali/common.sh`, `profiles/scripts/windows/common.ps1`.
+**수정:** CLI `profiles_builtin.rs`/`cli.rs`/`main.rs`/`output.rs`, `tui/{app,launch,sessions}.rs`, core `app/profiles.rs`, CLI `tests/cli.rs`, core `tests/{profiles,launch,lifecycle}.rs`.
+
+- [ ] 내장 템플릿 파싱과 사용자 YAML/스크립트 보존 테스트를 추가한다.
+- [ ] 기본 도구·verify 명령과 custom script 예시를 제공한다.
+- [ ] profiles/doctor/launch/TUI에 backend/arch/mode/이미지 상태를 반영한다.
+- [ ] 혼합 세션·과거 JSON으로 생명주기·gui·ssh를 검사한다.
+
+**산출 계약:** §4 흐름이 완성되며 CLI/TUI는 같은 서비스와 상태를 사용한다.
+
+### Task 7. 실VM 인수 검증과 문서
+
+**추가:** `scripts/e2e-multi-os.sh`, `crates/wargame-utm/tests/e2e.rs`.
+**수정:** `README.md`, `DESIGN.md`, `CHANGELOG.md`, `docs/verification.md`, `docs/next-steps.md`.
+
+- [ ] 자동 검사와 기존 macOS 두 프로필 smoke를 실행한다.
+- [ ] 필수 세 게스트에서 설치·build·launch·사용자 도구 재빌드를 수행한다.
+- [ ] 중지→재개→콘솔→파일 확인→삭제 및 원본 보존을 검사한다.
+- [ ] 네트워크 격리/거부, 실패 복구, emulate 설정을 검증한다.
+- [ ] OS/ISO 해시, 호스트/UTM 버전, 명령·시간·로그와 AC별 결과를 기록한다.
+- [ ] 최종 코드 검토로 요구 누락·회귀·소유권·인젝션 문제를 해결한다.
+
+**산출 계약:** 문서와 실검증 결과가 일치하며 미검증 조합은 지원 완료로 표시하지 않는다.
+
+## 9. 검사 명령과 완료 판정
+
+```bash
+nix develop -c cargo fmt --all --check
+nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+nix develop -c cargo test --workspace
+nix flake check
+nix build
+```
+
+실VM 검사는 opt-in이다. 일반 cargo test에서 VM 생성·대용량 다운로드·앱 자동화를 수행하지 않는다. Linux에서도 비실VM 테스트가 실행 가능해야 한다.
+
+기존 `scripts/e2e-smoke.sh`의 입력과 부작용을 확인한 뒤 준비된 macOS 두 프로필로 검사한다. 새 `e2e-multi-os.sh`는 프로필 이름을 받고 미리 빌드된 이미지에서 launch 이후를 검증한다. ISO 설치는 별도 수동 단계와 증거로 기록한다.
+
+- [ ] AC-01–AC-12 각각 pass/fail/unverified를 기록했다.
+- [ ] Windows/Kali x86_64 전체 VM 에뮬레이션 및 Kali arm64 virtualization을 실검증했다.
+- [ ] Windows/Kali 사용자 도구 추가·재빌드가 동작한다.
+- [ ] 기존 macOS와 과거 프로필/세션 호환성을 검증했다.
+- [ ] mock 결과와 실VM 결과를 구분했고 미검증을 완료로 처리하지 않았다.
+- [ ] 최종 변경 파일·검사 결과·실행 명령·남은 제한을 인계했다.
+
+## 10. Claude 실행 지침 및 공식 근거
+
+- 실행 시 저장소 지침과 git 상태를 다시 확인한다. 이 PRD 작성 시작 시 작업 트리는 깨끗했다.
+- Task 1의 실제 외부 API 검증을 먼저 수행한다. 기존 코드를 재작성하지 말고 필요한 경계만 확장한다.
+- 스크립트·의존성 추가 이유와 단계별 검증 증거를 기록한다. 비밀값·라이선스 키·ISO/VM 디스크는 저장소에 넣지 않는다.
+- 과거 `.claude/workflows/mvp-build.js`의 작업 번호·모델·커밋 정책을 새 기능 요구로 해석하지 않는다. 커밋은 현재 실행 환경 지침을 따른다.
+- 사용자에게는 구현 결과와 검증 여부를 구분해 보고한다. 이 문서 작성 후 구현 담당은 Claude이다.
+
+공식 자료(구현 시 설치 버전과 대조):
+
+- [Tart](https://tart.run/): Apple Silicon macOS/Linux VM 도구.
+- [UTM scripting](https://docs.getutm.app/scripting/scripting/): 자동화와 앱 내부 utmctl 경로.
+- [UTM scripting cheat sheet](https://docs.getutm.app/scripting/cheat-sheet/): 생성/복제, hypervisor 설정, 주소 조회, guest agent 예시.
+- [UTM scripting reference](https://docs.getutm.app/scripting/reference/): backend/configuration/VM 조작 계약.
+
+설계상 기대와 검증된 동작은 다르다. Windows 설치 조건, UTM 명령 옵션, 네트워크 격리와 콘솔 동작은 Task 1 및 실제 인수 검증으로 확정한다.
