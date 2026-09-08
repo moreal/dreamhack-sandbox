@@ -38,6 +38,13 @@ use wargame_core::testing::{
 struct FakeBuilder {
     backend: String,
     installer: bool,
+    /// Whether `publish` re-uses one id for every build, the way Tart does
+    /// (its image *is* `wargame-profile-<name>`), or mints a new one, the way
+    /// UTM's `duplicate` does.
+    stable_image_id: bool,
+    /// The images that exist on this fake backend right now: `publish` adds
+    /// one, `discard_image` removes it.
+    live_images: Mutex<Vec<String>>,
     transport: Arc<FakeTransport>,
     /// Overrides `transport` when a test needs a guest that behaves
     /// differently (a reboot mid-provisioning, say).
@@ -61,6 +68,8 @@ impl FakeBuilder {
         FakeBuilder {
             backend: "utm".to_string(),
             installer: true,
+            stable_image_id: false,
+            live_images: Mutex::new(Vec::new()),
             transport: Arc::new(FakeTransport::new()),
             guest: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
@@ -88,12 +97,18 @@ impl FakeBuilder {
         FakeBuilder {
             backend: "tart".to_string(),
             installer: false,
+            stable_image_id: true,
             ..FakeBuilder::utm()
         }
     }
 
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Whether the backend still has this image.
+    fn has_image(&self, id: &str) -> bool {
+        self.live_images.lock().unwrap().iter().any(|i| i == id)
     }
 
     fn record(&self, call: &str) {
@@ -227,14 +242,27 @@ impl ProfileImageBuilder for FakeBuilder {
         self.record("publish");
         *self.last_profile.lock().unwrap() = req.profile.name.clone();
         self.should_fail("publish")?;
-        let name = format!("wg-build-image-{}", req.profile.name);
+        let (name, id) = if self.stable_image_id {
+            // Tart: the built VM is the image, so the same name comes back
+            // from every build.
+            let name = req.profile.image_name();
+            (name.clone(), name)
+        } else {
+            let name = format!("wg-build-image-{}", req.profile.name);
+            (name, self.new_id("IMAGE"))
+        };
         self.published.lock().unwrap().push(name.clone());
-        Ok(PublishedImage::new(self.new_id("IMAGE"), name))
+        self.live_images.lock().unwrap().push(id.clone());
+        Ok(PublishedImage::new(id, name))
     }
 
     async fn discard_image(&self, image: &PublishedImage) -> Result<()> {
         self.record(&format!("discard_image:{}", image.id));
         self.discarded.lock().unwrap().push(image.id.clone());
+        self.live_images
+            .lock()
+            .unwrap()
+            .retain(|id| id != &image.id);
         let watched = self.builds.lock().unwrap().clone();
         if let Some(builds) = watched {
             let profile = self.last_profile.lock().unwrap().clone();
@@ -1130,10 +1158,12 @@ async fn a_failed_discard_of_the_old_image_is_recorded_not_swallowed() {
         BuildPhase::Ready,
         "the new image is still good"
     );
-    assert!(
-        record.previous_image.is_some(),
-        "the old image is still there"
+    assert_eq!(
+        record.leaked_images.len(),
+        1,
+        "the old image still exists, so it stays tracked"
     );
+    assert_eq!(record.previous_image, None);
     assert_eq!(record.cleanup_failures.len(), 1);
     assert!(record.cleanup_failures[0].contains("could not delete"));
 }
@@ -1281,5 +1311,156 @@ async fn a_script_that_asks_for_a_reboot_waits_for_the_guest_and_continues() {
             .iter()
             .any(|argv| argv == &["python3".to_string(), "--version".to_string()]),
         "{execs:?}"
+    );
+}
+
+/// A backend whose image id is stable across builds -- Tart's image *is*
+/// `wargame-profile-<name>` -- republishes the same id, so there is no old
+/// image to delete. Deleting it would delete the one this build just made,
+/// leaving a record that says `ready` and a `launch` that fails with
+/// `ImageMissing` (spec.md §3 FR-3's "사용자 스크립트를 추가하고 build를
+/// 재실행하면 …", AC-01's existing macOS profiles).
+#[tokio::test]
+async fn rebuilding_an_image_whose_id_never_changes_keeps_it() {
+    let f = fixture();
+    let first = profile_build::build(&f.ctx, "macos-re-arm64", &mut noop)
+        .await
+        .unwrap();
+    let image = first
+        .ready_image()
+        .expect("the first build publishes")
+        .clone();
+    assert_eq!(image.id, "wargame-profile-macos-re-arm64");
+
+    let second = profile_build::build(&f.ctx, "macos-re-arm64", &mut noop)
+        .await
+        .unwrap();
+
+    assert_eq!(second.phase, BuildPhase::Ready);
+    assert_eq!(
+        second.ready_image().map(|i| i.id.clone()),
+        Some(image.id.clone())
+    );
+    assert_eq!(
+        second.previous_image, None,
+        "the same image was republished; there is no earlier one to delete"
+    );
+    assert!(
+        f.tart.discarded.lock().unwrap().is_empty(),
+        "the republished image must never be deleted: {:?}",
+        f.tart.calls()
+    );
+    assert!(
+        f.tart.has_image(&image.id),
+        "the image the record points at must still exist on the backend"
+    );
+    assert!(second.leaked_images.is_empty());
+
+    // And it is still what a launch would clone.
+    let profile = f.ctx.profiles.get("macos-re-arm64").unwrap();
+    assert_eq!(
+        profile_build::launch_image(&f.ctx, &profile)
+            .await
+            .unwrap()
+            .0,
+        image.id
+    );
+}
+
+/// An image that could not be deleted still exists, so the record keeps
+/// pointing at it: `prune` must not treat it as an orphan, and the next
+/// build retries the deletion.
+#[tokio::test]
+async fn an_image_that_could_not_be_deleted_stays_tracked_and_is_retried() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let first = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    let old = first.ready_image().unwrap().clone();
+
+    f.utm.set_fail_on("discard_image");
+    let second = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .leaked_images
+            .iter()
+            .map(|i| i.id.clone())
+            .collect::<Vec<_>>(),
+        vec![old.id.clone()],
+        "a failed deletion must not lose the reference"
+    );
+    assert!(second
+        .owned_vm_ids()
+        .contains(&("utm".to_string(), old.id.clone())));
+    // Whatever the bookkeeping, the currently published image is never a
+    // deletion candidate.
+    let current = second.ready_image().unwrap().id.clone();
+    assert!(f.utm.has_image(&current));
+
+    // The next build retries it, and this time it works.
+    *f.utm.fail_on.lock().unwrap() = None;
+    let third = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    assert!(
+        third.leaked_images.is_empty(),
+        "the retry cleared the leak: {:?}",
+        third.leaked_images
+    );
+    assert!(!f.utm.has_image(&old.id));
+    assert!(f.utm.has_image(&third.ready_image().unwrap().id));
+}
+
+/// A build killed halfway must leave the phase it reached, not the phase of
+/// the run before it.
+#[tokio::test]
+async fn each_stage_is_written_down_as_the_build_reaches_it() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+
+    // A rebuild that dies while verifying leaves `verifying` behind, not the
+    // `ready` of the previous run.
+    f.utm.transport.set_exec_responder(|argv| {
+        if argv == ["python3".to_string(), "--version".to_string()] {
+            wargame_core::ports::ExecResult {
+                status: 1,
+                stdout: String::new(),
+                stderr: "boom".to_string(),
+            }
+        } else {
+            wargame_core::ports::ExecResult {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        }
+    });
+    let _ = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap_err();
+    let record = f.record("kali-arm64").await;
+    assert!(matches!(
+        record.phase,
+        BuildPhase::Failed {
+            stage: BuildStage::Verifying,
+            ..
+        }
+    ));
+
+    // The phases really were persisted one at a time, not only at the end.
+    assert!(
+        f.builds.saves() >= 6,
+        "expected a save per stage transition, got {}",
+        f.builds.saves()
     );
 }

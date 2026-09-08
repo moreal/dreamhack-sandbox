@@ -84,6 +84,21 @@ fn profiles_json_lists_every_builtin_profile_including_the_templates() {
     assert!(names.contains(&"kali-arm64".to_string()));
     assert!(names.contains(&"kali-x86_64".to_string()));
     assert!(names.contains(&"windows-x86_64".to_string()));
+
+    // FR-1: the list carries each profile's image state, not just its
+    // definition.
+    let kali = profiles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "kali-arm64")
+        .unwrap();
+    assert_eq!(
+        kali["image"],
+        serde_json::Value::String("not created".to_string())
+    );
+    assert_eq!(kali["vm"]["backend"], "utm");
+    assert_eq!(kali["default"], serde_json::Value::Bool(false));
 }
 
 /// spec.md §4's `profile init`: the copy gets its own YAML *and* its own

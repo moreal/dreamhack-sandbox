@@ -24,7 +24,9 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
 
 use crate::domain::build::{
     profile_hash, scripts_hash, BuildPhase, BuildRecord, BuildSource, BuildStage, PublishedImage,
@@ -33,8 +35,10 @@ use crate::domain::build::{
 use crate::domain::compat::Backend;
 use crate::domain::{GuestOs, GuestShell, Profile, VmRef};
 use crate::error::{Result, WargameError};
-use crate::ports::image_builder::{BuildRequest, GuestLink, InstallerRequest, Progress};
-use crate::ports::{ImageRef, ProfileImageBuilder};
+use crate::ports::image_builder::{
+    BuildObserver, BuildRequest, GuestLink, InstallerRequest, Progress,
+};
+use crate::ports::{BuildRecordRepository, ImageRef, ProfileImageBuilder};
 use crate::security::hash::sha256_file;
 
 use super::backends::resolve_backend;
@@ -166,54 +170,96 @@ pub async fn init(ctx: &AppContext, template: &str, new_name: &str) -> Result<In
         ));
     }
 
+    // Work the whole copy out in memory first: nothing is written until the
+    // result parses as the profile the user asked for, so a template this
+    // cannot rewrite leaves no half-made profile behind.
     let mut new_yaml = rename_in_yaml(&yaml, &template_profile.name, new_name)?;
-    let mut scripts = Vec::new();
+    let mut to_copy = Vec::new();
     for script in &template_profile.provision.scripts {
         let file_name = Path::new(script)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("provision.sh");
         let new_rel = format!("scripts/{new_name}/{file_name}");
-        let dest = profiles_dir.join(&new_rel);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let source = profiles_dir.join(script);
-        if !dest.exists() {
-            match std::fs::read(&source) {
-                Ok(bytes) => std::fs::write(&dest, bytes)?,
-                Err(e) => {
-                    return Err(WargameError::InvalidProfile {
-                        name: template.to_string(),
-                        reason: format!(
-                            "its provisioning script {} is missing ({e}); cannot copy the template",
-                            source.display()
-                        ),
-                    })
-                }
-            }
-        }
-        new_yaml = new_yaml.replace(script.as_str(), &new_rel);
-        scripts.push(dest);
+        let contents = std::fs::read(&source).map_err(|e| WargameError::InvalidProfile {
+            name: template.to_string(),
+            reason: format!(
+                "its provisioning script {} is missing ({e}); cannot copy the template",
+                source.display()
+            ),
+        })?;
+        new_yaml = repoint_script(&new_yaml, script, &new_rel);
+        to_copy.push((profiles_dir.join(&new_rel), contents));
     }
 
-    std::fs::write(&yaml_path, &new_yaml)?;
     let profile = Profile::from_yaml(&new_yaml)?;
     if profile.name != new_name {
         return Err(refuse(
             new_name,
             format!(
-                "the copied template still calls itself {:?}; edit {} by hand",
-                profile.name,
-                yaml_path.display()
+                "the copied template still calls itself {:?}; nothing was written",
+                profile.name
             ),
         ));
     }
+
+    let mut scripts = Vec::new();
+    for (dest, contents) in to_copy {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // An existing file here is the user's; the new profile just points
+        // at it.
+        if !dest.exists() {
+            std::fs::write(&dest, contents)?;
+        }
+        scripts.push(dest);
+    }
+    std::fs::write(&yaml_path, &new_yaml)?;
+
     Ok(InitOutcome {
         profile,
         yaml_path,
         scripts,
     })
+}
+
+/// Repoints one `provision.scripts` entry at the copy's own script.
+///
+/// Only the sequence item itself is rewritten -- a whole-document replace
+/// would also edit any comment that happens to mention the path, and the
+/// template's comments are what make it a template.
+fn repoint_script(yaml: &str, old_path: &str, new_path: &str) -> String {
+    let mut out = String::with_capacity(yaml.len());
+    for line in yaml.lines() {
+        let trimmed = line.trim_start();
+        let is_entry = trimmed
+            .strip_prefix("- ")
+            .map(|value| unquote(value.trim()) == old_path)
+            .unwrap_or(false);
+        if is_entry {
+            let indent = &line[..line.len() - trimmed.len()];
+            out.push_str(&format!("{indent}- {new_path}\n"));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// A YAML scalar without its surrounding quotes, if it had any.
+fn unquote(value: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|v| v.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    value
 }
 
 /// Replaces `metadata.name` in a profile YAML while leaving every comment
@@ -564,7 +610,7 @@ pub async fn build(
         ));
     }
 
-    let mut record = match ctx.builds.load(&profile.name).await? {
+    let record = match ctx.builds.load(&profile.name).await? {
         Some(record) => record,
         None if builder.uses_installer_vm() => return Err(no_installer_vm(&profile.name)),
         // Tart needs no `profile create`: its source is `image.base`.
@@ -603,7 +649,13 @@ pub async fn build(
             .boot_timeout(execution.backend, execution.mode),
     };
 
-    match run_build_flow(builder.as_ref(), &request, progress).await {
+    // The flow persists the phase it reaches, so a build killed halfway
+    // leaves an accurate record rather than the phase of the previous run.
+    let phases = RecordPhases::new(ctx.builds.clone(), record);
+    let outcome = run_build_flow(builder.as_ref(), &request, progress, &phases).await;
+    let mut record = phases.into_record();
+
+    match outcome {
         Ok(outcome) => {
             record.verification = outcome.verification;
             for failure in outcome.cleanup_failures {
@@ -614,23 +666,20 @@ pub async fn build(
             }
             // The new image is written down *before* the old one is deleted:
             // a crash in between leaves two images, never none (FR-3).
-            record.previous_image = record.image.replace(outcome.image);
+            //
+            // A backend whose image id is stable across builds (Tart's image
+            // *is* `wargame-profile-<name>`) republishes the same id, and
+            // then there is no old image to delete -- deleting it would
+            // delete the one just built.
+            let replaced = record.image.replace(outcome.image.clone());
+            record.previous_image = replaced.filter(|old| old.id != outcome.image.id);
             record.profile_hash = new_profile_hash;
             record.scripts_hash = new_scripts_hash;
             record.last_error = None;
             record.set_phase(BuildPhase::Ready);
             ctx.builds.save(&record).await?;
 
-            if let Some(previous) = record.previous_image.clone() {
-                match builder.discard_image(&previous).await {
-                    Ok(()) => record.previous_image = None,
-                    Err(e) => record.record_cleanup_failure(format!(
-                        "could not delete the replaced image {} ({}): {e}",
-                        previous.name, previous.id
-                    )),
-                }
-                ctx.builds.save(&record).await?;
-            }
+            discard_replaced_images(ctx, builder.as_ref(), &mut record).await?;
             Ok(record)
         }
         Err(failure) => {
@@ -660,6 +709,92 @@ pub async fn build(
             ctx.builds.save(&record).await?;
             Err(failure.error)
         }
+    }
+}
+
+/// Deletes the image this build replaced, and retries any earlier deletion
+/// that failed.
+///
+/// Only ever called after the record naming the *new* image was saved, so a
+/// failure here can lose nothing. An image that still cannot be deleted
+/// stays tracked in `leaked_images`: it exists on the backend, so `prune`
+/// must keep skipping it, and the next build tries again.
+async fn discard_replaced_images(
+    ctx: &AppContext,
+    builder: &dyn ProfileImageBuilder,
+    record: &mut BuildRecord,
+) -> Result<()> {
+    let mut pending: Vec<PublishedImage> = record.previous_image.take().into_iter().collect();
+    pending.append(&mut record.leaked_images);
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let published = record.image.as_ref().map(|image| image.id.clone());
+    let mut leaked = Vec::new();
+    for image in pending {
+        // Never delete what the record currently points at, whatever the
+        // bookkeeping says.
+        if published.as_deref() == Some(image.id.as_str()) {
+            continue;
+        }
+        if let Err(e) = builder.discard_image(&image).await {
+            record.record_cleanup_failure(format!(
+                "could not delete the replaced image {} ({}): {e}",
+                image.name, image.id
+            ));
+            leaked.push(image);
+        }
+    }
+    record.leaked_images = leaked;
+    ctx.builds.save(record).await
+}
+
+/// The [`BuildObserver`] that writes each stage the flow reaches into the
+/// build record (spec.md §3 FR-3's "단계 ... 를 로그에 남긴다", and what makes
+/// a half-finished build report where it actually stopped).
+///
+/// It owns the record while the flow runs -- the flow is the only thing
+/// touching it then -- and hands it back afterwards.
+struct RecordPhases {
+    builds: Arc<dyn BuildRecordRepository>,
+    record: Mutex<BuildRecord>,
+}
+
+impl RecordPhases {
+    fn new(builds: Arc<dyn BuildRecordRepository>, record: BuildRecord) -> Self {
+        RecordPhases {
+            builds,
+            record: Mutex::new(record),
+        }
+    }
+
+    fn into_record(self) -> BuildRecord {
+        self.record.into_inner().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[async_trait]
+impl BuildObserver for RecordPhases {
+    async fn stage_started(&self, stage: BuildStage) -> Result<()> {
+        // The stages before the guest answers say nothing a record should
+        // claim: a UTM profile is still `awaiting-install` until it does,
+        // and a rebuild's previous image is still the launchable one.
+        let phase = match stage {
+            BuildStage::Provisioning => BuildPhase::Provisioning,
+            BuildStage::Verifying => BuildPhase::Verifying,
+            BuildStage::Publishing => BuildPhase::Publishing,
+            BuildStage::Preparing
+            | BuildStage::Cloning
+            | BuildStage::Booting
+            | BuildStage::Connecting => return Ok(()),
+        };
+        let snapshot = {
+            let mut record = self.record.lock().unwrap_or_else(|e| e.into_inner());
+            record.set_phase(phase);
+            record.clone()
+        };
+        self.builds.save(&snapshot).await
     }
 }
 
@@ -793,22 +928,25 @@ pub async fn run_build_flow(
     builder: &dyn ProfileImageBuilder,
     req: &BuildRequest<'_>,
     progress: Progress<'_>,
+    observer: &dyn BuildObserver,
 ) -> std::result::Result<BuildFlowOutcome, BuildFlowError> {
     let profile = req.profile;
 
+    stage(observer, BuildStage::Preparing).await?;
     progress(format!("preparing the {} build", builder.backend()));
     builder
         .prepare(req, progress)
         .await
         .map_err(|e| BuildFlowError::new(BuildStage::Preparing, e))?;
 
+    stage(observer, BuildStage::Cloning).await?;
     let vm = builder
         .clone_for_build(req, progress)
         .await
         .map_err(|e| BuildFlowError::new(BuildStage::Cloning, e))?;
 
     // From here every failure cleans up after itself before propagating.
-    let outcome = build_from(builder, req, &vm, progress).await;
+    let outcome = build_from(builder, req, &vm, progress, observer).await;
     match outcome {
         Ok(outcome) => Ok(outcome),
         Err(mut failure) => {
@@ -837,21 +975,26 @@ async fn build_from(
     req: &BuildRequest<'_>,
     vm: &VmRef,
     progress: Progress<'_>,
+    observer: &dyn BuildObserver,
 ) -> std::result::Result<BuildFlowOutcome, BuildFlowError> {
+    stage(observer, BuildStage::Booting).await?;
     builder
         .boot(req, vm, progress)
         .await
         .map_err(|e| BuildFlowError::new(BuildStage::Booting, e))?;
 
+    stage(observer, BuildStage::Connecting).await?;
     let link = builder
         .connect(req, vm, progress)
         .await
         .map_err(|e| BuildFlowError::new(BuildStage::Connecting, e))?;
 
+    stage(observer, BuildStage::Provisioning).await?;
     provision(req, &link, progress)
         .await
         .map_err(|e| BuildFlowError::new(BuildStage::Provisioning, e))?;
 
+    stage(observer, BuildStage::Verifying).await?;
     let verification = verify(req, &link, progress).await.map_err(|(results, e)| {
         let mut failure = BuildFlowError::new(BuildStage::Verifying, e);
         failure.verification = results;
@@ -860,6 +1003,7 @@ async fn build_from(
 
     // Everything from here is "make the image": a guest that does not stop
     // cleanly must never be published (DESIGN.md §5).
+    stage(observer, BuildStage::Publishing).await?;
     flush_guest(&link, progress).await;
     builder.shutdown(req, vm, progress).await.map_err(|e| {
         let mut failure = BuildFlowError::new(BuildStage::Publishing, e);
@@ -879,6 +1023,18 @@ async fn build_from(
         verification,
         cleanup_failures: Vec::new(),
     })
+}
+
+/// Announces a stage to the observer, turning a refusal to record it into a
+/// failure *at* that stage.
+async fn stage(
+    observer: &dyn BuildObserver,
+    stage: BuildStage,
+) -> std::result::Result<(), BuildFlowError> {
+    observer
+        .stage_started(stage)
+        .await
+        .map_err(|e| BuildFlowError::new(stage, e))
 }
 
 /// Copies the profile's `scripts/` tree into the guest and runs each
@@ -1191,6 +1347,28 @@ workspace:
         let renamed = rename_in_yaml(&yaml, "kali-arm64", "kali-custom").unwrap();
         assert!(renamed.contains("  name: not-metadata"));
         assert_eq!(renamed.matches("kali-custom").count(), 1);
+    }
+
+    /// A whole-document replace would rewrite the template's comments too,
+    /// which is where the instructions live.
+    #[test]
+    fn repointing_a_script_only_touches_its_list_entry() {
+        let yaml = "# see scripts/kali/common.sh for what runs\nprovision:\n  scripts:\n    - scripts/kali/common.sh\n    - scripts/kali/extra.sh\n";
+        let out = repoint_script(yaml, "scripts/kali/common.sh", "scripts/mine/common.sh");
+        assert!(
+            out.contains("# see scripts/kali/common.sh for what runs"),
+            "{out}"
+        );
+        assert!(out.contains("    - scripts/mine/common.sh"), "{out}");
+        assert!(out.contains("    - scripts/kali/extra.sh"), "{out}");
+        assert!(!out.contains("    - scripts/kali/common.sh"), "{out}");
+    }
+
+    #[test]
+    fn repointing_handles_a_quoted_entry() {
+        let yaml = "  scripts:\n    - \"scripts/kali/common.sh\"\n";
+        let out = repoint_script(yaml, "scripts/kali/common.sh", "scripts/mine/common.sh");
+        assert!(out.contains("    - scripts/mine/common.sh"), "{out}");
     }
 
     #[test]

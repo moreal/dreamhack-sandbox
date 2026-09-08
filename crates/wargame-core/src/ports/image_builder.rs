@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::domain::build::{BuildRecord, BuildSource, PublishedImage};
+use crate::domain::build::{BuildRecord, BuildSource, BuildStage, PublishedImage};
 use crate::domain::compat::ResolvedBackend;
 use crate::domain::{GuestEndpoint, Profile, VmRef};
 use crate::error::{Result, WargameError};
@@ -57,6 +57,26 @@ pub struct InstallerRequest<'a> {
     pub name: String,
     pub execution: ResolvedBackend,
     pub source: &'a BuildSource,
+}
+
+/// Told which stage the build has reached, before that stage runs.
+///
+/// This is how the record ends up saying where a build actually stopped: the
+/// flow itself owns no record, so it announces its progress and whoever
+/// called it decides what that means. An error aborts the build -- a stage
+/// that cannot be written down is not one to carry on from.
+#[async_trait]
+pub trait BuildObserver: Send + Sync {
+    async fn stage_started(&self, stage: BuildStage) -> Result<()>;
+}
+
+/// The observer for callers that do not keep a record (every backend's own
+/// tests): notice nothing, fail nothing.
+#[async_trait]
+impl BuildObserver for () {
+    async fn stage_started(&self, _stage: BuildStage) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A live connection to the guest being provisioned.

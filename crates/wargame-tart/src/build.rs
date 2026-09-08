@@ -157,6 +157,11 @@ impl ProfileImageBuilder for TartImageBuilder {
     }
 
     async fn prepare(&self, req: &BuildRequest<'_>, progress: Progress<'_>) -> Result<()> {
+        // The key is not needed until `connect`, but a host that cannot
+        // produce one would otherwise pull a base image, clone it and boot
+        // it before finding that out (spec.md §6: fail before creating).
+        self.pubkey()?;
+
         let base = ImageRef(req.profile.image.base.clone());
         progress(format!("checking for base image {}", base.0));
         if !self.tart.image_exists(&base).await? {
@@ -454,7 +459,7 @@ mod tests {
         let req = request(&profile, &record, Path::new("/tmp"));
         let mut messages = Vec::new();
 
-        let outcome = run_build_flow(&*b, &req, &mut |m| messages.push(m))
+        let outcome = run_build_flow(&*b, &req, &mut |m| messages.push(m), &())
             .await
             .unwrap_or_else(|e| panic!("build failed: {}", e.error));
         assert_eq!(outcome.image.name, "wargame-profile-macos-minimal-arm64");
@@ -606,7 +611,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&*b, &req, &mut |_| {})
+        let failure = run_build_flow(&*b, &req, &mut |_| {}, &())
             .await
             .err()
             .expect("the build must fail");
@@ -635,7 +640,10 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&*b, &req, &mut |_| {}).await.err().unwrap();
+        let failure = run_build_flow(&*b, &req, &mut |_| {}, &())
+            .await
+            .err()
+            .unwrap();
         assert!(
             matches!(failure.error, WargameError::InvalidProfile { ref name, .. } if name == "macos-minimal-arm64")
         );
@@ -661,7 +669,10 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&*b, &req, &mut |_| {}).await.err().unwrap();
+        let failure = run_build_flow(&*b, &req, &mut |_| {}, &())
+            .await
+            .err()
+            .unwrap();
         assert!(
             matches!(failure.error, WargameError::InvalidProfile { ref name, .. } if name == "macos-minimal-arm64")
         );
@@ -686,6 +697,45 @@ mod tests {
         );
     }
 
+    /// A host with no `$WARGAME_HOME/keys/id_ed25519.pub` cannot install a
+    /// key into the guest, and must find that out before pulling, cloning or
+    /// booting anything.
+    #[tokio::test]
+    async fn a_missing_host_key_is_refused_before_anything_is_created() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_responder(install_happy_responder);
+        let transport = Arc::new(FakeTransport::new());
+        let tart = Arc::new(TartProvider::new(runner.clone(), TartConfig::default()));
+        let b = TartImageBuilder::new(
+            runner.clone(),
+            tart,
+            Box::new(move || transport.clone() as Arc<dyn GuestTransport>),
+            PathBuf::from("/no/such/dir/id_ed25519.pub"),
+        );
+        let profile = sample_profile();
+        let record = record(&profile);
+        let req = request(&profile, &record, Path::new("/tmp"));
+
+        let failure = run_build_flow(&b, &req, &mut |_| {}, &())
+            .await
+            .err()
+            .expect("a missing host key must fail the build");
+        assert_eq!(
+            failure.stage,
+            wargame_core::domain::build::BuildStage::Preparing
+        );
+        assert!(
+            failure.error.to_string().contains("id_ed25519.pub"),
+            "{}",
+            failure.error
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "nothing may run before the key is known: {:?}",
+            runner.calls()
+        );
+    }
+
     #[tokio::test]
     async fn missing_password_is_rejected_before_any_guest_transport_use() {
         let runner = Arc::new(FakeRunner::new());
@@ -698,7 +748,10 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&*b, &req, &mut |_| {}).await.err().unwrap();
+        let failure = run_build_flow(&*b, &req, &mut |_| {}, &())
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(failure.error, WargameError::InvalidProfile { .. }));
         assert!(transport.calls().is_empty());
     }
@@ -714,7 +767,7 @@ mod tests {
         let log_dir = tempfile::tempdir().unwrap();
         let req = request(&profile, &record, log_dir.path());
 
-        run_build_flow(&*b, &req, &mut |_| {})
+        run_build_flow(&*b, &req, &mut |_| {}, &())
             .await
             .unwrap_or_else(|e| panic!("build failed: {}", e.error));
 
@@ -766,7 +819,10 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, log_dir.path());
 
-        let failure = run_build_flow(&*b, &req, &mut |_| {}).await.err().unwrap();
+        let failure = run_build_flow(&*b, &req, &mut |_| {}, &())
+            .await
+            .err()
+            .unwrap();
 
         let WargameError::InvalidProfile { reason, .. } = failure.error else {
             panic!("expected InvalidProfile");

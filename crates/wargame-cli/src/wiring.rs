@@ -111,9 +111,13 @@ pub fn build_context(
     let wargame = build_wargame_provider(&config, &dirs, &runner)?;
     let builds: Arc<dyn BuildRecordRepository> =
         Arc::new(JsonBuildRepository::new(dirs.builds_dir()));
-    let (backends, transports) =
-        build_vm_backends(&config, &dirs, &runner, &builtin_profiles, &builds);
-    let builders = build_image_builders(&config, &dirs, &runner, &builds);
+    // One adapter per backend, shared by the registry a launch picks from
+    // and the builders `profile build` runs through -- they are the same
+    // VMs, and a second `UtmProvider` would keep its own idea of things like
+    // which run log a VM was started with.
+    let providers = RealProviders::new(&config, &runner, &builds);
+    let (backends, transports) = build_vm_backends(&dirs, &runner, &builtin_profiles, &providers);
+    let builders = build_image_builders(&dirs, &runner, &providers);
 
     let repo: Arc<dyn SessionRepository> =
         Arc::new(JsonSessionRepository::new(dirs.sessions_dir()));
@@ -186,12 +190,36 @@ pub fn build_credential_store(
 /// The SSH transport carries no guest user: it comes from
 /// `profile.guest.user` at launch and from the session's saved connection
 /// afterwards.
+/// The real VM backends, built once and shared (spec.md §5 item 2).
+struct RealProviders {
+    tart: Arc<TartProvider>,
+    utm: Arc<UtmProvider>,
+}
+
+impl RealProviders {
+    fn new(
+        config: &Config,
+        runner: &Arc<dyn ProcessRunner>,
+        builds: &Arc<dyn BuildRecordRepository>,
+    ) -> Self {
+        RealProviders {
+            tart: Arc::new(TartProvider::new(runner.clone(), tart_config(config))),
+            // The build records are what tells UTM which images exist:
+            // without them every UTM profile would report "not ready"
+            // forever (spec.md §5 item 5).
+            utm: Arc::new(
+                UtmProvider::new(runner.clone(), utm_config(config))
+                    .with_image_catalog(Arc::new(RecordImageCatalog::new(builds.clone()))),
+            ),
+        }
+    }
+}
+
 fn build_vm_backends(
-    config: &Config,
     dirs: &AppDirs,
     runner: &Arc<dyn ProcessRunner>,
     builtin_profiles: &[wargame_core::domain::Profile],
-    builds: &Arc<dyn BuildRecordRepository>,
+    providers: &RealProviders,
 ) -> (BackendRegistry, TransportRegistry) {
     if std::env::var("WARGAME_VM").as_deref() == Ok("fake") {
         let fake_tart = Arc::new(FakeVmProvider::new());
@@ -210,21 +238,14 @@ fn build_vm_backends(
         );
     }
 
-    let tart = Arc::new(TartProvider::new(runner.clone(), tart_config(config)));
-    // The build records are what tells UTM which images exist: without them
-    // every UTM profile would report "not ready" forever (spec.md §5 item 5).
-    let utm = Arc::new(
-        UtmProvider::new(runner.clone(), utm_config(config))
-            .with_image_catalog(Arc::new(RecordImageCatalog::new(builds.clone()))),
-    );
     let transport = Arc::new(SshGuestTransport::new(
         runner.clone(),
         dirs.keys_dir().join("id_ed25519"),
     ));
     (
         BackendRegistry::new(vec![
-            tart as Arc<dyn VmProvider>,
-            utm as Arc<dyn VmProvider>,
+            providers.tart.clone() as Arc<dyn VmProvider>,
+            providers.utm.clone() as Arc<dyn VmProvider>,
         ]),
         TransportRegistry::new(transport as Arc<dyn GuestTransport>),
     )
@@ -239,13 +260,11 @@ fn build_vm_backends(
 /// a Tart profile, say) exact instead of turning them into "no builder is
 /// wired".
 fn build_image_builders(
-    config: &Config,
     dirs: &AppDirs,
     runner: &Arc<dyn ProcessRunner>,
-    builds: &Arc<dyn BuildRecordRepository>,
+    providers: &RealProviders,
 ) -> BuilderRegistry {
     let key_path = dirs.keys_dir().join("id_ed25519");
-    let tart = Arc::new(TartProvider::new(runner.clone(), tart_config(config)));
     let tart_runner = runner.clone();
     let tart_key = key_path.clone();
     let transport_factory: TransportFactory = Box::new(move || {
@@ -256,17 +275,13 @@ fn build_image_builders(
     });
     let tart_builder = TartImageBuilder::new(
         runner.clone(),
-        tart,
+        providers.tart.clone(),
         transport_factory,
         dirs.keys_dir().join("id_ed25519.pub"),
     );
 
-    let utm = Arc::new(
-        UtmProvider::new(runner.clone(), utm_config(config))
-            .with_image_catalog(Arc::new(RecordImageCatalog::new(builds.clone()))),
-    );
     let utm_builder = UtmImageBuilder::new(
-        utm,
+        providers.utm.clone(),
         Arc::new(SshGuestTransport::new(runner.clone(), key_path)) as Arc<dyn GuestTransport>,
     );
 

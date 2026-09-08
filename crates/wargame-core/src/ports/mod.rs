@@ -15,7 +15,8 @@ pub use credential_store::CredentialStore;
 pub use disk_space::DiskSpace;
 pub use guest_transport::{ExecResult, GuestEndpoint, GuestShell, GuestTransport};
 pub use image_builder::{
-    BuildRecordRepository, BuildRequest, GuestLink, InstallerRequest, ProfileImageBuilder, Progress,
+    BuildObserver, BuildRecordRepository, BuildRequest, GuestLink, InstallerRequest,
+    ProfileImageBuilder, Progress,
 };
 pub use session_repo::SessionRepository;
 pub use vm_provider::{

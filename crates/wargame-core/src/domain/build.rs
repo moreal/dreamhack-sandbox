@@ -209,10 +209,18 @@ pub struct BuildRecord {
     /// The image a finished build published, and what `launch` clones from.
     #[serde(default)]
     pub image: Option<PublishedImage>,
-    /// The image that was published before the current one. Set while a new
-    /// build is in flight so a failure can never lose the last good image.
+    /// The image that was published before the current one, while it still
+    /// exists. Set by a successful publish so a crash between "the new image
+    /// is recorded" and "the old one is deleted" leaves two images rather
+    /// than none (FR-3).
     #[serde(default)]
     pub previous_image: Option<PublishedImage>,
+    /// Images this profile published that could not be deleted when they
+    /// were replaced. They still exist on the backend, so they stay tracked:
+    /// `prune` must not treat them as orphans, and the next build retries
+    /// deleting them (spec.md §3 FR-5's "정리 실패를 기록한다").
+    #[serde(default)]
+    pub leaked_images: Vec<PublishedImage>,
     /// Hash of the profile definition the current image was built from.
     #[serde(default)]
     pub profile_hash: String,
@@ -249,6 +257,7 @@ impl BuildRecord {
             phase: BuildPhase::Created,
             image: None,
             previous_image: None,
+            leaked_images: Vec::new(),
             profile_hash: String::new(),
             scripts_hash: String::new(),
             verification: Vec::new(),
@@ -294,8 +303,9 @@ impl BuildRecord {
     }
 
     /// Every `(backend, vm id)` this record owns -- the installer VM, the
-    /// published image and the image it replaced. `prune` skips these: they
-    /// have no session, but they are not orphans (spec.md §3 FR-5).
+    /// published image, the image it replaced, and any image a failed
+    /// deletion left behind. `prune` skips these: they have no session, but
+    /// they are not orphans (spec.md §3 FR-5).
     pub fn owned_vm_ids(&self) -> Vec<(String, String)> {
         let mut owned = Vec::new();
         if let Some(vm) = &self.installer_vm {
@@ -304,6 +314,7 @@ impl BuildRecord {
         for image in [self.image.as_ref(), self.previous_image.as_ref()]
             .into_iter()
             .flatten()
+            .chain(self.leaked_images.iter())
         {
             owned.push((self.backend.clone(), image.id.clone()));
         }
@@ -457,10 +468,17 @@ mod tests {
         });
         record.image = Some(PublishedImage::new("NEW", "wg-build-image-kali-custom"));
         record.previous_image = Some(PublishedImage::new("OLD", "wg-build-image-kali-custom"));
+        record
+            .leaked_images
+            .push(PublishedImage::new("LEAKED", "wg-build-image-kali-custom"));
         let owned = record.owned_vm_ids();
         assert!(owned.contains(&("utm".to_string(), "INSTALLER".to_string())));
         assert!(owned.contains(&("utm".to_string(), "NEW".to_string())));
         assert!(owned.contains(&("utm".to_string(), "OLD".to_string())));
+        assert!(
+            owned.contains(&("utm".to_string(), "LEAKED".to_string())),
+            "an image whose deletion failed still exists, so prune must skip it"
+        );
     }
 
     #[test]

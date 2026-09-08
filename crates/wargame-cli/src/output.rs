@@ -268,6 +268,20 @@ pub fn print_checks(checks: &[Check], json: bool) {
     }
 }
 
+/// One `profiles --json` row: the profile itself plus its image-readiness
+/// state, which lives outside the [`Profile`] (it comes from the build
+/// record).
+#[derive(Serialize)]
+struct ProfileJson<'a> {
+    #[serde(flatten)]
+    profile: &'a Profile,
+    /// `"ready"`, `"rebuild needed"`, `"not built"`, or the phase a
+    /// half-finished build stopped at. `null` when it could not be
+    /// determined.
+    image: Option<String>,
+    default: bool,
+}
+
 /// `profiles`, with one image-readiness line per profile (spec.md §3 FR-1:
 /// "profiles ... 화면에 OS/arch/backend/mode와 이미지 준비 상태를 표시한다").
 /// `status` is parallel to `profiles`; `None` means the status could not be
@@ -279,7 +293,19 @@ pub fn print_profiles(
     json: bool,
 ) {
     if json {
-        print_json(&profiles);
+        // The profile's own fields, flattened, plus the state FR-1 asks the
+        // profile list to show. `--json` is what scripts read, so it carries
+        // the same answer the table does.
+        let rows: Vec<ProfileJson<'_>> = profiles
+            .iter()
+            .enumerate()
+            .map(|(i, profile)| ProfileJson {
+                profile,
+                image: status.get(i).cloned().flatten(),
+                default: profile.name == default_profile,
+            })
+            .collect();
+        print_json(&rows);
         return;
     }
     let mut table = table();

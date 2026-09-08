@@ -432,7 +432,7 @@ async fn the_whole_flow_provisions_the_installation_vm_and_publishes_a_copy() {
     let record = record_with_installer(&profile);
     let req = request(&profile, &record);
 
-    let outcome = run_build_flow(&h.builder, &req, &mut |_| {})
+    let outcome = run_build_flow(&h.builder, &req, &mut |_| {}, &())
         .await
         .unwrap_or_else(|e| panic!("build failed: {}", e.error));
 
@@ -497,7 +497,7 @@ async fn a_build_uses_an_installation_vm_the_console_left_running() {
     let record = record_with_installer(&profile);
     let req = request(&profile, &record);
 
-    let outcome = run_build_flow(&h.builder, &req, &mut |_| {})
+    let outcome = run_build_flow(&h.builder, &req, &mut |_| {}, &())
         .await
         .unwrap_or_else(|e| panic!("build failed: {}", e.error));
     assert_eq!(outcome.image.name, "wg-build-image-kali-custom");
@@ -525,7 +525,7 @@ async fn a_guest_without_the_agent_fails_at_connect_and_keeps_the_installation_v
     let record = record_with_installer(&profile);
     let req = request(&profile, &record);
 
-    let failure = run_build_flow(&h.builder, &req, &mut |_| {})
+    let failure = run_build_flow(&h.builder, &req, &mut |_| {}, &())
         .await
         .err()
         .expect("the build must fail");
@@ -568,7 +568,7 @@ async fn a_missing_installation_vm_is_reported_not_recreated() {
     let record = record_with_installer(&profile);
     let req = request(&profile, &record);
 
-    let failure = run_build_flow(&h.builder, &req, &mut |_| {})
+    let failure = run_build_flow(&h.builder, &req, &mut |_| {}, &())
         .await
         .err()
         .unwrap();
