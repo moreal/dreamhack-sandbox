@@ -16,7 +16,7 @@ use wargame_core::app::backends::{
     provider_for_session, resolve_backend, BackendRegistry, TransportRegistry,
 };
 use wargame_core::app::profiles::ProfileStore;
-use wargame_core::app::{prune, resume, stop, AppContext};
+use wargame_core::app::{list_sessions, prune, resume, stop, AppContext};
 use wargame_core::config::Config;
 use wargame_core::domain::{
     Backend, BackendChoice, Challenge, ChallengeRef, ChallengeSummary, ExecutionMode, GuestArch,
@@ -742,4 +742,11 @@ async fn a_session_whose_backend_is_not_wired_reports_it_by_name() {
         .expect("an unwired backend is an error")
         .to_string();
     assert!(message.contains("utm"), "{message}");
+
+    // Listing must still work, though: an unreachable backend leaves its
+    // session records exactly as they are rather than failing the whole
+    // command.
+    let listed = list_sessions(&ctx).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].state, SessionState::Running);
 }

@@ -100,7 +100,12 @@ pub async fn reconcile(ctx: &AppContext, mut session: Session) -> Result<Session
     let Some(vm_ref) = &session.vm_ref else {
         return Ok(session);
     };
-    let vm = provider_for_session(ctx, &session)?;
+    // A backend this build has no adapter for is treated like one that
+    // cannot answer: the record is left exactly as it is rather than
+    // failing every `wargame sessions` that happens to include it.
+    let Ok(vm) = provider_for_session(ctx, &session) else {
+        return Ok(session);
+    };
     let vm_ref = vm_ref.clone();
     if vm.status(&vm_ref).await? != VmStatus::Stopped {
         return Ok(session);
