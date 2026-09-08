@@ -21,7 +21,7 @@ use crate::ports::{GuestTransport, SessionRepository, VmProvider, WargameProvide
 pub use console::{open_gui, ssh_command};
 pub use doctor::{doctor, Check};
 pub use launch::{launch, LaunchEvent, LaunchRequest};
-pub use lifecycle::{delete, inspect, keep, list_sessions, prune, resume, stop};
+pub use lifecycle::{delete, inspect, keep, list_sessions, prune, resolve_session, resume, stop};
 pub use profiles::ProfileStore;
 pub use search::{open, search};
 

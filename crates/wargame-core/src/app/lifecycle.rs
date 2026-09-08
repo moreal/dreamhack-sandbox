@@ -21,6 +21,55 @@ pub async fn list_sessions(ctx: &AppContext) -> Result<Vec<Session>> {
     Ok(sessions)
 }
 
+/// Turns what the user typed on the command line into a full session id.
+///
+/// `None` (the id was omitted) means the most recently created session --
+/// the one the user almost certainly means right after `launch`. Otherwise
+/// the needle matches, in order of preference: the exact id, a unique id
+/// prefix, or a unique case-insensitive substring of the id or the
+/// challenge title (`wargame ssh out_of_bound`). Several matches yield
+/// [`WargameError::AmbiguousSession`] listing every candidate; none yields
+/// [`WargameError::SessionNotFound`].
+pub async fn resolve_session(ctx: &AppContext, needle: Option<&str>) -> Result<String> {
+    let sessions = ctx.repo.list().await?;
+    let Some(needle) = needle.map(str::trim).filter(|n| !n.is_empty()) else {
+        return sessions
+            .first()
+            .map(|s| s.id.clone())
+            .ok_or(WargameError::NoSessions);
+    };
+    if sessions.iter().any(|s| s.id == needle) {
+        return Ok(needle.to_string());
+    }
+    let pick = |matching: Vec<&Session>| -> Option<Result<String>> {
+        match matching.as_slice() {
+            [] => None,
+            [only] => Some(Ok(only.id.clone())),
+            many => Some(Err(WargameError::AmbiguousSession {
+                needle: needle.to_string(),
+                candidates: many.iter().map(|s| s.id.clone()).collect(),
+            })),
+        }
+    };
+    if let Some(found) = pick(
+        sessions
+            .iter()
+            .filter(|s| s.id.starts_with(needle))
+            .collect(),
+    ) {
+        return found;
+    }
+    let lower = needle.to_ascii_lowercase();
+    let loose: Vec<&Session> = sessions
+        .iter()
+        .filter(|s| {
+            s.id.to_ascii_lowercase().contains(&lower)
+                || s.display_name.to_ascii_lowercase().contains(&lower)
+        })
+        .collect();
+    pick(loose).unwrap_or_else(|| Err(WargameError::SessionNotFound(needle.to_string())))
+}
+
 pub async fn inspect(ctx: &AppContext, id: &str) -> Result<Session> {
     let session = ctx.repo.load(id).await?;
     reconcile(ctx, session).await
@@ -141,9 +190,7 @@ pub async fn resume(ctx: &AppContext, id: &str) -> Result<Session> {
 pub async fn delete(ctx: &AppContext, id: &str, force: bool) -> Result<()> {
     let mut session = ctx.repo.load(id).await?;
     if session.keep == KeepPolicy::Keep && !force {
-        return Err(WargameError::Other(
-            "session is kept; use --force".to_string(),
-        ));
+        return Err(WargameError::SessionKept(session.id.clone()));
     }
     session.transition(SessionState::Deleting)?;
     ctx.repo.save(&session).await?;
@@ -313,6 +360,98 @@ mod tests {
         f.ctx.repo.save(&session).await.unwrap();
         // The VM dies behind the record's back.
         f.vm.stop(&vm_ref).await.unwrap();
+    }
+
+    async fn seed(f: &Fixture, id: &str, title: &str, age_secs: i64) {
+        let mut s = sample_session(id, SessionState::Stopped, KeepPolicy::Discard);
+        s.display_name = title.to_string();
+        s.created_at = OffsetDateTime::now_utc() - Duration::from_secs(age_secs as u64);
+        f.ctx.repo.save(&s).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolve_omitted_picks_the_newest_session() {
+        let f = fixture();
+        seed(&f, "dh-old-aaaaaa", "old", 600).await;
+        seed(&f, "dh-new-bbbbbb", "new", 10).await;
+        assert_eq!(
+            resolve_session(&f.ctx, None).await.unwrap(),
+            "dh-new-bbbbbb"
+        );
+        assert_eq!(
+            resolve_session(&f.ctx, Some("  ")).await.unwrap(),
+            "dh-new-bbbbbb"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_omitted_with_no_sessions_says_so() {
+        let f = fixture();
+        assert!(matches!(
+            resolve_session(&f.ctx, None).await,
+            Err(WargameError::NoSessions)
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_prefers_exact_then_prefix_then_substring() {
+        let f = fixture();
+        seed(&f, "dh-out-of-bound-a1b2c3", "out_of_bound", 30).await;
+        seed(&f, "dh-out-of-bound-a1ffff", "out_of_bound", 20).await;
+        seed(&f, "dh-rev-basic-1-9z9z9z", "rev-basic-1", 10).await;
+        let r = |n: &'static str| resolve_session(&f.ctx, Some(n));
+
+        assert_eq!(
+            r("dh-out-of-bound-a1b2c3").await.unwrap(),
+            "dh-out-of-bound-a1b2c3"
+        );
+        assert_eq!(
+            r("dh-out-of-bound-a1f").await.unwrap(),
+            "dh-out-of-bound-a1ffff"
+        );
+        assert_eq!(r("dh-rev").await.unwrap(), "dh-rev-basic-1-9z9z9z");
+        // Substring of the id and of the title, case-insensitively.
+        assert_eq!(r("9z9z").await.unwrap(), "dh-rev-basic-1-9z9z9z");
+        assert_eq!(r("REV-BASIC").await.unwrap(), "dh-rev-basic-1-9z9z9z");
+    }
+
+    #[tokio::test]
+    async fn resolve_reports_ambiguity_with_candidates() {
+        let f = fixture();
+        seed(&f, "dh-out-of-bound-a1b2c3", "out_of_bound", 30).await;
+        seed(&f, "dh-out-of-bound-a1ffff", "out_of_bound", 20).await;
+        match resolve_session(&f.ctx, Some("dh-out")).await {
+            Err(WargameError::AmbiguousSession { needle, candidates }) => {
+                assert_eq!(needle, "dh-out");
+                assert_eq!(candidates.len(), 2);
+            }
+            other => panic!("expected AmbiguousSession, got {other:?}"),
+        }
+        assert!(matches!(
+            resolve_session(&f.ctx, Some("nope")).await,
+            Err(WargameError::SessionNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_a_kept_session_with_a_dedicated_error() {
+        let f = fixture();
+        f.ctx
+            .repo
+            .save(&sample_session(
+                "k",
+                SessionState::Stopped,
+                KeepPolicy::Keep,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            delete(&f.ctx, "k", false).await,
+            Err(WargameError::SessionKept(id)) if id == "k"
+        ));
+        assert!(f.ctx.repo.load("k").await.is_ok());
+        delete(&f.ctx, "k", true).await.unwrap();
+        assert!(f.ctx.repo.load("k").await.is_err());
     }
 
     #[tokio::test]
@@ -512,20 +651,6 @@ mod tests {
         let resumed = resume(&ctx, "s").await.unwrap();
         assert_eq!(resumed.state, SessionState::Running);
         assert!(resumed.guest_ip.is_some());
-    }
-
-    #[tokio::test]
-    async fn delete_refuses_kept_session_without_force() {
-        let Fixture { ctx, .. } = fixture();
-        let session = sample_session("s", SessionState::Ready, KeepPolicy::Keep);
-        ctx.repo.save(&session).await.unwrap();
-
-        let err = delete(&ctx, "s", false).await.unwrap_err();
-        assert!(matches!(err, WargameError::Other(_)));
-        assert!(ctx.repo.load("s").await.is_ok());
-
-        delete(&ctx, "s", true).await.unwrap();
-        assert!(ctx.repo.load("s").await.is_err());
     }
 
     #[tokio::test]

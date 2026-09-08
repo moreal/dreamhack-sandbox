@@ -8,14 +8,15 @@ mod tui;
 mod wiring;
 
 use std::io::{IsTerminal, Write};
+use std::time::Instant;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use wargame_core::app::{
-    delete, doctor, inspect, keep, launch, list_sessions, open, open_gui, prune, resume, search,
-    ssh_command, stop, AppContext, LaunchEvent, LaunchRequest,
+    delete, doctor, inspect, keep, launch, list_sessions, open, open_gui, prune, resolve_session,
+    resume, search, ssh_command, stop, AppContext, LaunchEvent, LaunchRequest,
 };
-use wargame_core::domain::{ChallengeRef, NetworkMode};
+use wargame_core::domain::{ChallengeRef, KeepPolicy, NetworkMode, SessionState};
 use wargame_core::error::{Result, WargameError};
 use wargame_core::ports::{AuthState, SearchQuery, Secret};
 
@@ -35,6 +36,17 @@ async fn run(cli: Cli) -> i32 {
         home,
         command,
     } = cli;
+
+    if let Some(Command::Completions { shell }) = command {
+        // Needs no context (and must work before any config/home exists).
+        clap_complete::generate(
+            shell,
+            &mut Cli::command(),
+            "wargame",
+            &mut std::io::stdout(),
+        );
+        return 0;
+    }
 
     let ctx = match wiring::build_context(verbose, config, home) {
         Ok(ctx) => ctx,
@@ -70,6 +82,17 @@ fn print_error(err: &WargameError) {
     if let Some(hint) = err.hint() {
         eprintln!("Try: {hint}");
     }
+}
+
+/// Resolves a (possibly shortened or omitted) session reference, telling
+/// the user on stderr which session was picked whenever it is not
+/// literally what they typed.
+async fn resolve(ctx: &AppContext, needle: Option<&str>) -> Result<String> {
+    let id = resolve_session(ctx, needle).await?;
+    if needle != Some(id.as_str()) {
+        eprintln!("(session {id})");
+    }
+    Ok(id)
 }
 
 async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
@@ -113,7 +136,7 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
         } => {
             let challenge_ref = ChallengeRef::parse(&r#ref)?;
             let network_mode = match network {
-                Some(n) => n.parse::<NetworkMode>()?,
+                Some(n) => NetworkMode::from(n),
                 None => ctx.config.general.default_network,
             };
 
@@ -144,6 +167,11 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
                 gui,
             };
 
+            println!(
+                "Launching {} into profile {} ({} network)…",
+                req.challenge, req.profile, req.network
+            );
+            let started = Instant::now();
             let (tx, mut rx) = tokio::sync::mpsc::channel(64);
             let printer = tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
@@ -155,7 +183,14 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
 
             match outcome {
                 Ok(session) => {
-                    println!("session id: {}", session.id);
+                    let id = &session.id;
+                    println!();
+                    println!("Ready in {}s: {id}", started.elapsed().as_secs());
+                    println!("Next:");
+                    println!("  wargame ssh {id}      # open a shell in the VM");
+                    println!("  wargame gui {id}      # open a graphical console");
+                    println!("  wargame stop {id}     # pause it (resume later)");
+                    println!("  wargame delete {id}   # discard it");
                     Ok(0)
                 }
                 Err(e) => {
@@ -174,41 +209,69 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
         Command::Session {
             action: SessionCommand::Inspect { id, json },
         } => {
+            let id = resolve(ctx, id.as_deref()).await?;
             let session = inspect(ctx, &id).await?;
-            output::print_session(&session, json);
+            let log = ctx.repo.session_dir(&id).join("run.log");
+            output::print_session(&session, Some(&log), json);
             Ok(0)
         }
 
         Command::Ssh { id } => {
+            let id = resolve(ctx, id.as_deref()).await?;
             let cmd = ssh_command(ctx, &id).await?;
             exec_replacing_process(cmd)
         }
 
         Command::Gui { id } => {
+            let id = resolve(ctx, id.as_deref()).await?;
+            println!("Opening a graphical console for {id}… (SSH keeps working; closing the window stops the VM)");
             open_gui(ctx, &id).await?;
-            println!("Opened a graphical console for {id}.");
+            println!("Opened. Next: wargame ssh {id}   # or: wargame stop {id}");
             Ok(0)
         }
 
         Command::Stop { id } => {
+            let id = resolve(ctx, id.as_deref()).await?;
+            let current = inspect(ctx, &id).await?;
+            if current.state == SessionState::Stopped {
+                println!("{id} is already stopped. Next: wargame resume {id}");
+                return Ok(0);
+            }
             let session = stop(ctx, &id).await?;
-            println!("Stopped {}.", session.id);
+            println!(
+                "Stopped {}. Next: wargame resume {0}   # or: wargame delete {0}",
+                session.id
+            );
             Ok(0)
         }
 
         Command::Resume { id } => {
+            let id = resolve(ctx, id.as_deref()).await?;
+            let current = inspect(ctx, &id).await?;
+            if current.state.is_up() {
+                println!("{id} is already running. Next: wargame ssh {id}");
+                return Ok(0);
+            }
+            println!("Resuming {id}… (waiting for the guest to boot)");
             let session = resume(ctx, &id).await?;
-            println!("Resumed {}.", session.id);
+            println!("Resumed {}. Next: wargame ssh {0}", session.id);
             Ok(0)
         }
 
         Command::Keep { id, off } => {
+            let id = resolve(ctx, id.as_deref()).await?;
             let session = keep(ctx, &id, !off).await?;
-            println!("{}: keep = {:?}", session.id, session.keep);
+            match session.keep {
+                KeepPolicy::Keep => println!(
+                    "{id} is now kept: it survives `wargame prune` and needs `wargame delete {id} --force`.\nUndo: wargame keep {id} --off"
+                ),
+                KeepPolicy::Discard => println!("{id} is no longer kept; `wargame delete {id}` works again."),
+            }
             Ok(0)
         }
 
         Command::Delete { id, force } => {
+            let id = resolve(ctx, Some(&id)).await?;
             delete(ctx, &id, force).await?;
             println!("Deleted {id}.");
             Ok(0)
@@ -218,6 +281,7 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
             let orphans = prune(ctx, dry_run).await?;
             if orphans.is_empty() {
                 println!("No orphaned VMs found.");
+                return Ok(0);
             }
             for name in &orphans {
                 if dry_run {
@@ -225,6 +289,14 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
                 } else {
                     println!("deleted {name}");
                 }
+            }
+            if dry_run {
+                println!(
+                    "{} orphaned VM(s). Run `wargame prune` to delete them.",
+                    orphans.len()
+                );
+            } else {
+                println!("Deleted {} orphaned VM(s).", orphans.len());
             }
             Ok(0)
         }
@@ -236,23 +308,38 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
         }
 
         Command::Profiles { json } => {
-            output::print_profiles(&ctx.profiles.list(), json);
+            output::print_profiles(
+                &ctx.profiles.list(),
+                &ctx.config.general.default_profile,
+                json,
+            );
             Ok(0)
         }
 
         Command::Profile {
             action: ProfileCommand::Build { name },
         } => {
+            let name = name.unwrap_or_else(|| ctx.config.general.default_profile.clone());
             let profile = ctx.profiles.get(&name)?;
+            println!(
+                "Building image for profile {name} (this takes tens of minutes the first time; NAT networking is used for provisioning)…"
+            );
+            let started = Instant::now();
             let (builder, opts) = wiring::build_profile_image_builder(ctx).await?;
             let image = builder
                 .build_profile(&profile, &opts, &mut |msg| println!("… {msg}"))
                 .await?;
-            println!("✓ built {}", image.0);
+            println!(
+                "✓ built {} in {}s. Next: wargame launch <provider:id> --profile {name}",
+                image.0,
+                started.elapsed().as_secs()
+            );
             Ok(0)
         }
 
         Command::Auth { action } => dispatch_auth(ctx, action).await,
+
+        Command::Completions { .. } => unreachable!("handled before the context is built"),
     }
 }
 
@@ -268,13 +355,15 @@ async fn dispatch_auth(ctx: &AppContext, action: AuthCommand) -> Result<i32> {
             ctx.wargame
                 .login(&email, Secret::new(Box::new(password)))
                 .await?;
-            println!("Logged in as {email}.");
+            println!("Logged in as {email}. Next: wargame search <query>");
             Ok(0)
         }
         AuthCommand::Status => {
             match ctx.wargame.auth_state().await? {
-                AuthState::Anonymous => println!("anonymous"),
-                AuthState::Authenticated { display } => println!("authenticated as {display}"),
+                AuthState::Anonymous => {
+                    println!("Not logged in. Searching works anonymously; downloading challenge files needs `wargame auth login`.")
+                }
+                AuthState::Authenticated { display } => println!("Logged in as {display}."),
             }
             Ok(0)
         }
@@ -283,7 +372,7 @@ async fn dispatch_auth(ctx: &AppContext, action: AuthCommand) -> Result<i32> {
             store
                 .delete(wargame_dreamhack::CREDENTIAL_KEY)
                 .map_err(|e| WargameError::CredentialStore(e.to_string()))?;
-            println!("Logged out.");
+            println!("Logged out; the stored session was removed from the credential store.");
             Ok(0)
         }
     }
@@ -325,6 +414,20 @@ fn confirm_nat_or_abort(yes: bool) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+fn human_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < KIB {
+        format!("{bytes} B")
+    } else if b < KIB * KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else if b < KIB * KIB * KIB {
+        format!("{:.1} MiB", b / KIB / KIB)
+    } else {
+        format!("{:.2} GiB", b / KIB / KIB / KIB)
+    }
+}
+
 fn print_launch_event(event: &LaunchEvent) {
     match event {
         LaunchEvent::Preflight(msg) => println!("… {msg}"),
@@ -335,14 +438,19 @@ fn print_launch_event(event: &LaunchEvent) {
             filename,
             sha256,
             size,
-        } => println!("✓ downloaded {filename} ({size} bytes, sha256 {sha256})"),
-        LaunchEvent::Booting => println!("… booting"),
+        } => println!(
+            "✓ downloaded {filename} ({}, sha256 {}…)",
+            human_size(*size),
+            &sha256[..sha256.len().min(12)]
+        ),
+        LaunchEvent::Booting => println!("… booting the VM (up to a few minutes on first boot)"),
         LaunchEvent::GuestIp(ip) => println!("✓ guest ip: {ip}"),
-        LaunchEvent::Bootstrapping => println!("… bootstrapping"),
-        LaunchEvent::Ready {
-            session_id,
-            ssh_hint,
-        } => println!("✓ Ready: session {session_id} ({ssh_hint})"),
+        LaunchEvent::Bootstrapping => {
+            println!("… copying files into the guest and unpacking them there")
+        }
+        LaunchEvent::Ready { .. } => {
+            // The summary block printed by `launch` covers this.
+        }
         LaunchEvent::Failed {
             session_id,
             error,
@@ -350,7 +458,7 @@ fn print_launch_event(event: &LaunchEvent) {
         } => {
             println!("✗ Failed: {error}");
             if let Some(id) = session_id {
-                println!("  session: {id}");
+                println!("  session {id} was left in place; `wargame session inspect {id}` shows the details, `wargame delete {id}` discards it.");
             }
             if let Some(hint) = hint {
                 println!("  Try: {hint}");

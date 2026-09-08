@@ -92,7 +92,7 @@ async fn delete_refuses_a_kept_session_without_force_then_succeeds_with_it() {
     ctx.repo.save(&s).await.unwrap();
 
     let err = delete(&ctx, "keep-me", false).await.unwrap_err();
-    assert!(matches!(err, WargameError::Other(_)));
+    assert!(matches!(err, WargameError::SessionKept(ref id) if id == "keep-me"));
     assert!(ctx.repo.load("keep-me").await.is_ok());
 
     delete(&ctx, "keep-me", true).await.unwrap();

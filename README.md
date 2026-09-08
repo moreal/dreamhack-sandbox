@@ -231,7 +231,7 @@ in this MVP.
   `incoming/extracted/<name>/` subdirectory and never executes anything it
   finds — extraction only, never execution.
 - **Every user-facing error carries an explicit hint** (e.g. `ImageMissing`
-  → "Run: wargame profile build <profile>"), so failure modes are
+  → "wargame profile build <profile>"), so failure modes are
   actionable rather than opaque.
 
 See `DESIGN.md` §3.6 for the exact mechanisms and `MVP.md` §18/§37 for the

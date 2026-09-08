@@ -91,6 +91,45 @@ impl SessionState {
     pub fn is_terminal(self) -> bool {
         matches!(self, SessionState::Deleted)
     }
+
+    /// The lowercase name used everywhere a state is shown to the user
+    /// (tables, status lines, error messages); matches the serde form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionState::Creating => "creating",
+            SessionState::Downloading => "downloading",
+            SessionState::Booting => "booting",
+            SessionState::Provisioning => "provisioning",
+            SessionState::Ready => "ready",
+            SessionState::Running => "running",
+            SessionState::Stopped => "stopped",
+            SessionState::Failed => "failed",
+            SessionState::Deleting => "deleting",
+            SessionState::Deleted => "deleted",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl NetworkMode {
+    /// The lowercase name used in tables and status lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NetworkMode::Isolated => "isolated",
+            NetworkMode::Nat => "nat",
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

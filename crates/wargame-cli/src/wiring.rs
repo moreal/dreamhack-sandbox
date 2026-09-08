@@ -78,7 +78,12 @@ pub fn build_context(
         Some(root) => AppDirs { root },
         None => AppDirs::resolve()?,
     };
-    dirs.ensure_layout()?;
+    dirs.ensure_layout().map_err(|e| {
+        WargameError::Config(format!(
+            "cannot create the wargame home directory {}: {e} (set --home or $WARGAME_HOME to a writable location)",
+            dirs.root.display()
+        ))
+    })?;
 
     seed_builtin_profile_yamls(&dirs)?;
     // Unlike the YAMLs, the built-in scripts are overwritten every run: they

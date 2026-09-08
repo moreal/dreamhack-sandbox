@@ -168,7 +168,7 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
             hint: if ok {
                 None
             } else {
-                Some(format!("Run: wargame profile build {}", profile.name))
+                Some(format!("wargame profile build {}", profile.name))
             },
         });
     }
@@ -197,7 +197,7 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
         hint: if key_present {
             None
         } else {
-            Some("Run: wargame profile build <name>".to_string())
+            Some("wargame profile build <name>".to_string())
         },
     });
 

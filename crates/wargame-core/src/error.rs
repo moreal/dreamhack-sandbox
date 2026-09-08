@@ -45,7 +45,16 @@ pub enum WargameError {
     CleanupFailed(String),
     #[error("session {0} not found")]
     SessionNotFound(String),
-    #[error("invalid session state transition {from:?} -> {to:?}")]
+    #[error("session reference {needle:?} is ambiguous; it matches: {}", candidates.join(", "))]
+    AmbiguousSession {
+        needle: String,
+        candidates: Vec<String>,
+    },
+    #[error("no sessions exist yet")]
+    NoSessions,
+    #[error("session {0} is marked keep")]
+    SessionKept(String),
+    #[error("session is {from} and cannot become {to}")]
     InvalidTransition {
         from: SessionState,
         to: SessionState,
@@ -89,18 +98,38 @@ impl WargameError {
         match self {
             WargameError::NetworkUnavailable(_) => Some(isolated_network_hint(None)),
             WargameError::ImageMissing { profile, .. } => {
-                Some(format!("Run: wargame profile build {profile}"))
+                Some(format!("wargame profile build {profile}"))
             }
             WargameError::AuthenticationRequired { .. } => {
-                Some("Run: wargame auth login".to_string())
+                Some("wargame auth login".to_string())
             }
             WargameError::InsufficientResources(_) => Some(
-                "Run: wargame sessions   # then delete an old session to free space".to_string(),
+                "wargame sessions   # then delete an old session to free space".to_string(),
             ),
-            WargameError::BackendUnavailable { .. } => Some("Run: wargame doctor".to_string()),
-            WargameError::ProfileNotFound(_) => Some("Run: wargame profiles".to_string()),
-            WargameError::SessionNotFound(_) => Some("Run: wargame sessions".to_string()),
-            WargameError::Incompatible(_) => Some("Run: wargame profiles".to_string()),
+            WargameError::BackendUnavailable { .. } => Some("wargame doctor".to_string()),
+            WargameError::ProfileNotFound(_) => Some("wargame profiles".to_string()),
+            WargameError::SessionNotFound(_) => Some("wargame sessions".to_string()),
+            WargameError::AmbiguousSession { .. } => {
+                Some("Use a longer prefix, or the full id from: wargame sessions".to_string())
+            }
+            WargameError::NoSessions => Some(
+                "wargame search <query>   # then: wargame launch <provider:id>".to_string(),
+            ),
+            WargameError::SessionKept(id) => Some(format!(
+                "wargame delete {id} --force   # or unmark it first: wargame keep {id} --off"
+            )),
+            WargameError::InvalidTransition { from, .. } => Some(match from {
+                SessionState::Stopped => "wargame resume <id>   # then try again".to_string(),
+                SessionState::Failed => {
+                    "wargame session inspect <id>   # see why it failed; wargame delete <id> to discard it"
+                        .to_string()
+                }
+                SessionState::Ready | SessionState::Running => {
+                    "wargame sessions   # the session is already up; wargame ssh <id> to connect".to_string()
+                }
+                _ => "wargame sessions".to_string(),
+            }),
+            WargameError::Incompatible(_) => Some("wargame profiles".to_string()),
             WargameError::InvalidProfile { name, .. } => Some(format!(
                 "Check the provisioning log: $WARGAME_HOME/logs/provision-{name}.log"
             )),
