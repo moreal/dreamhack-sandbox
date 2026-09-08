@@ -204,10 +204,17 @@ const DUPLICATE_BODY: &str = r#"duplicate vm with properties {configuration:{nam
 				return "ok""#;
 
 const HARDWARE_PROLOGUE: &str = r#"set memMib to (item 2 of argv) as integer
-	set cores to (item 3 of argv) as integer"#;
+	set cores to (item 3 of argv) as integer
+	set hyp to ((item 4 of argv) is "true")"#;
+// `hypervisor` is written explicitly rather than inherited from whatever
+// the source VM was built with: the session's execution mode is the one
+// the profile resolved to. UTM will silently ignore `true` on a
+// mismatched architecture (T6), which is why the caller refuses that
+// combination before ever getting here.
 const HARDWARE_BODY: &str = r#"set c to configuration of vm
 				set memory of c to memMib
 				set cpu cores of c to cores
+				set hypervisor of c to hyp
 				update configuration of vm with c
 				return "ok""#;
 
@@ -636,11 +643,23 @@ impl Automation {
         Ok((id.trim().to_string(), name.trim().to_string()))
     }
 
-    /// CPU and memory. The VM must be `stopped`, else -2700 (T9).
-    pub async fn set_hardware(&self, id: &str, cpu_cores: u32, memory_mib: u64) -> Result<()> {
+    /// CPU, memory and the hypervisor flag. The VM must be `stopped`, else
+    /// -2700 (T9).
+    pub async fn set_hardware(
+        &self,
+        id: &str,
+        cpu_cores: u32,
+        memory_mib: u64,
+        hypervisor: bool,
+    ) -> Result<()> {
         self.osascript(
             &vm_script(HARDWARE_PROLOGUE, HARDWARE_BODY),
-            &[id, &memory_mib.to_string(), &cpu_cores.to_string()],
+            &[
+                id,
+                &memory_mib.to_string(),
+                &cpu_cores.to_string(),
+                &hypervisor.to_string(),
+            ],
         )
         .await?;
         Ok(())

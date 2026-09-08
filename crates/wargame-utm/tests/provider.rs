@@ -464,6 +464,51 @@ async fn create_clones_the_source_vm_and_returns_the_new_uuid() {
     assert_eq!(network.args[2], "host");
 }
 
+/// The clone inherits the source's configuration, so the session's own
+/// execution mode is written explicitly: `emulate` must land as
+/// `hypervisor:false` even if the source VM was built virtualized.
+#[tokio::test]
+async fn create_writes_the_hypervisor_flag_of_the_sessions_mode() {
+    let new_id = "11111111-2222-3333-4444-555555555555";
+    let before = LIST_MULTI.to_string();
+    let after = format!("{before}{new_id} stopped  wg-session-1\n");
+    let n = Arc::new(std::sync::Mutex::new(0usize));
+    let seen = n.clone();
+    let fake = runner(move |cmd| {
+        if utmctl_sub(cmd) == Some("list") {
+            let mut n = seen.lock().unwrap();
+            *n += 1;
+            return Some(ok(if *n == 1 { &before } else { &after }));
+        }
+        None
+    });
+    let p = provider(fake.clone());
+    p.create(&kali_x86_spec("wg-session-1")).await.unwrap();
+
+    let calls = fake.calls();
+    let hardware = calls
+        .iter()
+        .find(|c| is_osascript(c, "cpu cores"))
+        .expect("a hardware call");
+    // id, memory (MiB), cores, hypervisor
+    assert_eq!(hardware.args[1], new_id);
+    assert_eq!(hardware.args[2], "8192");
+    assert_eq!(hardware.args[3], "4");
+    assert_eq!(hardware.args[4], "false", "emulate means hypervisor:false");
+}
+
+/// Copying a running VM captures a torn disk, and the copy inherits its
+/// state; refuse before `duplicate`.
+#[tokio::test]
+async fn create_refuses_to_clone_a_running_source_vm() {
+    let listing = owned_list(X86_ID, "started", "wargame-t1-x86");
+    let fake = runner(move |cmd| (utmctl_sub(cmd) == Some("list")).then(|| ok(&listing)));
+    let p = provider(fake.clone());
+    let err = p.create(&kali_x86_spec("wg-session-1")).await.unwrap_err();
+    assert!(err.to_string().contains("started"), "{err}");
+    assert!(!fake.calls().iter().any(|c| is_osascript(c, "duplicate")));
+}
+
 #[tokio::test]
 async fn create_maps_nat_to_utms_shared_mode() {
     let new_id = "11111111-2222-3333-4444-555555555555";

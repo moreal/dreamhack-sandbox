@@ -182,9 +182,17 @@ impl UtmProvider {
     /// the name only as a tie-breaker, because names are not unique (T3).
     pub async fn clone_vm(&self, source_id: &str, new_name: &str) -> Result<VmRef> {
         let before = self.automation.list().await?;
-        if !before.iter().any(|vm| vm.id == source_id) {
+        let Some(source) = before.iter().find(|vm| vm.id == source_id) else {
             return Err(WargameError::VmCreationFailed(format!(
                 "no UTM virtual machine with id {source_id} to clone from (it is the source recorded for this profile's image)"
+            )));
+        };
+        // Copying a VM that is still running would capture a torn disk, and
+        // the copy inherits everything including that state.
+        if source.status.is_live() {
+            return Err(WargameError::VmCreationFailed(format!(
+                "the source VM {} ({}) is {}; stop it in UTM before cloning from it",
+                source.name, source_id, source.status
             )));
         }
         self.automation.duplicate(source_id, new_name).await?;
@@ -504,10 +512,10 @@ impl VmProvider for UtmProvider {
     /// UTM has nothing to pull: an image is a VM this app built and
     /// recorded, and building one is `profile create` + `profile build`.
     async fn pull_image(&self, image: &ImageRef) -> Result<()> {
-        Err(WargameError::ImageMissing {
-            profile: image.0.clone(),
-            image: image.0.clone(),
-        })
+        Err(WargameError::Other(format!(
+            "UTM has no image registry to pull {} from: a UTM image is a VM this app installed and recorded. Create the installation VM with `wargame profile create <profile> --iso <path>`, install the OS through its console, then `wargame profile build <profile>`",
+            image.0
+        )))
     }
 
     /// Clones the profile's source VM into a fresh one and applies the
@@ -519,15 +527,20 @@ impl VmProvider for UtmProvider {
     async fn create(&self, spec: &VmSpec) -> Result<VmRef> {
         // Refuse an impossible execution configuration before contacting
         // UTM at all (spec.md §6: fail before anything is created).
-        let _hypervisor = validate_execution(&spec.execution)?;
+        let hypervisor = validate_execution(&spec.execution)?;
 
         let vm = self.clone_vm(&spec.image.0, &spec.name).await?;
 
         // A clone inherits the source's configuration, so only what this
-        // session changes is written -- while it is still stopped, which is
+        // session decides is written -- while it is still stopped, which is
         // the only state `update configuration` accepts (T9).
         self.automation
-            .set_hardware(&vm.id, spec.resources.cpu, spec.resources.memory_mib)
+            .set_hardware(
+                &vm.id,
+                spec.resources.cpu,
+                spec.resources.memory_mib,
+                hypervisor,
+            )
             .await?;
         self.automation
             .set_network_mode(&vm.id, network_mode(spec.network))
