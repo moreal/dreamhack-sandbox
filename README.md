@@ -105,15 +105,27 @@ afterwards authenticates with the key alone.
 $ wargame search out_of_bound
 $ wargame open dreamhack:11
 $ wargame launch dreamhack:11 --profile macos-re-arm64 --network isolated
+Launching dreamhack:11 into profile macos-re-arm64 (isolated network)…
 … downloading out_of_bound.zip
-✓ downloaded out_of_bound.zip (…)
-… booting
+✓ downloaded out_of_bound.zip (1.2 KiB, sha256 03cb4114beed…)
+… booting the VM (up to a few minutes on first boot)
 ✓ guest ip: 192.168.…
-… bootstrapping
-✓ Ready: session dh-out-of-bound-a1b2c3 (wargame ssh dh-out-of-bound-a1b2c3)
+… copying files into the guest and unpacking them there
 
-$ wargame ssh dh-out-of-bound-a1b2c3
+Ready in 21s: dh-out-of-bound-a1b2c3
+Next:
+  wargame ssh dh-out-of-bound-a1b2c3      # open a shell in the VM
+  wargame gui dh-out-of-bound-a1b2c3      # open a graphical console
+  wargame stop dh-out-of-bound-a1b2c3     # pause it (resume later)
+  wargame delete dh-out-of-bound-a1b2c3   # discard it
+
+$ wargame ssh            # no id needed: the most recent session
 ```
+
+Session ids never have to be typed in full: any unique prefix or substring
+of the id *or the challenge title* works (`wargame ssh out_of`, `wargame
+stop a1b2`), and omitting the id entirely means the most recent session.
+An ambiguous reference lists the candidates instead of guessing.
 
 `launch` clones the built profile image, boots it, streams the challenge's
 files to a local staging directory (hashing them as they arrive), copies
@@ -125,19 +137,36 @@ guest*. Nothing is ever extracted, previewed, or executed on the host.
 When you're done:
 
 ```sh
-$ wargame sessions
-NAME                  PROBLEM        PROFILE          STATE
-dh-out-of-bound-a12   out_of_bound   macos-re-arm64   running
+$ wargame sessions                            # alias: wargame ls
+┌────────────────────────┬──────────────┬─────────┬──────────┬────────────────┬──────┬─────┐
+│ id                     ┆ title        ┆ state   ┆ network  ┆ profile        ┆ keep ┆ age │
+╞════════════════════════╪══════════════╪═════════╪══════════╪════════════════╪══════╪═════╡
+│ dh-out-of-bound-a1b2c3 ┆ out_of_bound ┆ running ┆ isolated ┆ macos-re-arm64 ┆      ┆ 7m  │
+└────────────────────────┴──────────────┴─────────┴──────────┴────────────────┴──────┴─────┘
+1 session(s), 1 up. Ids may be shortened to any unique prefix.
 
-$ wargame delete dh-out-of-bound-a12          # discard the clone
-$ wargame keep dh-out-of-bound-a12            # or: mark it to survive `prune`
-$ wargame stop dh-out-of-bound-a12            # or just stop it for now
-$ wargame resume dh-out-of-bound-a12          # ...and pick it back up later
+$ wargame delete out_of          # discard the clone (alias: rm)
+$ wargame keep out_of            # or: mark it to survive `prune` (delete then needs --force)
+$ wargame stop out_of            # or just stop it for now
+$ wargame resume out_of          # ...and pick it back up later
+$ wargame session inspect out_of # everything recorded about it, incl. the run.log path
+```
+
+Every command ends with a `Next:` line naming the natural follow-up, and
+`wargame --help` carries a quick-start block. Shell completion is one
+command away:
+
+```sh
+wargame completions zsh > ~/.zfunc/_wargame      # or: bash, fish, elvish, powershell
 ```
 
 Running `wargame` with no subcommand opens the TUI, which drives the same
 application services (search → problem detail → launch → sessions) as the
-CLI above — there is no TUI-only business logic.
+CLI above — there is no TUI-only business logic. Inside it, the footer
+always lists exactly the keys that do something on the current screen;
+`Ctrl+C` quits from anywhere, `[`/`]` page through search results, and on
+the sessions screen `Enter` opens a shell, `g` a window, `x`/`r` stop and
+resume, `k` toggles keep, `d` deletes (after a `y/N` prompt), `R` refreshes.
 
 ## What "isolated" networking means
 
@@ -269,6 +298,13 @@ prerequisite is missing, with a `hint` for each failing check.
   network access to `https://dreamhack.io`, then `wargame auth login`
   again; `wargame auth status` shows the current state without touching
   anything.
+- **`session … is ambiguous`** — the shortened id you typed matches more
+  than one session; the error lists them. Use a longer prefix or the full
+  id from `wargame sessions`.
+- **`session is stopped and cannot become running`** (on `ssh`/`gui`) — the
+  VM is stopped, possibly because its Tart window was closed; `wargame
+  resume <id>` first. `wargame stop` on an already-stopped session (and
+  `resume` on a running one) is not an error — it just tells you so.
 - **`sshpass` missing** — only needed for `wargame profile build` (the
   one-time password-based key install); everyday `launch`/`ssh` never uses
   it.

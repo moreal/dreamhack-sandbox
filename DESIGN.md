@@ -342,17 +342,26 @@ workspace: { root: /Users/admin/wargame }
 
 ```
 cli/
-  main.rs        clap: search, open, launch, sessions, session inspect, ssh, gui, stop, resume, delete, keep, prune,
-                 doctor, profiles [list|build], auth [login|status|logout]; no subcommand → TUI
+  cli.rs         clap: search|find, open|show|info, launch|run, sessions|ls|ps, session inspect, ssh, gui, stop,
+                 resume|start, delete|rm, keep, prune, doctor, profiles, profile build, auth [login|status|logout],
+                 completions <shell>; no subcommand → TUI
+  main.rs        dispatch; resolves session references; prints "Next:" hints after every command
   wiring.rs      builds Config, AppDirs, providers, repo, transport (the composition root)
   output.rs      human tables + `--json`
   tui/
-    app.rs       state machine: Search → Problem → Launching → Sessions; Esc back, q quit
-    search.rs    input + list, `/` focuses input, Enter opens
-    problem.rs   detail (description scrolled), profile picker, network picker (NAT shows warning), [Launch]
-    launch.rs    event log driven by LaunchEvent, on Ready offers [s] ssh / [g] gui / [b] back
-    sessions.rs  table with stop/resume/delete (delete asks y/N)
+    app.rs       state machine: Search → Problem → Launching → Sessions; Esc back, q quit, Ctrl+C quits anywhere;
+                 the footer lists only keys that currently do something
+    search.rs    input + list, `/` focuses input, Enter opens, `[`/`]` page
+    problem.rs   detail (description scrolled), profile picker, network picker (NAT shows warning), Enter/l launches
+    launch.rs    event log driven by LaunchEvent, on Ready offers [s] ssh / [g] gui / [b] sessions
+    sessions.rs  table with ssh/gui/stop/resume/keep/delete (delete asks y/N), R refreshes
 ```
+
+Every session-taking command accepts a *reference*, resolved by
+`app::lifecycle::resolve_session`: the exact id, else a unique id prefix, else a
+unique case-insensitive substring of the id or challenge title; several matches
+are an `AmbiguousSession` error listing the candidates. Omitting the reference
+(allowed everywhere except `delete`) means the most recently created session.
 
 `wargame ssh <session>` execs `ssh` (replaces the process). `wargame gui` follows §5. `wargame delete` on a `Keep` session requires `--force` or interactive confirmation (NFR-07). `wargame prune` lists Tart VMs with the `wg-` prefix that have no session record and deletes them with confirmation (NFR-02).
 

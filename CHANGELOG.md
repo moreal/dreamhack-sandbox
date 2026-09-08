@@ -4,6 +4,39 @@ All notable changes to `wargame-vm` are recorded here. This project has not
 yet made a versioned release; entries are grouped by the MVP milestones
 defined in `MVP.md` §36 and the implementation plan in `PLAN.md`.
 
+## [Unreleased] — Usability pass (2026-09-08)
+
+### Changed
+
+- **Session references**: every command that takes a session id now also
+  accepts a unique prefix or substring of the id or challenge title, and
+  (except `delete`) may omit it to mean the most recent session. Ambiguous
+  references list their candidates (`WargameError::AmbiguousSession`).
+- **Next-step hints**: `launch` ends with an elapsed time and the four
+  follow-up commands; `search`, `open`, `sessions`, `session inspect`,
+  `stop`, `resume`, `keep`, `profiles`, `profile build` and `auth` each
+  end with a `Next:` line. `stop`/`resume` on a session already in that
+  state succeed with a message; state errors read "session is stopped and
+  cannot become running" and carry a state-specific hint; deleting a kept
+  session raises `SessionKept` naming `--force`.
+- **Tables**: `sessions` gains `keep`/`age` columns, a summary line and an
+  empty-state hint; `search` explains no-result pages; `doctor` renders
+  ✓/✗ with a failure summary; `profiles` marks the default.
+- **Help**: every flag is documented, defaults are visible, `--network` is
+  an enum (case-insensitive), global flags sort last, `wargame --help`
+  carries a quick-start block, `profile build` defaults to the configured
+  profile, `-y`/`-f` short flags, aliases `find`, `show`/`info`, `run`,
+  `ls`/`ps`, `start`, `rm`. New `wargame completions <shell>`.
+- **TUI**: Ctrl+C quits anywhere; the footer lists only keys that do
+  something on the current screen; "Searching…"/"Opening…" indicators;
+  `[`/`]` page through results; Enter launches from the problem screen;
+  the launch log is coloured and auto-scrolls; the sessions screen is a
+  real table (header, keep, age, state colours, empty state) with `g`
+  gui, `k` keep, `R` refresh, and state-aware explanations instead of
+  transition errors; async errors show their hint.
+- Hints no longer carry a `Run:` prefix; an unwritable `--home` reports
+  the path and the fix.
+
 ## [Unreleased] — MVP
 
 ### Added

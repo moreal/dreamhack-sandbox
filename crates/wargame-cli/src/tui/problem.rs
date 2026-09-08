@@ -64,13 +64,21 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &ProblemState) {
         ])
         .split(area);
 
-    let header = Paragraph::new(format!(
-        "{}\nCategory: {}   Provider: {}",
-        state.challenge.summary.title,
-        state.challenge.summary.categories.join(", "),
-        state.challenge.summary.r#ref.provider
-    ))
-    .block(Block::default().borders(Borders::ALL).title("Challenge"));
+    let summary = &state.challenge.summary;
+    let mut facts = vec![summary.r#ref.to_string()];
+    if !summary.categories.is_empty() {
+        facts.push(summary.categories.join(", "));
+    }
+    if let Some(d) = &summary.difficulty {
+        facts.push(d.clone());
+    }
+    facts.push(match state.challenge.assets.len() {
+        0 => "no files".to_string(),
+        1 => "1 file".to_string(),
+        n => format!("{n} files"),
+    });
+    let header = Paragraph::new(format!("{}   ·   {}", summary.title, facts.join("  ·  ")))
+        .block(Block::default().borders(Borders::ALL).title("Challenge"));
     frame.render_widget(header, chunks[0]);
 
     let desc = Paragraph::new(state.challenge.description.as_str())
@@ -90,7 +98,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &ProblemState) {
     let profile = Paragraph::new(profile_text).style(profile_style).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Environment (Tab, ↑/↓)"),
+            .title("Profile (↑/↓ to change)"),
     );
     frame.render_widget(profile, chunks[2]);
 
@@ -108,7 +116,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &ProblemState) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Network (n to toggle, l to launch)"),
+                .title("Network (n to toggle)   —   Enter to launch"),
         );
     frame.render_widget(network, chunks[3]);
 }
