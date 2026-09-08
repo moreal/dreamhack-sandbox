@@ -17,6 +17,14 @@ pub struct SearchState {
     pub editing: bool,
     pub results: Vec<ChallengeSummary>,
     pub selected: usize,
+    /// The page the current `results` came from (1-based).
+    pub page: u32,
+    /// The provider's next page, if there is one (`]` requests it).
+    pub next_page: Option<u32>,
+    /// Total matches across all pages, as reported by the provider.
+    pub total: u64,
+    /// Whether any search has completed yet (drives the empty-state text).
+    pub searched: bool,
 }
 
 impl SearchState {
@@ -28,6 +36,10 @@ impl SearchState {
             editing: true,
             results: Vec::new(),
             selected: 0,
+            page: 1,
+            next_page: None,
+            total: 0,
+            searched: false,
         }
     }
 }
@@ -49,14 +61,50 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SearchState) {
     } else {
         Style::default()
     };
-    let input = Paragraph::new(state.input.as_str())
+    let input_title = if state.editing {
+        "Search Dreamhack (Enter to search)"
+    } else {
+        "Search Dreamhack (/ to edit)"
+    };
+    let shown = if state.editing {
+        format!("{}▏", state.input)
+    } else {
+        state.input.clone()
+    };
+    let input = Paragraph::new(shown)
         .style(input_style)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Search Dreamhack"),
-        );
+        .block(Block::default().borders(Borders::ALL).title(input_title));
     frame.render_widget(input, chunks[0]);
+
+    let results_title = if state.results.is_empty() {
+        "Results".to_string()
+    } else {
+        let first = (state.page - 1) as u64 * 20 + 1;
+        let last = first + state.results.len() as u64 - 1;
+        let more = if state.next_page.is_some() {
+            "  ] next page"
+        } else {
+            ""
+        };
+        let back = if state.page > 1 {
+            "  [ previous page"
+        } else {
+            ""
+        };
+        format!("Results {first}–{last} of {}{more}{back}", state.total)
+    };
+    if state.results.is_empty() {
+        let text = if state.searched {
+            "No challenges matched. Press / to change the query."
+        } else {
+            "Type a query and press Enter. Enter on a result shows its details."
+        };
+        let empty = Paragraph::new(text)
+            .style(Style::default().add_modifier(Modifier::DIM))
+            .block(Block::default().borders(Borders::ALL).title(results_title));
+        frame.render_widget(empty, chunks[1]);
+        return;
+    }
 
     let items: Vec<ListItem> = state
         .results
@@ -71,11 +119,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SearchState) {
         })
         .collect();
     let mut list_state = ListState::default();
-    if !state.results.is_empty() {
-        list_state.select(Some(state.selected));
-    }
+    list_state.select(Some(state.selected));
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Results"))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .block(Block::default().borders(Borders::ALL).title(results_title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, chunks[1], &mut list_state);
 }

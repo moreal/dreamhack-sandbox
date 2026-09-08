@@ -25,7 +25,7 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
 use wargame_core::app::{
-    delete, launch as launch_challenge, list_sessions, open, open_gui, resume,
+    delete, keep, launch as launch_challenge, list_sessions, open, open_gui, resume,
     search as search_challenges, ssh_command, stop, AppContext, LaunchEvent,
 };
 use wargame_core::error::{Result, WargameError};
@@ -124,7 +124,7 @@ fn spawn_effect(ctx: Arc<AppContext>, effect: Effect, tx: mpsc::UnboundedSender<
                         let _ = tx.send(Msg::SearchResults(page));
                     }
                     Err(e) => {
-                        let _ = tx.send(Msg::Error(e.to_string()));
+                        let _ = tx.send(Msg::Error(describe(&e)));
                     }
                 }
             });
@@ -136,7 +136,7 @@ fn spawn_effect(ctx: Arc<AppContext>, effect: Effect, tx: mpsc::UnboundedSender<
                         let _ = tx.send(Msg::Challenge(challenge));
                     }
                     Err(e) => {
-                        let _ = tx.send(Msg::Error(e.to_string()));
+                        let _ = tx.send(Msg::Error(describe(&e)));
                     }
                 }
             });
@@ -153,7 +153,7 @@ fn spawn_effect(ctx: Arc<AppContext>, effect: Effect, tx: mpsc::UnboundedSender<
                     }
                 });
                 if let Err(e) = launch_challenge(&ctx, req, etx).await {
-                    let _ = tx.send(Msg::Error(e.to_string()));
+                    let _ = tx.send(Msg::Error(describe(&e)));
                 }
                 let _ = forward.await;
             });
@@ -166,7 +166,7 @@ fn spawn_effect(ctx: Arc<AppContext>, effect: Effect, tx: mpsc::UnboundedSender<
                 match stop(&ctx, &id).await {
                     Ok(_) => refresh_sessions(&ctx, &tx).await,
                     Err(e) => {
-                        let _ = tx.send(Msg::Error(e.to_string()));
+                        let _ = tx.send(Msg::Error(describe(&e)));
                     }
                 }
             });
@@ -176,7 +176,7 @@ fn spawn_effect(ctx: Arc<AppContext>, effect: Effect, tx: mpsc::UnboundedSender<
                 match resume(&ctx, &id).await {
                     Ok(_) => refresh_sessions(&ctx, &tx).await,
                     Err(e) => {
-                        let _ = tx.send(Msg::Error(e.to_string()));
+                        let _ = tx.send(Msg::Error(describe(&e)));
                     }
                 }
             });
@@ -189,15 +189,28 @@ fn spawn_effect(ctx: Arc<AppContext>, effect: Effect, tx: mpsc::UnboundedSender<
                 match delete(&ctx, &id, true).await {
                     Ok(()) => refresh_sessions(&ctx, &tx).await,
                     Err(e) => {
-                        let _ = tx.send(Msg::Error(e.to_string()));
+                        let _ = tx.send(Msg::Error(describe(&e)));
+                    }
+                }
+            });
+        }
+        Effect::Keep(id, keep_it) => {
+            tokio::spawn(async move {
+                match keep(&ctx, &id, keep_it).await {
+                    Ok(_) => refresh_sessions(&ctx, &tx).await,
+                    Err(e) => {
+                        let _ = tx.send(Msg::Error(describe(&e)));
                     }
                 }
             });
         }
         Effect::OpenGui(id) => {
             tokio::spawn(async move {
-                if let Err(e) = open_gui(&ctx, &id).await {
-                    let _ = tx.send(Msg::Error(e.to_string()));
+                match open_gui(&ctx, &id).await {
+                    Ok(()) => refresh_sessions(&ctx, &tx).await,
+                    Err(e) => {
+                        let _ = tx.send(Msg::Error(describe(&e)));
+                    }
                 }
             });
         }
@@ -207,13 +220,21 @@ fn spawn_effect(ctx: Arc<AppContext>, effect: Effect, tx: mpsc::UnboundedSender<
     }
 }
 
+/// An error plus its hint on one status line (`Error: … — try: …`).
+fn describe(err: &WargameError) -> String {
+    match err.hint() {
+        Some(hint) => format!("{err} — try: {}", hint.lines().next().unwrap_or_default()),
+        None => err.to_string(),
+    }
+}
+
 async fn refresh_sessions(ctx: &AppContext, tx: &mpsc::UnboundedSender<Msg>) {
     match list_sessions(ctx).await {
         Ok(sessions) => {
             let _ = tx.send(Msg::Sessions(sessions));
         }
         Err(e) => {
-            let _ = tx.send(Msg::Error(e.to_string()));
+            let _ = tx.send(Msg::Error(describe(&e)));
         }
     }
 }
@@ -231,7 +252,7 @@ async fn run_ssh(
     let cmd = match ssh_command(ctx, id).await {
         Ok(cmd) => cmd,
         Err(e) => {
-            let _ = tx.send(Msg::Error(e.to_string()));
+            let _ = tx.send(Msg::Error(describe(&e)));
             return;
         }
     };

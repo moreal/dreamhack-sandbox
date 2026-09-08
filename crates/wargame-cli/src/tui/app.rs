@@ -4,10 +4,12 @@
 //! out. The reducer itself never touches a terminal, a socket, or
 //! [`AppContext`] -- that is what makes it unit-testable without a pty.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use wargame_core::app::{LaunchEvent, LaunchRequest};
-use wargame_core::domain::{Challenge, ChallengeRef, NetworkMode, Session};
+use wargame_core::domain::{
+    Challenge, ChallengeRef, KeepPolicy, NetworkMode, Session, SessionState,
+};
 use wargame_core::ports::{SearchPage, SearchQuery};
 
 use super::launch::LaunchState;
@@ -48,6 +50,8 @@ pub enum Effect {
     Stop(String),
     Resume(String),
     Delete(String),
+    /// `(id, keep)`: flip a session's keep policy.
+    Keep(String, bool),
     ExecSsh(String),
     OpenGui(String),
     Quit,
@@ -94,22 +98,38 @@ impl App {
     }
 
     /// Help text for the current screen's key map, shown in the status bar
-    /// whenever `status` itself is empty (MVP.md §6's mockup footer).
+    /// whenever `status` itself is empty (MVP.md §6's mockup footer). Only
+    /// keys that would actually do something right now are listed.
     pub fn help_text(&self) -> &'static str {
         match self.screen {
             Screen::Search => {
                 if self.search.editing {
-                    "Enter: search   Esc: stop editing"
+                    "Enter: search   Esc: stop editing   Ctrl+C: quit"
+                } else if self.search.results.is_empty() {
+                    "/: edit query   s: sessions   q: quit"
                 } else {
-                    "/: search   Enter: open   s: sessions   q: quit"
+                    "↑/↓: select   Enter: open   [/]: page   /: edit query   s: sessions   q: quit"
                 }
             }
             Screen::Problem => {
-                "Tab: field   up/down: change   n: toggle network   l: launch   Esc: back   q: quit"
+                "Enter/l: launch   ↑/↓: profile   n: toggle network   Esc: back   q: quit"
             }
-            Screen::Launching => "s: ssh   g: gui   b: back   q: quit",
+            Screen::Launching => {
+                let launch = self.launch.as_ref();
+                if launch.is_some_and(|l| l.ready) {
+                    "s: ssh   g: gui   b: sessions   Esc: search   q: quit"
+                } else if launch.is_some_and(|l| l.failed) {
+                    "b: sessions (inspect/delete)   Esc: search   q: quit"
+                } else {
+                    "launching…   b: sessions   q: quit"
+                }
+            }
             Screen::Sessions => {
-                "up/down: select   x: stop   r: resume   d: delete   Enter: ssh   Esc: back   q: quit"
+                if self.sessions.is_empty() {
+                    "Esc: search   R: refresh   q: quit"
+                } else {
+                    "Enter: ssh   g: gui   x: stop   r: resume   k: keep   d: delete   R: refresh   Esc: search   q: quit"
+                }
             }
         }
     }
@@ -120,7 +140,14 @@ impl App {
             Msg::SearchResults(page) => {
                 self.search.results = page.items;
                 self.search.selected = 0;
-                self.status = format!("{} result(s)", page.total);
+                self.search.next_page = page.next_page;
+                self.search.total = page.total;
+                self.search.searched = true;
+                self.status = if page.total == 0 {
+                    "No challenges matched; press / to change the query.".to_string()
+                } else {
+                    format!("{} result(s), page {}", page.total, self.search.page)
+                };
                 Vec::new()
             }
             Msg::Challenge(challenge) => {
@@ -140,6 +167,11 @@ impl App {
                 if self.sessions_selected >= self.sessions.len() {
                     self.sessions_selected = self.sessions.len().saturating_sub(1);
                 }
+                if self.status.ends_with('…') {
+                    // A pending "Stopping…"/"Resuming…" note is resolved by
+                    // the refreshed list.
+                    self.status.clear();
+                }
                 Vec::new()
             }
             Msg::Error(err) => {
@@ -154,6 +186,11 @@ impl App {
         // only on Press avoids doing everything twice.
         if key.kind != KeyEventKind::Press {
             return Vec::new();
+        }
+        // Ctrl+C quits from anywhere, including while typing a query (raw
+        // mode swallows the terminal's own SIGINT).
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return vec![Effect::Quit];
         }
         match self.screen {
             Screen::Search => self.handle_search_key(key),
@@ -176,12 +213,8 @@ impl App {
                 }
                 KeyCode::Enter => {
                     self.search.editing = false;
-                    vec![Effect::Search(SearchQuery {
-                        text: self.search.input.clone(),
-                        category: None,
-                        page: 1,
-                        page_size: 20,
-                    })]
+                    self.search.page = 1;
+                    self.search_page(1)
                 }
                 KeyCode::Esc => {
                     self.search.editing = false;
@@ -198,7 +231,22 @@ impl App {
             KeyCode::Char('q') => vec![Effect::Quit],
             KeyCode::Char('s') => {
                 self.screen = Screen::Sessions;
+                self.status = "Loading sessions…".to_string();
                 vec![Effect::LoadSessions]
+            }
+            KeyCode::Char(']') | KeyCode::Right | KeyCode::PageDown => {
+                match self.search.next_page {
+                    Some(next) => self.search_page(next),
+                    None => Vec::new(),
+                }
+            }
+            KeyCode::Char('[') | KeyCode::Left | KeyCode::PageUp => {
+                if self.search.page > 1 {
+                    let prev = self.search.page - 1;
+                    self.search_page(prev)
+                } else {
+                    Vec::new()
+                }
             }
             KeyCode::Down => {
                 if !self.search.results.is_empty() {
@@ -211,14 +259,28 @@ impl App {
                 self.search.selected = self.search.selected.saturating_sub(1);
                 Vec::new()
             }
-            KeyCode::Enter => self
-                .search
-                .results
-                .get(self.search.selected)
-                .map(|item| vec![Effect::Open(item.r#ref.clone())])
-                .unwrap_or_default(),
+            KeyCode::Enter => match self.search.results.get(self.search.selected) {
+                Some(item) => {
+                    self.status = format!("Opening {}…", item.title);
+                    vec![Effect::Open(item.r#ref.clone())]
+                }
+                None => Vec::new(),
+            },
             _ => Vec::new(),
         }
+    }
+
+    /// Issues the current query for `page`, noting it in the status line
+    /// so the user sees something happened before the results arrive.
+    fn search_page(&mut self, page: u32) -> Vec<Effect> {
+        self.search.page = page;
+        self.status = format!("Searching \"{}\"…", self.search.input);
+        vec![Effect::Search(SearchQuery {
+            text: self.search.input.clone(),
+            category: None,
+            page,
+            page_size: 20,
+        })]
     }
 
     fn handle_problem_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -257,7 +319,7 @@ impl App {
                 };
                 Vec::new()
             }
-            KeyCode::Char('l') => {
+            KeyCode::Char('l') | KeyCode::Enter => {
                 let profile = problem
                     .selected_profile()
                     .map(str::to_string)
@@ -314,12 +376,17 @@ impl App {
             KeyCode::Char('g') if ready => session_id
                 .map(|id| vec![Effect::OpenGui(id)])
                 .unwrap_or_default(),
-            KeyCode::Char('b') if ready => {
+            KeyCode::Char('b') => {
+                // Always available: a failed launch leaves a session to
+                // inspect or delete, and a slow one can be watched from
+                // the list.
                 self.screen = Screen::Sessions;
+                self.status = "Loading sessions…".to_string();
                 vec![Effect::LoadSessions]
             }
             KeyCode::Esc => {
                 self.screen = Screen::Search;
+                self.status.clear();
                 Vec::new()
             }
             KeyCode::Char('q') => vec![Effect::Quit],
@@ -347,27 +414,85 @@ impl App {
                 self.sessions_selected = self.sessions_selected.saturating_sub(1);
                 Vec::new()
             }
-            KeyCode::Char('x') => self
-                .selected_session_id()
-                .map(|id| vec![Effect::Stop(id)])
-                .unwrap_or_default(),
-            KeyCode::Char('r') => self
-                .selected_session_id()
-                .map(|id| vec![Effect::Resume(id)])
-                .unwrap_or_default(),
+            KeyCode::Char('x') => match self.selected_session() {
+                Some(s) if s.state.is_up() => {
+                    let id = s.id.clone();
+                    self.status = format!("Stopping {id}…");
+                    vec![Effect::Stop(id)]
+                }
+                Some(s) => {
+                    self.status = format!("{} is {}; nothing to stop.", s.id, s.state);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
+            KeyCode::Char('r') => match self.selected_session() {
+                Some(s) if s.state == SessionState::Stopped => {
+                    let id = s.id.clone();
+                    self.status = format!("Resuming {id}… (booting the guest)");
+                    vec![Effect::Resume(id)]
+                }
+                Some(s) if s.state.is_up() => {
+                    self.status = format!("{} is already up; Enter opens a shell.", s.id);
+                    Vec::new()
+                }
+                Some(s) => {
+                    self.status = format!("{} is {}; only stopped sessions resume.", s.id, s.state);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
+            KeyCode::Char('k') => match self.selected_session() {
+                Some(s) => {
+                    let keep = s.keep != KeepPolicy::Keep;
+                    vec![Effect::Keep(s.id.clone(), keep)]
+                }
+                None => Vec::new(),
+            },
+            KeyCode::Char('g') => match self.selected_session() {
+                Some(s) if s.state.is_up() || s.state == SessionState::Stopped => {
+                    let id = s.id.clone();
+                    self.status = format!("Opening a window for {id}… (closing it stops the VM)");
+                    vec![Effect::OpenGui(id)]
+                }
+                Some(s) => {
+                    self.status = format!("{} is {}; no VM to show.", s.id, s.state);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
+            KeyCode::Char('R') => {
+                self.status = "Refreshing…".to_string();
+                vec![Effect::LoadSessions]
+            }
             KeyCode::Char('d') => {
-                if let Some(id) = self.selected_session_id() {
+                if let Some(s) = self.selected_session() {
+                    let id = s.id.clone();
+                    let kept = if s.keep == KeepPolicy::Keep {
+                        " (it is marked keep)"
+                    } else {
+                        ""
+                    };
+                    self.status = format!("Delete {id}{kept}? [y/N]");
                     self.pending_delete = Some(id);
-                    self.status = "Delete this session? [y/N]".to_string();
                 }
                 Vec::new()
             }
-            KeyCode::Enter => self
-                .selected_session_id()
-                .map(|id| vec![Effect::ExecSsh(id)])
-                .unwrap_or_default(),
+            KeyCode::Enter => match self.selected_session() {
+                Some(s) if s.state.is_up() => vec![Effect::ExecSsh(s.id.clone())],
+                Some(s) if s.state == SessionState::Stopped => {
+                    self.status = format!("{} is stopped; press r to resume it first.", s.id);
+                    Vec::new()
+                }
+                Some(s) => {
+                    self.status = format!("{} is {}; nothing to connect to.", s.id, s.state);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
             KeyCode::Esc => {
                 self.screen = Screen::Search;
+                self.status.clear();
                 Vec::new()
             }
             KeyCode::Char('q') => vec![Effect::Quit],
@@ -375,18 +500,15 @@ impl App {
         }
     }
 
-    fn selected_session_id(&self) -> Option<String> {
-        self.sessions
-            .get(self.sessions_selected)
-            .map(|s| s.id.clone())
+    fn selected_session(&self) -> Option<&Session> {
+        self.sessions.get(self.sessions_selected)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
-    use wargame_core::domain::{ChallengeSummary, KeepPolicy, Resources, SessionState};
+    use wargame_core::domain::{ChallengeSummary, Resources};
 
     fn key(code: KeyCode) -> Msg {
         Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -534,6 +656,108 @@ mod tests {
         let launch = a.launch.as_ref().unwrap();
         assert!(launch.ready);
         assert_eq!(launch.session_id.as_deref(), Some("dh-out-of-bound-a1b2c3"));
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_while_editing() {
+        let mut a = app();
+        assert!(a.search.editing);
+        let effects = a.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(matches!(effects.as_slice(), [Effect::Quit]));
+    }
+
+    #[test]
+    fn bracket_keys_page_through_results() {
+        let mut a = app();
+        a.update(key(KeyCode::Enter)); // search page 1
+        assert!(a.status.starts_with("Searching"));
+        a.update(Msg::SearchResults(SearchPage {
+            items: vec![summary("11", "out_of_bound")],
+            next_page: Some(2),
+            total: 40,
+        }));
+        assert_eq!(a.status, "40 result(s), page 1");
+
+        let effects = a.update(key(KeyCode::Char(']')));
+        match effects.as_slice() {
+            [Effect::Search(q)] => assert_eq!(q.page, 2),
+            other => panic!("expected a page-2 search, got {other:?}"),
+        }
+        a.update(Msg::SearchResults(SearchPage {
+            items: vec![summary("12", "second")],
+            next_page: None,
+            total: 40,
+        }));
+        // No next page: `]` is a no-op; `[` goes back.
+        assert!(a.update(key(KeyCode::Char(']'))).is_empty());
+        match a.update(key(KeyCode::Char('['))).as_slice() {
+            [Effect::Search(q)] => assert_eq!(q.page, 1),
+            other => panic!("expected a page-1 search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_launches_from_the_problem_screen() {
+        let mut a = app();
+        a.update(Msg::Challenge(challenge("11", "out_of_bound")));
+        let effects = a.update(key(KeyCode::Enter));
+        assert!(matches!(effects.as_slice(), [Effect::Launch(_)]));
+        assert_eq!(a.screen, Screen::Launching);
+    }
+
+    #[test]
+    fn launching_screen_offers_sessions_after_a_failure() {
+        let mut a = app();
+        a.update(Msg::Launch(LaunchEvent::Failed {
+            session_id: Some("dh-x-1".to_string()),
+            error: "boom".to_string(),
+            hint: None,
+        }));
+        assert!(a.help_text().contains("b: sessions"));
+        assert!(!a.help_text().contains("ssh"));
+        let effects = a.update(key(KeyCode::Char('b')));
+        assert!(matches!(effects.as_slice(), [Effect::LoadSessions]));
+        assert_eq!(a.screen, Screen::Sessions);
+    }
+
+    #[test]
+    fn sessions_screen_keys_respect_state() {
+        let mut a = app();
+        let mut stopped = sample_session("dh-stopped");
+        stopped.state = SessionState::Stopped;
+        a.update(Msg::Sessions(vec![sample_session("dh-ready"), stopped]));
+        a.screen = Screen::Sessions;
+
+        // Ready: Enter -> ssh, x -> stop, r -> explains.
+        assert!(
+            matches!(a.update(key(KeyCode::Enter)).as_slice(), [Effect::ExecSsh(id)] if id == "dh-ready")
+        );
+        assert!(
+            matches!(a.update(key(KeyCode::Char('x'))).as_slice(), [Effect::Stop(id)] if id == "dh-ready")
+        );
+        assert!(a.update(key(KeyCode::Char('r'))).is_empty());
+        assert!(a.status.contains("already up"));
+
+        // Stopped: Enter explains, r -> resume, x -> explains.
+        a.update(key(KeyCode::Down));
+        assert!(a.update(key(KeyCode::Enter)).is_empty());
+        assert!(a.status.contains("press r"));
+        assert!(
+            matches!(a.update(key(KeyCode::Char('r'))).as_slice(), [Effect::Resume(id)] if id == "dh-stopped")
+        );
+        assert!(a.update(key(KeyCode::Char('x'))).is_empty());
+
+        // k toggles keep; R refreshes.
+        assert!(
+            matches!(a.update(key(KeyCode::Char('k'))).as_slice(), [Effect::Keep(id, true)] if id == "dh-stopped")
+        );
+        assert!(matches!(
+            a.update(key(KeyCode::Char('R'))).as_slice(),
+            [Effect::LoadSessions]
+        ));
     }
 
     #[test]
