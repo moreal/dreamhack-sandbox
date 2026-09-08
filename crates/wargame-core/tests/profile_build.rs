@@ -568,17 +568,15 @@ async fn init_refuses_a_name_that_already_exists() {
     let err = profile_build::init(&f.ctx, "kali-arm64", "kali-custom")
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, WargameError::InvalidProfile { .. }),
-        "{err:?}"
-    );
+    assert!(err.to_string().contains("already exists"), "{err}");
+    // The message carries the recovery step, so no misleading "check the
+    // provisioning log" hint is attached to it.
+    assert_eq!(err.hint(), None, "{err}");
+
     let err = profile_build::init(&f.ctx, "kali-arm64", "kali-arm64")
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, WargameError::InvalidProfile { .. }),
-        "{err:?}"
-    );
+    assert!(err.to_string().contains("template"), "{err}");
 }
 
 // --- profile create -------------------------------------------------------
@@ -737,6 +735,11 @@ async fn create_on_a_tart_profile_explains_that_tart_uses_image_base() {
     let message = err.to_string();
     assert!(message.contains("image.base"), "{message}");
     assert!(message.contains("profile build"), "{message}");
+    assert_eq!(
+        err.hint(),
+        None,
+        "the message already names the next command"
+    );
     assert!(f.tart.calls().is_empty());
 }
 

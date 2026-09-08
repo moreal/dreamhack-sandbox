@@ -42,6 +42,17 @@ use super::AppContext;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
+/// "You asked for the wrong thing, and here is the right thing" -- a
+/// refusal whose *message* already names the next command.
+///
+/// Deliberately not [`WargameError::InvalidProfile`]: that variant's hint
+/// sends the user to the provisioning log, which is exactly where the answer
+/// is *not* when a profile is fine and the command simply does not apply to
+/// it (spec.md §6 wants the recovery step, not a wrong one).
+fn refuse(profile: &str, reason: impl std::fmt::Display) -> WargameError {
+    WargameError::Other(format!("profile {profile}: {reason}"))
+}
+
 /// The exit code a provisioning script uses to say "reboot me, then carry
 /// on with the next script" -- the Windows Update/MSI convention, reused for
 /// every guest so one profile can mix scripts that need it (spec.md §3 FR-3:
@@ -126,22 +137,22 @@ pub async fn init(ctx: &AppContext, template: &str, new_name: &str) -> Result<In
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        return Err(WargameError::InvalidProfile {
-            name: new_name.to_string(),
-            reason: "a profile name may only contain letters, digits, '-', '_' and '.'".to_string(),
-        });
+        return Err(refuse(
+            new_name,
+            "a profile name may only contain letters, digits, '-', '_' and '.'",
+        ));
     }
     if new_name == template {
-        return Err(WargameError::InvalidProfile {
-            name: new_name.to_string(),
-            reason: format!("{template} is the template; pick a different --name"),
-        });
+        return Err(refuse(
+            new_name,
+            format!("{template} is the template; pick a different --name"),
+        ));
     }
     if ctx.profiles.get(new_name).is_ok() {
-        return Err(WargameError::InvalidProfile {
-            name: new_name.to_string(),
-            reason: "a profile with this name already exists; pick another --name or edit the existing one".to_string(),
-        });
+        return Err(refuse(
+            new_name,
+            "a profile with this name already exists; pick another --name or edit the existing one",
+        ));
     }
 
     let template_profile = ctx.profiles.get(template)?;
@@ -149,10 +160,10 @@ pub async fn init(ctx: &AppContext, template: &str, new_name: &str) -> Result<In
     let profiles_dir = ctx.profiles.user_dir().to_path_buf();
     let yaml_path = profiles_dir.join(format!("{new_name}.yaml"));
     if yaml_path.exists() {
-        return Err(WargameError::InvalidProfile {
-            name: new_name.to_string(),
-            reason: format!("{} already exists", yaml_path.display()),
-        });
+        return Err(refuse(
+            new_name,
+            format!("{} already exists", yaml_path.display()),
+        ));
     }
 
     let mut new_yaml = rename_in_yaml(&yaml, &template_profile.name, new_name)?;
@@ -189,14 +200,14 @@ pub async fn init(ctx: &AppContext, template: &str, new_name: &str) -> Result<In
     std::fs::write(&yaml_path, &new_yaml)?;
     let profile = Profile::from_yaml(&new_yaml)?;
     if profile.name != new_name {
-        return Err(WargameError::InvalidProfile {
-            name: new_name.to_string(),
-            reason: format!(
+        return Err(refuse(
+            new_name,
+            format!(
                 "the copied template still calls itself {:?}; edit {} by hand",
                 profile.name,
                 yaml_path.display()
             ),
-        });
+        ));
     }
     Ok(InitOutcome {
         profile,
@@ -278,13 +289,13 @@ pub async fn create(
     let execution = resolve_backend(&profile)?;
     let builder = ctx.builders.get(execution.backend.as_str())?;
     if !builder.uses_installer_vm() {
-        return Err(WargameError::InvalidProfile {
-            name: profile.name.clone(),
-            reason: format!(
-                "{} profiles build from `image.base`, not from an installation VM: `profile create` is for UTM profiles that install an OS from an ISO or clone an installed VM. Run `wargame profile build {}` instead",
+        return Err(refuse(
+            &profile.name,
+            format!(
+                "{} profiles build from `image.base`, not from an installation VM. `profile create` is for UTM profiles that install an OS from an ISO or clone an installed VM; run `wargame profile build {}` instead",
                 execution.backend, profile.name
             ),
-        });
+        ));
     }
 
     // Everything that can be judged from data alone happens before any VM
@@ -294,9 +305,9 @@ pub async fn create(
 
     if let Some(existing) = ctx.builds.load(&profile.name).await? {
         if !existing.source.same_as(&source) {
-            return Err(WargameError::InvalidProfile {
-                name: profile.name.clone(),
-                reason: format!(
+            return Err(refuse(
+                &profile.name,
+                format!(
                     "this profile is already attached to {} (installation VM {}). A profile has exactly one image source; to build from {} instead, make a new profile: `wargame profile init {} --name <new-name>`",
                     existing.source.describe(),
                     existing
@@ -307,7 +318,7 @@ pub async fn create(
                     source.describe(),
                     profile.name,
                 ),
-            });
+            ));
         }
         let guidance = create_guidance(ctx, &profile, &existing, true);
         return Ok(CreateOutcome {
@@ -499,13 +510,13 @@ pub async fn console(ctx: &AppContext, profile_name: &str) -> Result<()> {
     let execution = resolve_backend(&profile)?;
     let builder = ctx.builders.get(execution.backend.as_str())?;
     if !builder.uses_installer_vm() {
-        return Err(WargameError::InvalidProfile {
-            name: profile.name.clone(),
-            reason: format!(
+        return Err(refuse(
+            &profile.name,
+            format!(
                 "`profile console` opens the installation VM of a UTM profile; {} profiles build from `image.base` and have no installation VM. Use `wargame gui <session>` for a session's console",
                 execution.backend
             ),
-        });
+        ));
     }
     let record = require_record(ctx, &profile).await?;
     let vm = record
@@ -547,10 +558,10 @@ pub async fn build(
     // provisioning path, which is the next task. Refuse here, before the VM
     // is touched at all, rather than half-provisioning a guest.
     if GuestShell::for_os(profile.guest.os) == GuestShell::PowerShell {
-        return Err(WargameError::InvalidProfile {
-            name: profile.name.clone(),
-            reason: "Windows provisioning arrives in Task 5: this build would have to run PowerShell in the guest, and no PowerShell guest transport is wired yet. `profile create` and `profile console` already work, so the installation VM can be prepared in the meantime".to_string(),
-        });
+        return Err(refuse(
+            &profile.name,
+            "Windows provisioning arrives in Task 5: this build would have to run PowerShell in the guest, and no PowerShell guest transport is wired yet. `profile create` and `profile console` already work, so the installation VM can be prepared in the meantime",
+        ));
     }
 
     let mut record = match ctx.builds.load(&profile.name).await? {
@@ -566,13 +577,13 @@ pub async fn build(
         ),
     };
     if record.backend != execution.backend.as_str() {
-        return Err(WargameError::InvalidProfile {
-            name: profile.name.clone(),
-            reason: format!(
+        return Err(refuse(
+            &profile.name,
+            format!(
                 "its build record was made for the {} backend but the profile now resolves to {}. Make a new profile (`wargame profile init <template> --name <new>`) rather than re-pointing this one",
                 record.backend, execution.backend
             ),
-        });
+        ));
     }
 
     let scripts_dir = ctx.profiles.user_dir().to_path_buf();
