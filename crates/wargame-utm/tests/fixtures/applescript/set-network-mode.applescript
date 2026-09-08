@@ -1,3 +1,14 @@
+-- Switch the first network interface between UTM's four modes.
+-- usage: osascript set-network-mode.applescript <vm-name> <shared|host|emulated|bridged>
+-- Verified mapping to the generated QEMU command line:
+--   shared   -> -netdev vmnet-shared            (NAT with WAN routing)
+--   host     -> -netdev vmnet-host              (no WAN routing; FR-6 `isolated` candidate)
+--   emulated -> -netdev user,...,hostfwd=...    (libslirp; port forwards only work here)
+--   bridged  -> -netdev vmnet-bridged,ifname=en0
+-- NOTE 1: `port forwards` is honoured only in `emulated` mode.
+-- NOTE 2: `host interface` is only meaningful for `bridged`; a stale value is ignored
+--   by the other modes.
+-- NOTE 3: the VM must be `stopped`, else -2700.
 on run argv
 	set vmName to item 1 of argv
 	set m to item 2 of argv

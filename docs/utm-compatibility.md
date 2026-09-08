@@ -35,7 +35,13 @@ lives in; the Homebrew symlink and the bundle path resolve to the same binary (b
 | UTM (recommended floor) | **4.3** | UTM 4.3 release notes add "TPM 2.0 and Secure Boot … required for Windows 11 updates to 22H2". Windows 11 needs it (§6). |
 | UTM (verified) | **4.7.5** only | everything in this document |
 
-`doctor` should therefore require UTM ≥ 4.3 and record that only 4.7.5 has been exercised.
+**Decision: `doctor` requires UTM ≥ 4.3.** 4.2 is the point below which nothing works at all, but
+Windows 11 is a release requirement (spec §1) and needs the TPM 2.0 / Secure Boot toggles that
+arrived in 4.3, so 4.3 is the single number to check. Report anything below 4.3 as unsupported and
+anything other than 4.7.5 as untested.
+
+Every row in that table is **unverified except the 4.7.5 row**: the floors are read off UTM's own
+release notes and `Info.plist`, not reproduced. Only UTM 4.7.5 on macOS 26.6.2 was executed.
 
 ### `utmctl` discovery (FR-6)
 
@@ -80,6 +86,23 @@ Keep using `ProcessRunner` argv arrays; never build a shell string.
   (`com.apple.security.app-sandbox`), so **the adapter must not try to inspect `.utm` bundles on
   disk** — every read has to go through the scripting API.
 
+### Matching on UTM's error output
+
+UTM and `osascript` emit **typographic** apostrophes and quotes (U+2019 `’`, U+201C/D `“ ”`) —
+`The operation couldn’t be completed`, `Can’t make … into type text`. The committed fixtures keep
+them byte-exact; this document straightens them for readability, so **never copy prose out of this
+document into a matcher**.
+
+Match on the stable parts instead, in this order:
+
+1. the numeric code — `-1700`, `-1712`, `-1728`, `-1743`, `-2700`, `-609`, `-10004`;
+2. the ASCII-only prefix — `Error from event:` (Apple Event failure, `utmctl` exit 0) or
+   `Error:` (`utmctl`'s own failure, exit 1);
+3. the ASCII-only second line where UTM supplies one, e.g. `The virtual machine is not running.`,
+   `Virtual machine not found.`, `The QEMU guest agent is not running or not installed on the guest.`
+
+Never match a sentence containing an apostrophe.
+
 ## 2. Operation matrix
 
 `AS` = AppleScript via `osascript`. Every "verified" row was run against an app-owned
@@ -91,8 +114,8 @@ Keep using `ProcessRunner` argv arrays; never build a shell string.
 | List VMs | both | `utmctl list` (UUID / Status / Name columns) | **verified** |
 | Create VM | **AS only** | `make new virtual machine with properties {backend:qemu, configuration:{name:…, architecture:"aarch64"\|"x86_64", memory:…, cpu cores:…, hypervisor:…, uefi:true, drives:{{removable:true, source:isoFile}, {guest size:20480}}}}` | **verified**, returns a specifier (id + name) |
 | Attach ISO at create | **AS only** | `drives:{{removable:true, source:isoFile}}` | **verified**; `host size` of the drive comes back as the ISO size in MiB (3788 / 4580) |
-| Attach a *second* ISO | **AS only** | `set drives of c to (drives of c) & {{removable:true, source:isoFile}}` + `update configuration` | **verified** (needed for the Windows guest-tools CD) |
-| Replace an ISO | **AS only** | `set item 1 of drives of c to {id:i, source:isoFile}` + `update configuration` | **verified** |
+| Attach a *second* ISO | **AS only** | `set drives of c to (drives of c) & {{removable:true, source:isoFile}}` + `update configuration` | **verified**, transcript §2 — a third drive appears with `hostMiB=4580` (the amd64 ISO). Needed for the Windows guest-tools CD |
+| Replace an ISO | **AS only** | `set item 1 of drives of c to {id:i, source:isoFile}` + `update configuration` | **verified**, transcript §3 — drive 1's `hostMiB` goes 3788 → 4580 after pointing it at the other ISO |
 | Change any setting | **AS only** | `update configuration of vm with c` | **verified**; **VM must be `stopped`**, else `-2700 The virtual machine must be stopped before this operation can be performed` |
 | Add / remove display | **AS only** | `set displays of c to {{hardware:"virtio-ramfb"}}` / `set displays of c to {}` | **verified** |
 | Set network mode | **AS only** | `set item 1 of network interfaces of c to {index:n, mode:host}` | **verified** for all four modes (§5) |
@@ -103,24 +126,67 @@ Keep using `ProcessRunner` argv arrays; never build a shell string.
 | Start | both | `utmctl start <id>` / `start vm` | **verified**; `started` in ~2 s (arm64) / ~6 s (x86_64 TCG) |
 | Start disposable | both | `utmctl start <id> --disposable` / `start vm without saving` | **unverified** (flag exists in `--help` and the sdef) |
 | Start recovery | both | `utmctl start <id> --recovery` / `start vm with recovery` | **unverified** |
-| Suspend (pause) | both | `utmctl suspend <id>` / `suspend vm` | **verified** → `paused` |
-| Suspend + save state | both | `utmctl suspend <id> --save-state` | **verified** → `paused` |
-| Resume | both | `utmctl start <id>` / `start vm` | **verified** `paused` → `started` |
+| Suspend (pause) | both | `utmctl suspend <id>` / `suspend vm` | **verified**, transcript §10 → `paused` |
+| Suspend + save state | both | `utmctl suspend <id> --save-state` | **verified**, transcript §10 → also `paused`, no distinct status |
+| Resume | both | `utmctl start <id>` / `start vm` | **verified**, transcript §10, `paused` → `started` |
 | Stop (ACPI/force) | both | `utmctl stop <id>` / `stop vm by force` | **verified** for arm64 `virt` (1 s); **hung in `stopping` > 60 s** for x86_64 `q35` sitting in GRUB |
 | Stop (kill) | both | `utmctl stop <id> --kill` / `stop vm by kill` | **verified**, `stopped` immediately, QEMU process gone within seconds |
 | Stop (guest request) | both | `utmctl stop <id> --request` | **unverified** (needs an installed OS) |
 | Delete | both | `utmctl delete <id>` / `delete virtual machine …` | **verified**, no confirmation |
-| Export bundle | **AS only** | `export virtual machine named … to POSIX file "…/x.utm"` | **verified** (524 KB for a diskless VM) |
-| Import bundle | **AS only** | `import new virtual machine from POSIX file "…/x.utm"` | **verified**; **keeps the source display name**, so two VMs shared a name |
+| Export bundle | **AS only** | `export virtual machine named … to POSIX file "…/x.utm"` | **verified**, transcript §11 — 964 KB for a VM whose disk is an untouched sparse qcow2 |
+| Import bundle | **AS only** | `import new virtual machine from POSIX file "…/x.utm"` | **verified**, transcript §11 — returns a specifier, but **keeps the source display name**, so `utmctl list` then showed two VMs called `wargame-t1-evidence` |
 | Serial console address | **AS only** | `address of first serial port of vm` | **verified**, `/dev/ttys010` while running, **empty string while stopped** |
-| Serial console attach | — | `utmctl attach <id>` | **verified BROKEN**: prints `WARNING: attach command is not implemented yet!` then `PTTY: /dev/ttys010`, exit 0 |
+| Serial console attach | — | `utmctl attach <id>`, `utmctl start <id> --attach` | **verified BROKEN**, transcript §14: both print `WARNING: attach command is not implemented yet!` on stdout and exit 0; `attach` adds the ptty path and neither streams anything |
 | Graphical console | app UI | display device configured → UTM opens a window named after the VM | **verified** (§3) |
 | Guest IP | both | `utmctl ip-address <id>` / `query ip of vm` | **verified failure** pre-install: `The QEMU guest agent is not running or not installed on the guest` |
 | Guest exec | both | `utmctl exec <id> --cmd …` / `execute of vm at …` | **verified failure** pre-install, same reason |
 | Guest file push/pull | both | `utmctl file push\|pull` / `open file of vm at …` | **unverified** (needs the guest agent) |
 | USB attach | both | `utmctl usb …` / `connect device to vm` | **unverified**, not needed |
-| Input automation | **AS only** | `input scan code of vm codes {28, 156}`, `input keystroke of vm text "…"` | **verified** (exit 0, GRUB redrew in response); QEMU backend only |
+| Input automation | **AS only** | `input scan code of vm codes {28, 156}`, `input keystroke of vm text "…"` | **verified**, transcript §9 (exit 0; separately, GRUB redrew in response to a scan code); QEMU backend only |
 | Hide the UTM window | — | `utmctl … --hide` | **verified BROKEN**: emits `OSStatus error -10004` twice; see §4 |
+
+### State machine: the `status` and `backend` enumerations
+
+Quoted from `utm-4.7.5.sdef`. These are the complete sets — the adapter's state machine can be
+written from this table alone.
+
+`status` (enumeration `VmEs`), the value returned by `status of vm` and printed by `utmctl status`:
+
+| Value | sdef description | Observed on this host |
+|---|---|---|
+| `stopped` | "VM is not running." | yes — the resting state; **the only state in which `update configuration` is accepted** |
+| `starting` | "VM is starting up." | not observed (start reached `started` within the 1 s polling interval) |
+| `started` | "VM is running." | yes |
+| `pausing` | "VM is going to pause." | not observed (transient) |
+| `paused` | "VM is paused." | yes — after `suspend`, with or without `--save-state`. **`stop` refuses a paused VM** ("The virtual machine is not running", exit 0); resume it with `start` first |
+| `resuming` | "VM is resuming from pause." | not observed (transient) |
+| `stopping` | "VM is stopping." | yes — and it can persist (>60 s for an x86_64 TCG VM at the GRUB prompt). **`update configuration` fails here with -2700**, so poll for `stopped`, never for "not `started`" |
+
+Transitions verified end to end in `readback-transcript.txt` §10:
+`stopped --start--> started --suspend--> paused --start--> started --suspend --save-state--> paused
+--start--> started --stop--> stopped`. There is no separate "saved" status: `suspend --save-state`
+also lands in `paused`.
+
+`backend` (enumeration `VmEb`), the value returned by `backend of vm`:
+
+| Value | sdef description |
+|---|---|
+| `apple` | "Apple Virtualization.framework backend." |
+| `qemu` | "QEMU backend." — the only one this project uses |
+| `unavailable` | "The virtual machine is not currently available." |
+
+**`unavailable` matters.** It is not an error; it is a third value a registered VM can report, and
+the dictionary gives no way to ask *why*. Treat it as "this VM exists in UTM's registry but its
+backend cannot be used right now" — map it to the spec's `Missing`/unusable state, never delete on
+it, and re-read before acting. It was **not** reproduced on this host, so its exact trigger is
+**unverified**.
+
+Two related lifecycle rules, both verified:
+
+- `status` is not enough on its own after a stop — see trap T12, where the QEMU process outlived a
+  `stop --kill` while `utmctl status` already said `stopped`.
+- `stop` and `start` are Apple Events with the exit-code defect from T1; always re-read `status`
+  rather than trusting the verb's return.
 
 ### What is AppleScript-only
 
@@ -150,11 +216,21 @@ for.
   `--hide` (whose help says "Hide the main UTM window") is broken (§4).
 - **Verified:** the serial ptty is the machine-readable console. Get it from
   `address of first serial port of vm` **after** the VM reports `started` (it is `""` while
-  stopped) and read the device directly; `utmctl attach` is a stub.
+  stopped) and read the device directly.
+- **Verified:** there is no working attach verb. `utmctl attach <id>` **and**
+  `utmctl start <id> --attach` (help text: "Attach to the first serial port after start") are the
+  same stub — both print `WARNING: attach command is not implemented yet!` on **stdout** and exit
+  0, `attach` additionally prints `PTTY: /dev/ttysNNN`, and neither streams a byte
+  (`readback-transcript.txt` §14). `start --attach` does still start the VM, so it is not inert —
+  it is a normal start with a misleading warning. Use plain `start` and read the ptty yourself.
+- **Verified:** the `serial ports` list of a *configuration record* reads back empty (T5), so the
+  ptty path is only reachable through the VM element, never through the configuration.
 
 ## 4. Defects and traps found (with evidence)
 
-Each of these changes what a `wargame-utm` adapter has to do.
+Twelve of them. Each changes what a `wargame-utm` adapter has to do. Raw output for every one is
+in `crates/wargame-utm/tests/fixtures/`; the readback-heavy ones cite
+`readback-transcript.txt` by section.
 
 ### T1. `utmctl` exit codes do not report Apple-Event failures
 
@@ -229,18 +305,55 @@ the ISO path and the requested disk size in the app's own build record (spec §5
 UTM as write-mostly. `host size` (MiB, host-side allocation) is the only usable cross-check: it
 equals the ISO size for a removable drive and `0` for a fresh sparse qcow2.
 
-Two smaller quirks: `count of drives of c` returns **0** while `length of (drives of c)` returns
-the real count (use `length` or a `repeat` loop); and `POSIX file <variable>` must be evaluated
-**outside** the `tell application "UTM"` block, otherwise UTM resolves the path in its own sandbox
-and fails with `-1728 Can't get POSIX file "…"`.
+Three related quirks, all in `readback-transcript.txt` §4:
+
+- `count of <any list property>` returns **0**. Use `length of (…)` or a `repeat` loop.
+- **`serial ports` of a configuration record is unreachable as a list** — loop, `count of` and
+  `length of` all give 0, even though the flattened whole-record dump plainly contains
+  `serial ports:port:0, index:0, interface:ptty, hardware:`. `drives`, `displays`,
+  `network interfaces` and `qemu additional arguments` all behave normally. To reach the serial
+  console use the VM element (`address of first serial port of vm`), which works, not the
+  configuration record.
+
+  ```
+  drives: loop=3 count-of=0 length-of=3  ||  serial ports: loop=0 count-of=0 length-of=0
+  ```
+- `POSIX file <variable>` must be evaluated **outside** the `tell application "UTM"` block,
+  otherwise UTM resolves the path in its own sandbox and fails with `-1728 Can't get POSIX file "…"`.
+
+One more shape worth knowing: `make` with the `drives` key omitted entirely still produces a VM
+with a removable CD (no image) plus a blank disk — visible in the orphan VM's argv in
+`readback-transcript.txt` §15 as `-drive if=none,media=cdrom,id=…,readonly=on` with no
+`file.filename`. Always pass `drives` explicitly.
 
 ### T6. `hypervisor` is silently ignored for a non-matching architecture
 
-The x86_64 VM was reconfigured with `hypervisor:true` and started; the generated command line is
-still `-accel tcg,tb-size=1024` (fixture
-`qemu-argv-x86_64-emulate-hypervisor-on-ignored.txt`). The official docs say the same:
-"If the guest architecture does not match the host, virtualization will not be used even if enabled
-in the QEMU settings."
+The x86_64 VM was created with `hypervisor:false`, started, stopped, reconfigured to
+`hypervisor:true`, and started again. The configuration readback changes; the accelerator does not
+(`readback-transcript.txt` §12):
+
+```
+$ osascript … 'return "config readback hypervisor=" & ((hypervisor of c) as text)'
+config readback hypervisor=false
+$ ps -Aww -o command | grep qemu-x86_64-softmmu | grep -v grep | grep -oE '\-accel [^ ]+|\-smp [^ ]+|\-cpu [^ ]+'
+-cpu Skylake-Client
+-smp cpus=4,sockets=1,cores=4,threads=1
+-accel tcg,tb-size=1024
+$ osascript … 'set hypervisor of c to true; update configuration of vm with c; return "update issued"'
+update issued
+$ osascript … 'return "config readback hypervisor=" & ((hypervisor of c) as text)'
+config readback hypervisor=true
+$ ps -Aww -o command | grep qemu-x86_64-softmmu | grep -v grep | grep -oE '\-accel [^ ]+|\-smp [^ ]+|\-cpu [^ ]+'
+-cpu Skylake-Client
+-smp cpus=4,sockets=1,cores=4,threads=1
+-accel tcg,tb-size=1024
+```
+
+(The two committed argv fixtures for this VM, `qemu-argv-x86_64-emulate-hypervisor-off.txt` and
+`…-on-ignored.txt`, are byte-identical *because that is the finding* — the configuration flip is
+invisible in the command line. The readback above is what distinguishes the two runs.)
+The official docs say the same: "If the guest architecture does not match the host, virtualization
+will not be used even if enabled in the QEMU settings."
 
 *Resolution:* FR-1 forbids silently changing mode, and UTM will not tell us it downgraded. Our
 compat layer must reject `mode: virtualize` for `x86_64` on an Apple Silicon host **before**
@@ -288,7 +401,7 @@ process was gone within seconds. Meanwhile `update configuration` on a `stopping
 
 *Resolution:* separate stop timeouts as FR-5 requires, poll `utmctl status` until `stopped` (not
 just `stop`'s return), escalate `force → kill` on timeout, and gate every configuration write on
-an observed `stopped`.
+an observed `stopped`. But `stopped` is still not sufficient — see T12.
 
 ### T10. `qemu additional arguments` is a real escape hatch
 
@@ -303,6 +416,41 @@ Setting `displays` to `{{hardware:"definitely-not-a-card"}}` returned exit 0 and
 used"), so an invalid value is not reported.
 
 *Resolution:* validate display/network hardware names in our layer; do not expect UTM to complain.
+
+### T12. `stop --kill` can leave an orphan QEMU process that UTM reports as stopped
+
+Reproduced on a small aarch64 VM (`readback-transcript.txt` §15). After `utmctl stop … --kill`,
+`utmctl status` said `stopped` **within 1 s while the QEMU process was still alive** — parented to
+UTM's `QEMUHelper` XPC service, in state `R`, still there minutes later. Every subsequent start of
+that VM then failed on the firmware variable store, and (per T1) still exited 0:
+
+```
+$ utmctl stop wargame-t1-attach --kill && utmctl status wargame-t1-attach
+stopped
+$ ps -o pid,ppid,stat,etime -p $(pgrep -f qemu-aarch64-softmmu)
+  PID  PPID STAT ELAPSED
+58445 92742 R      03:07          # ppid 92742 = UTM's QEMUHelper
+$ utmctl start wargame-t1-attach                        # stderr; exit 0
+Error from event: The operation couldn't be completed. (OSStatus error -2700.)
+QEMU error: QEMU exited from an error: Is another process using the image
+[/Users/moreal/Library/Containers/com.utmapp.UTM/Data/Documents/wargame-t1-attach.utm/Data/efi_vars.fd]?
+$ utmctl status wargame-t1-attach
+stopped
+```
+
+Waiting did not help — the same failure reproduced after 0 s, 3 s and 10 s of extra wait. Recovery
+was `kill -9 <orphan pid>`, after which `utmctl start` succeeded and `status` went to `started`.
+
+This is the mirror image of the existing Tart bug 13 in `docs/verification.md`: there the record
+said `running` while the VM had stopped; here UTM says `stopped` while the backend is still up.
+
+*Resolution:* the adapter must not treat `status == stopped` as "the VM's files are free". After a
+stop, before any restart, clone, `update configuration` or delete, confirm no
+`qemu-*-softmmu` process carries this VM's `-uuid`; `ps -Aww -o command` shows the full argv, and
+the QEMU `-uuid` matches UTM's VM id exactly, so ownership is unambiguous and no name matching is
+needed. Surface the `Is another process using the image` text as a distinct, recoverable error with
+the orphan pid in the message rather than a generic start failure. FR-5's "실패 시 단계별 정리와
+정리 실패를 기록한다" should cover this case explicitly.
 
 ## 5. Network modes (FR-6)
 
@@ -325,11 +473,37 @@ argv for each is committed. Additional **verified** facts:
   contains `hostfwd=`). Multiple forwards and `host address` / `guest address` round-trip.
 - `host interface` is only meaningful for `bridged`; a stale value left over from a bridged run is
   ignored by the other modes (the `host` and `shared` argv contain no `ifname=`).
-- While the `host`-mode VM ran, a fresh `bridge104` appeared at **`192.168.128.1/24`** with member
-  `vmenet4` — i.e. **macOS `vmnet` host mode gives the host `.1` on the guest's own segment**, which
-  is the "host management connection" FR-6 wants. (Each mode switch left its previous vmnet bridge
-  behind: `bridge100`–`bridge103` were still present from the earlier `shared`/`emulated`/`bridged`
-  runs. Harmless, but `doctor` should not treat "a vmnet bridge exists" as evidence of anything.)
+- **Verified — the host gets an address on the guest's segment.** With the VM stopped, four stale
+  vmnet bridges existed; starting it in `host` mode added `bridge104`, and only then
+  (`readback-transcript.txt` §6–§7):
+
+  ```
+  $ ifconfig | awk '/^bridge1[0-9][0-9]:/{b=substr($1,1,length($1)-1)} /inet /{if(b!=""){print b, $2; b=""}}'
+  bridge100 192.168.139.3          # before start
+  bridge101 192.168.194.0
+  bridge102 192.168.215.0
+  bridge103 192.168.117.0
+  $ utmctl start wargame-t1-evidence && sleep 8 && utmctl status wargame-t1-evidence
+  started
+  $ ps -Aww -o command | grep qemu-aarch64-softmmu | grep -v grep | grep -oE '\-netdev [^ ]+'
+  -netdev vmnet-host,id=net0
+  $ ifconfig | awk '…'                # after start — bridge104 is new
+  bridge100 192.168.139.3
+  bridge101 192.168.194.0
+  bridge102 192.168.215.0
+  bridge103 192.168.117.0
+  bridge104 192.168.128.1
+  $ ifconfig bridge104
+  bridge104: flags=8a63<UP,BROADCAST,SMART,RUNNING,ALLMULTI,SIMPLEX,MULTICAST> mtu 1500
+      inet 192.168.128.1 netmask 0xffffff00 broadcast 192.168.128.255
+      member: vmenet4 flags=3<LEARNING,DISCOVER>
+  ```
+
+  So **macOS `vmnet` host mode gives the host `.1` on the guest's own segment**, which is the "host
+  management connection" half of FR-6. The guest-side half (that the guest cannot reach the LAN or
+  the internet) is still **unverified** — see "Which mode is FR-6's `isolated`?" below.
+  Note that each mode switch left its previous vmnet bridge behind (`bridge100`–`bridge103` above
+  are leftovers), so `doctor` must not treat "a vmnet bridge exists" as evidence of anything.
 - No sudo, no sudoers rule, no helper daemon: UTM's own `com.apple.vm.networking` entitlement
   covers `vmnet-shared`, `vmnet-host` and `vmnet-bridged`.
 
@@ -566,3 +740,5 @@ All `wargame-t1-*` VMs created here were deleted (`utmctl list` empty at the end
 | 5 | `SHA256SUMS.gpg` verification for downloaded ISOs (FR-2) | adapter task |
 | 6 | Re-measure the `emulate` boot timeout against a real installed guest (FR-5's 1800 s) | real-VM verification |
 | 7 | `--disposable` / `--recovery` / `stop --request` / guest file push-pull / USB — dictionary entries never exercised | as needed |
+| 8 | Orphan-QEMU detection after stop (T12) — match `qemu-*-softmmu` argv `-uuid` against the VM id, and a recovery path for the `efi_vars.fd` lock | adapter task |
+| 9 | `backend: unavailable` — the third value of the `backend` enum was never reproduced; find its trigger and map it to the session `Missing` state | adapter task |

@@ -1,0 +1,400 @@
+### Consolidated readback transcript — UTM 4.7.5 / macOS 26.6.2 / 2026-09-08T17:24:46Z
+
+# PROVENANCE. Sections 0-13 and 16 are captured verbatim by the driver
+# (readback-transcript.sh): it echoes each command, runs it, and prints its exit code.
+# Sections 14 and 15 were TRANSCRIBED BY HAND from separate runs made with stdout and
+# stderr captured to different files, because the point of those two sections is which
+# stream each line arrives on and what the real exit code is -- information the inline
+# `2>&1` driver destroys. The quoted lines are byte-exact from those runs; the `$ ...`
+# lines above them are the commands that produced them.
+# The committed readback-transcript.sh is that same driver with two paths parameterised
+# (AS defaults to ./applescript, OUT to $TMPDIR); the run recorded here used absolute
+# scratchpad paths, which is why they appear in full below.
+
+## 0. app handshake (trap T8)
+$ open -a UTM
+exit=0
+
+$ until utmctl version >/dev/null 2>&1; do sleep 1; done; utmctl version
+4.7.5
+exit=0
+
+## 1. create an aarch64 VM (hypervisor on, UEFI, ISO + 20 GiB disk)
+$ osascript /Users/moreal/github/moreal/dreamhack-sandbox/crates/wargame-utm/tests/fixtures/applescript/create-qemu-vm.applescript wargame-t1-evidence aarch64 true '/Users/moreal/Library/Application Support/wargame-vm/iso/kali-linux-2026.2-installer-arm64.iso'
+E9B23A90-FB74-4781-82A8-228D19292CB4	wargame-t1-evidence	arch=aarch64	machine=virt	hypervisor=true	uefi=true	netmode=shared
+exit=0
+
+## 2. attach a SECOND removable drive (the Windows guest-tools CD case)
+$ osascript /Users/moreal/github/moreal/dreamhack-sandbox/crates/wargame-utm/tests/fixtures/applescript/add-removable-drive.applescript wargame-t1-evidence '/Users/moreal/Library/Application Support/wargame-vm/iso/kali-linux-2026.2-installer-amd64.iso'
+drives now:
+  id=E330EFCA-A986-4ED6-BF57-D3B7D09EA686 removable=true iface=USB hostMiB=3788
+  id=5019F6B5-6FAF-4305-8E27-4DB78160A0DA removable=false iface=VirtIO hostMiB=0
+  id=B0F44FD2-0019-4329-86B6-BE0240D15E9C removable=true iface=USB hostMiB=4580
+
+exit=0
+
+## 3. replace the ISO backing the FIRST removable drive
+$ osascript /Users/moreal/github/moreal/dreamhack-sandbox/crates/wargame-utm/tests/fixtures/applescript/set-iso-source.applescript wargame-t1-evidence '/Users/moreal/Library/Application Support/wargame-vm/iso/kali-linux-2026.2-installer-amd64.iso'
+drive 1 id=E330EFCA-A986-4ED6-BF57-D3B7D09EA686 hostMiB=4580
+exit=0
+
+# host size of drive 1 now matches the amd64 ISO (4580 MiB), drive 3 still the amd64 one too
+$ osascript /Users/moreal/github/moreal/dreamhack-sandbox/crates/wargame-utm/tests/fixtures/applescript/show-drives.applescript wargame-t1-evidence
+drives (3):
+  [1] id=E330EFCA-A986-4ED6-BF57-D3B7D09EA686 removable=true iface=USB hostMiB=4580
+  [2] id=5019F6B5-6FAF-4305-8E27-4DB78160A0DA removable=false iface=VirtIO hostMiB=0
+  [3] id=B0F44FD2-0019-4329-86B6-BE0240D15E9C removable=true iface=USB hostMiB=4580
+
+exit=0
+
+## 4. T5 quirk: 'count of' is always 0; 'length of' works except for serial ports
+$ osascript -e 'tell application "UTM"
+	set c to configuration of (virtual machine named "wargame-t1-evidence")
+	set d to 0
+	repeat with x in (drives of c)
+		set d to d + 1
+	end repeat
+	set sp to 0
+	repeat with x in (serial ports of c)
+		set sp to sp + 1
+	end repeat
+	return "drives: loop=" & (d as text) & " count-of=" & ((count of drives of c) as text) & " length-of=" & ((length of (drives of c)) as text) & "  ||  serial ports: loop=" & (sp as text) & " count-of=" & ((count of serial ports of c) as text) & " length-of=" & ((length of (serial ports of c)) as text)
+end tell'
+drives: loop=3 count-of=0 length-of=3  ||  serial ports: loop=0 count-of=0 length-of=0
+exit=0
+
+# ...yet the flattened whole-record dump clearly contains the serial port:
+$ osascript /Users/moreal/github/moreal/dreamhack-sandbox/crates/wargame-utm/tests/fixtures/applescript/dump-configuration.applescript wargame-t1-evidence
+icon:, cpu cores:4, directory share mode:WebDAV, qemu additional arguments:, hypervisor:true, notes:, serial ports:port:0, index:0, interface:ptty, hardware:, displays:, architecture:aarch64, uefi:true, drives:removable:true, host size:4580, id:E330EFCA-A986-4ED6-BF57-D3B7D09EA686, interface:USB, removable:false, id:5019F6B5-6FAF-4305-8E27-4DB78160A0DA, host size:0, interface:VirtIO, removable:true, host size:4580, id:B0F44FD2-0019-4329-86B6-BE0240D15E9C, interface:USB, network interfaces:host interface:, index:0, hardware:virtio-net-pci, mode:shared, port forwards:, address:AA:5B:5D:2E:EC:1C, memory:4096, machine:virt, name:wargame-t1-evidence
+exit=0
+
+## 5. qemu additional arguments round-trip (T10)
+$ osascript -e 'tell application "UTM"
+	set vm to virtual machine named "wargame-t1-evidence"
+	set c to configuration of vm
+	set qemu additional arguments of c to {{argument string:"-device"}, {argument string:"virtio-balloon-pci"}}
+	update configuration of vm with c
+	set c2 to configuration of vm
+	set out to ""
+	repeat with a in (qemu additional arguments of c2)
+		set out to out & (argument string of a) & " "
+	end repeat
+	return "readback: " & out
+end tell'
+readback: -device virtio-balloon-pci 
+exit=0
+
+$ osascript -e 'tell application "UTM"
+	set vm to virtual machine named "wargame-t1-evidence"
+	set c to configuration of vm
+	set qemu additional arguments of c to {}
+	update configuration of vm with c
+	set c2 to configuration of vm
+	return "cleared, length=" & ((length of (qemu additional arguments of c2)) as text)
+end tell'
+cleared, length=0
+exit=0
+
+## 6. network mode -> host, and the host-side vmnet bridges BEFORE the VM runs
+$ osascript /Users/moreal/github/moreal/dreamhack-sandbox/crates/wargame-utm/tests/fixtures/applescript/set-network-mode.applescript wargame-t1-evidence host
+mode=host hardware=virtio-net-pci hostif=
+exit=0
+
+$ utmctl status wargame-t1-evidence
+stopped
+exit=0
+
+$ ifconfig | awk '/^bridge1[0-9][0-9]:/{b=substr($1,1,length($1)-1)} /inet /{if(b!=""){print b, $2; b=""}}'
+bridge100 192.168.139.3
+bridge101 192.168.194.0
+bridge102 192.168.215.0
+bridge103 192.168.117.0
+exit=0
+
+## 7. start in host mode; bridges AFTER (FR-6 host-management connection)
+$ utmctl start wargame-t1-evidence
+exit=0
+
+$ sleep 8; true
+exit=0
+
+$ utmctl status wargame-t1-evidence
+started
+exit=0
+
+$ ps -Aww -o command | grep qemu-aarch64-softmmu | grep -v grep | grep -oE '\-netdev [^ ]+'
+-netdev vmnet-host,id=net0
+exit=0
+
+$ ifconfig | awk '/^bridge1[0-9][0-9]:/{b=substr($1,1,length($1)-1)} /inet /{if(b!=""){print b, $2; b=""}}'
+bridge100 192.168.139.3
+bridge101 192.168.194.0
+bridge102 192.168.215.0
+bridge103 192.168.117.0
+bridge104 192.168.128.1
+exit=0
+
+# the bridge that appeared, with its member interface:
+$ ifconfig bridge104
+bridge104: flags=8a63<UP,BROADCAST,SMART,RUNNING,ALLMULTI,SIMPLEX,MULTICAST> mtu 1500
+	options=3<RXCSUM,TXCSUM>
+	ether be:d0:74:60:04:68
+	inet 192.168.128.1 netmask 0xffffff00 broadcast 192.168.128.255
+	inet6 fe80::bcd0:74ff:fe60:468%bridge104 prefixlen 64 scopeid 0x25 
+	Configuration:
+		id 0:0:0:0:0:0 priority 0 hellotime 0 fwddelay 0
+		maxage 0 holdcnt 0 proto stp maxaddr 100 timeout 1200
+		root id 0:0:0:0:0:0 priority 0 ifcost 0 port 0
+		ipfilter disabled flags 0x0
+	member: vmenet4 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 36 priority 0 path cost 0
+	Address cache:
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect
+	status: active
+exit=0
+
+## 8. serial console address while running, and the --attach flag
+$ osascript /Users/moreal/github/moreal/dreamhack-sandbox/crates/wargame-utm/tests/fixtures/applescript/serial-port-address.applescript wargame-t1-evidence
+/dev/ttys002
+exit=0
+
+## 9. input automation (QEMU backend only): send Enter as raw scan codes
+$ osascript -e 'tell application "UTM" to input scan code of virtual machine named "wargame-t1-evidence" codes {28, 156}'
+exit=0
+
+## 10. suspend / resume / suspend --save-state — the full status enum in motion
+$ utmctl suspend wargame-t1-evidence
+exit=0
+
+$ sleep 2; utmctl status wargame-t1-evidence
+paused
+exit=0
+
+$ utmctl start wargame-t1-evidence
+exit=0
+
+$ sleep 2; utmctl status wargame-t1-evidence
+started
+exit=0
+
+$ utmctl suspend wargame-t1-evidence --save-state
+exit=0
+
+$ sleep 3; utmctl status wargame-t1-evidence
+paused
+exit=0
+
+# stop refuses a PAUSED VM (and still exits 0 — trap T1)
+$ utmctl stop wargame-t1-evidence
+Error from event: The operation couldn’t be completed. (OSStatus error -2700.)
+The virtual machine is not running.
+exit=0
+
+$ utmctl start wargame-t1-evidence
+exit=0
+
+$ sleep 2; utmctl status wargame-t1-evidence
+started
+exit=0
+
+$ utmctl stop wargame-t1-evidence
+exit=0
+
+$ for i in 1 2 3 4 5 6 7 8 9 10; do s=$(utmctl status wargame-t1-evidence); echo "t=${i}s status=$s"; [ "$s" = stopped ] && break; sleep 1; done
+t=1s status=stopped
+exit=0
+
+## 11. export / import — the import keeps the source display name (trap T3)
+$ rm -rf /private/tmp/claude-501/-Users-moreal-github-moreal-dreamhack-sandbox/53c57de2-b1c3-4219-97c5-3d7c3102cf74/scratchpad/t1fix/export && mkdir -p /private/tmp/claude-501/-Users-moreal-github-moreal-dreamhack-sandbox/53c57de2-b1c3-4219-97c5-3d7c3102cf74/scratchpad/t1fix/export
+exit=0
+
+$ osascript -e 'tell application "UTM" to export virtual machine named "wargame-t1-evidence" to POSIX file "/private/tmp/claude-501/-Users-moreal-github-moreal-dreamhack-sandbox/53c57de2-b1c3-4219-97c5-3d7c3102cf74/scratchpad/t1fix/export/evidence.utm"'
+exit=0
+
+$ du -sh /private/tmp/claude-501/-Users-moreal-github-moreal-dreamhack-sandbox/53c57de2-b1c3-4219-97c5-3d7c3102cf74/scratchpad/t1fix/export/evidence.utm
+964K	/private/tmp/claude-501/-Users-moreal-github-moreal-dreamhack-sandbox/53c57de2-b1c3-4219-97c5-3d7c3102cf74/scratchpad/t1fix/export/evidence.utm
+exit=0
+
+$ osascript -e 'tell application "UTM"
+	set vm to import new virtual machine from POSIX file "/private/tmp/claude-501/-Users-moreal-github-moreal-dreamhack-sandbox/53c57de2-b1c3-4219-97c5-3d7c3102cf74/scratchpad/t1fix/export/evidence.utm"
+	return "imported id=" & (id of vm) & " name=" & (name of vm)
+end tell'
+imported id=29AF808F-D780-4DB8-9768-6EF76FB60A03 name=wargame-t1-evidence
+exit=0
+
+# two VMs now share one display name; lookup by name silently returns the first
+$ utmctl list
+UUID                                 Status   Name
+E9B23A90-FB74-4781-82A8-228D19292CB4 stopped  wargame-t1-evidence
+29AF808F-D780-4DB8-9768-6EF76FB60A03 stopped  wargame-t1-evidence
+exit=0
+
+$ osascript -e 'tell application "UTM" to return "named lookup -> " & (id of virtual machine named "wargame-t1-evidence")'
+named lookup -> E9B23A90-FB74-4781-82A8-228D19292CB4
+exit=0
+
+# delete the imported duplicate again, by UUID
+$ osascript -e 'tell application "UTM"
+	set out to ""
+	repeat with vm in (virtual machines)
+		if (name of vm) is "wargame-t1-evidence" then set out to out & (id of vm) & " "
+	end repeat
+	return "both ids: " & out
+end tell'
+both ids: E9B23A90-FB74-4781-82A8-228D19292CB4 29AF808F-D780-4DB8-9768-6EF76FB60A03 
+exit=0
+
+## 12. x86_64: hypervisor:false vs hypervisor:true, config readback AND generated accel
+$ osascript /Users/moreal/github/moreal/dreamhack-sandbox/crates/wargame-utm/tests/fixtures/applescript/create-qemu-vm.applescript wargame-t1-evidence-x86 x86_64 false '/Users/moreal/Library/Application Support/wargame-vm/iso/kali-linux-2026.2-installer-amd64.iso'
+BB6CAE03-810D-4A33-93BB-E632BA9446A2	wargame-t1-evidence-x86	arch=x86_64	machine=q35	hypervisor=false	uefi=true	netmode=shared
+exit=0
+
+$ osascript -e 'tell application "UTM"
+	set c to configuration of (virtual machine named "wargame-t1-evidence-x86")
+	return "config readback hypervisor=" & ((hypervisor of c) as text)
+end tell'
+config readback hypervisor=false
+exit=0
+
+$ utmctl start wargame-t1-evidence-x86
+exit=0
+
+$ sleep 8; true
+exit=0
+
+$ ps -Aww -o command | grep qemu-x86_64-softmmu | grep -v grep | grep -oE '\-accel [^ ]+|\-smp [^ ]+|\-cpu [^ ]+'
+-cpu Skylake-Client
+-smp cpus=4,sockets=1,cores=4,threads=1
+-accel tcg,tb-size=1024
+exit=0
+
+$ utmctl stop wargame-t1-evidence-x86 --kill
+exit=0
+
+$ for i in 1 2 3 4 5 6 7 8 9 10; do s=$(utmctl status wargame-t1-evidence-x86); [ "$s" = stopped ] && { echo stopped after ${i}s; break; }; sleep 1; done
+stopped after 1s
+exit=0
+
+$ osascript -e 'tell application "UTM"
+	set vm to virtual machine named "wargame-t1-evidence-x86"
+	set c to configuration of vm
+	set hypervisor of c to true
+	update configuration of vm with c
+	return "update issued"
+end tell'
+update issued
+exit=0
+
+$ osascript -e 'tell application "UTM"
+	set c to configuration of (virtual machine named "wargame-t1-evidence-x86")
+	return "config readback hypervisor=" & ((hypervisor of c) as text)
+end tell'
+config readback hypervisor=true
+exit=0
+
+$ utmctl start wargame-t1-evidence-x86
+exit=0
+
+$ sleep 8; true
+exit=0
+
+# hypervisor is TRUE in the configuration, yet the accelerator is still TCG (trap T6)
+$ ps -Aww -o command | grep qemu-x86_64-softmmu | grep -v grep | grep -oE '\-accel [^ ]+|\-smp [^ ]+|\-cpu [^ ]+'
+-cpu Skylake-Client
+-smp cpus=4,sockets=1,cores=4,threads=1
+-accel tcg,tb-size=1024
+exit=0
+
+$ utmctl stop wargame-t1-evidence-x86 --kill
+exit=0
+
+$ for i in 1 2 3 4 5 6 7 8 9 10; do s=$(utmctl status wargame-t1-evidence-x86); [ "$s" = stopped ] && { echo stopped after ${i}s; break; }; sleep 1; done
+stopped after 1s
+exit=0
+
+## 13. cleanup — delete by UUID, skipping any VM that is not ours
+$ utmctl list
+UUID                                 Status   Name
+E9B23A90-FB74-4781-82A8-228D19292CB4 stopped  wargame-t1-evidence
+29AF808F-D780-4DB8-9768-6EF76FB60A03 stopped  wargame-t1-evidence
+BB6CAE03-810D-4A33-93BB-E632BA9446A2 stopped  wargame-t1-evidence-x86
+exit=0
+
+
+
+## 14. `utmctl start --attach` and `utmctl attach` are both the same stub
+$ osascript -e 'tell application "UTM" to make new virtual machine with properties {backend:qemu, configuration:{name:"wargame-t1-attach", architecture:"aarch64", memory:1024, cpu cores:1}}'
+7633A4A1-8256-4D65-8405-07E327886D78 wargame-t1-attach
+exit=0
+
+$ time timeout 15 utmctl start wargame-t1-attach --attach </dev/null
+timeout 15 utmctl start "$V" --attach < /dev/null  0.02s user 0.02s system 0% cpu 15.015 total
+exit=124  # not 124: the command returns at once instead of streaming the serial port
+
+$ utmctl status wargame-t1-attach
+started
+exit=0
+
+# the VM did start; the serial port is still only reachable by reading the ptty yourself
+$ osascript serial-port-address.applescript wargame-t1-attach
+/dev/ttys002
+exit=0
+
+$ utmctl stop wargame-t1-attach --kill
+exit=0
+stopped after 1s
+
+## 14. `utmctl start --attach` is the same stub as `utmctl attach`
+$ utmctl start wargame-t1-attach --attach </dev/null   # stdout
+WARNING: attach command is not implemented yet!
+exit=0   # returns at once; the VM does start, but no serial data is streamed
+
+$ utmctl attach wargame-t1-attach </dev/null           # stdout, VM already running
+WARNING: attach command is not implemented yet!
+PTTY: /dev/ttys002
+exit=0
+
+## 15. NEW TRAP: `stop --kill` can leave an orphan QEMU process that UTM reports as stopped
+$ utmctl stop wargame-t1-attach --kill && utmctl status wargame-t1-attach
+stopped
+
+$ ps -o pid,ppid,stat,etime,command -p $(pgrep -f qemu-aarch64-softmmu)
+  PID  PPID STAT ELAPSED
+58445 92742 R      03:40
+  ... QEMULauncher .../qemu-aarch64-softmmu ... -name wargamet1attach -uuid 7633A4A1-8256-4D65-8405-07E327886D78
+# parent is UTM's QEMUHelper XPC service; state R (spinning); still alive minutes later
+
+# every later start of that VM then fails on the firmware variable store, with exit 0:
+$ utmctl start wargame-t1-attach   # stderr
+Error from event: The operation couldn’t be completed. (OSStatus error -2700.)
+QEMU error: QEMU exited from an error: Is another process using the image [/Users/moreal/Library/Containers/com.utmapp.UTM/Data/Documents/wargame-t1-attach.utm/Data/efi_vars.fd]?
+exit=0
+
+$ utmctl status wargame-t1-attach
+stopped
+
+# waiting does not help: the same failure reproduced after 0 s, 3 s and 10 s of extra wait.
+# recovery on this host was: kill the orphan pid, then start again.
+$ kill -9 <orphan-pid>; utmctl start wargame-t1-attach; utmctl status wargame-t1-attach
+started
+
+## 16. final cleanup — delete by UUID, skipping any VM whose name is not ours
+UUID                                 Status   Name
+7633A4A1-8256-4D65-8405-07E327886D78 stopped  wargame-t1-attach
+deleted 7633A4A1-8256-4D65-8405-07E327886D78 (wargame-t1-attach)
+
+$ utmctl list
+UUID                                 Status   Name
+
+$ pgrep -lf 'qemu-(aarch64|x86_64)-softmmu'
+(none)
+
+$ tart list   # the user's kindle-vm and the Tart images are untouched
+Source Name                                                                                                             Disk Size Accessed     State  
+local  kindle-vm                                                                                                        60   28   3 days ago   stopped
+local  wargame-profile-macos-minimal-arm64                                                                              50   27   2 days ago   stopped
+local  wargame-profile-macos-re-arm64                                                                                   60   32   17 hours ago stopped
+local  wg-dh-sprout-base64-3edf2c                                                                                       60   32   2 days ago   stopped
+OCI    ghcr.io/cirruslabs/macos-sequoia-vanilla:latest                                                                  50   30   3 days ago   stopped
+OCI    ghcr.io/cirruslabs/macos-sequoia-vanilla@sha256:57a83b1b52f928f5b11b0963927178fd6c4cac52c315279f227c27cc5ab81587 50   30   2 days ago   stopped

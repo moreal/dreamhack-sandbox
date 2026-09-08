@@ -1,0 +1,2 @@
+Error from event: The operation couldn’t be completed. (OSStatus error -2700.)
+QEMU error: QEMU exited from an error: Is another process using the image [/Users/moreal/Library/Containers/com.utmapp.UTM/Data/Documents/wargame-t1-attach.utm/Data/efi_vars.fd]?
