@@ -577,6 +577,9 @@ async fn a_missing_installation_vm_is_reported_not_recreated() {
         wargame_core::domain::build::BuildStage::Preparing
     );
     assert!(matches!(failure.error, WargameError::VmNotFound(_)));
+    let message = failure.error.to_string();
+    assert!(message.contains("builds/kali-custom"), "{message}");
+    assert!(message.contains("profile create kali-custom"), "{message}");
     assert!(!h.calls.contains("osascript:make"));
     assert!(!h.calls.contains("osascript:duplicate"));
 }

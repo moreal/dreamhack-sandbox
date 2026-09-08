@@ -112,8 +112,8 @@ impl ProfileImageBuilder for UtmImageBuilder {
             // Deleted in UTM behind our back: never silently make another
             // one (spec.md §3 FR-5's "관계없는 VM 생성/삭제 금지").
             return Err(WargameError::VmNotFound(format!(
-                "the installation VM {} ({}) this profile was created with no longer exists in UTM. Nothing was recreated; make a new profile with `wargame profile init <template> --name <new>` and `wargame profile create`",
-                vm.name, vm.id
+                "the installation VM {} ({}) this profile was created with no longer exists in UTM. Nothing was recreated: to start that installation over, delete this profile's build record (rm -r $WARGAME_HOME/builds/{}) and run `wargame profile create {}` again",
+                vm.name, vm.id, req.profile.name, req.profile.name
             )));
         }
         Ok(())
