@@ -132,6 +132,27 @@ impl ProfileImageBuilder for UtmImageBuilder {
     }
 
     async fn boot(&self, req: &BuildRequest<'_>, vm: &VmRef, progress: Progress<'_>) -> Result<()> {
+        // `profile console` leaves the VM running -- which is exactly how a
+        // user gets from "installed the OS" to "build it", so the common
+        // case is a VM that is already up. UTM answers a `start` on a
+        // running VM with -2700 ("Operation not available"), so ask first.
+        match self.utm.status(vm).await? {
+            VmStatus::Running => {
+                progress(format!(
+                    "{} is already running (its console is open); building against it as it is",
+                    vm.name
+                ));
+                return Ok(());
+            }
+            VmStatus::Missing => {
+                return Err(WargameError::VmNotFound(format!(
+                    "UTM has no virtual machine with id {} ({})",
+                    vm.id, vm.name
+                )))
+            }
+            VmStatus::Stopped => {}
+        }
+
         progress("starting the installation VM on NAT".to_string());
         self.utm
             .start(
