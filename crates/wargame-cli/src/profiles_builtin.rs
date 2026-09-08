@@ -65,6 +65,23 @@ pub fn builtin_provision_scripts() -> Vec<(&'static str, &'static str)> {
                 "/../../profiles/scripts/windows/common.ps1"
             )),
         ),
+        // Not run by any built-in profile: the commented starting point
+        // spec.md §4's flow tells users to copy when they add their own
+        // tools.
+        (
+            "scripts/custom/my-tools.sh",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../profiles/scripts/custom/my-tools.sh"
+            )),
+        ),
+        (
+            "scripts/custom/my-tools.ps1",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../profiles/scripts/custom/my-tools.ps1"
+            )),
+        ),
     ]
 }
 
@@ -117,7 +134,7 @@ pub fn builtin_profiles() -> Result<Vec<Profile>> {
 mod tests {
     use super::*;
 
-    use wargame_core::domain::{BackendChoice, ExecutionMode, GuestArch, GuestOs};
+    use wargame_core::domain::{BackendChoice, ExecutionMode, GuestArch, GuestOs, GuestShell};
 
     #[test]
     fn every_builtin_profile_parses() {
@@ -210,6 +227,90 @@ mod tests {
                     profile.name
                 );
             }
+        }
+    }
+
+    /// spec.md §3 FR-3 + the Task 5 review: `tools.verify` entries are argv,
+    /// and a PowerShell guest runs argv through
+    /// [`wargame_core::infra::PowerShellCommand::from_argv`], which quotes
+    /// *every* token. A native executable takes those as plain strings, but
+    /// a **cmdlet** binds a parameter only from a bare `-Name` token, so a
+    /// quoted `'-Path'` would be bound positionally and the command would
+    /// fail for a reason no log makes obvious. Every Windows verify line we
+    /// ship therefore has to start with a native executable.
+    #[test]
+    fn windows_verify_commands_are_native_executables_not_cmdlets() {
+        for profile in builtin_profiles().unwrap() {
+            if GuestShell::for_os(profile.guest.os) != GuestShell::PowerShell {
+                continue;
+            }
+            assert!(
+                !profile.tools.verify.is_empty(),
+                "{}: a Windows profile must verify its tools",
+                profile.name
+            );
+            for check in &profile.tools.verify {
+                let argv: Vec<&str> = check.split_whitespace().collect();
+                let program = *argv
+                    .first()
+                    .unwrap_or_else(|| panic!("{}: empty verify entry", profile.name));
+                assert!(
+                    !looks_like_cmdlet(program),
+                    "{}: {check:?} starts with the cmdlet/alias {program:?}; \
+                     use a native executable (PowerShell binds a quoted \
+                     parameter name positionally)",
+                    profile.name
+                );
+            }
+        }
+    }
+
+    /// Whether `name` would resolve to a cmdlet or one of its aliases rather
+    /// than an executable on `PATH`.
+    ///
+    /// Two rules, both from PowerShell's own conventions: a cmdlet is named
+    /// `Verb-Noun`, and Windows PowerShell ships a fixed set of Unix-looking
+    /// aliases (`curl` and `wget` are `Invoke-WebRequest`, `sc` is
+    /// `Set-Content`, ...) that shadow the executables of the same name.
+    fn looks_like_cmdlet(name: &str) -> bool {
+        const SHADOWED_BY_AN_ALIAS: &[&str] = &[
+            "cat", "cd", "cp", "curl", "diff", "dir", "echo", "kill", "ls", "man", "mount", "mv",
+            "ps", "pwd", "rm", "rmdir", "sc", "set", "sleep", "sort", "tee", "type", "wget",
+            "where", "write",
+        ];
+        if SHADOWED_BY_AN_ALIAS.contains(&name.to_ascii_lowercase().as_str()) {
+            return true;
+        }
+        // `Verb-Noun`, e.g. `Get-ChildItem`: capitalised on both sides of a
+        // single hyphen, letters only.
+        match name.split_once('-') {
+            Some((verb, noun)) => {
+                !verb.is_empty()
+                    && !noun.is_empty()
+                    && verb.chars().all(|c| c.is_ascii_alphabetic())
+                    && noun.chars().all(|c| c.is_ascii_alphabetic())
+                    && verb.starts_with(|c: char| c.is_ascii_uppercase())
+                    && noun.starts_with(|c: char| c.is_ascii_uppercase())
+            }
+            None => false,
+        }
+    }
+
+    #[test]
+    fn the_cmdlet_heuristic_tells_executables_and_cmdlets_apart() {
+        for cmdlet in ["Get-ChildItem", "Set-Content", "sc", "curl", "LS"] {
+            assert!(looks_like_cmdlet(cmdlet), "{cmdlet}");
+        }
+        for native in [
+            "python",
+            "git",
+            "7z",
+            "sc.exe",
+            "ssh",
+            "powershell",
+            "python3",
+        ] {
+            assert!(!looks_like_cmdlet(native), "{native}");
         }
     }
 

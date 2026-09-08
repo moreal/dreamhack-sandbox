@@ -40,7 +40,17 @@ provision:
     - scripts/windows/common.ps1
 
 tools:
-  verify: []
+  # Each command is argv (no shell, no pipes) and must exit 0 in the guest.
+  # Every token reaches the guest as a quoted literal, so each entry has to
+  # be a native executable: a PowerShell cmdlet would bind its quoted
+  # parameter names as positional values and fail. scripts/windows/common.ps1
+  # names the install source for each one.
+  verify:
+    - powershell -NoProfile -Command $PSVersionTable.PSVersion.ToString()
+    - sc.exe query sshd
+    - python --version
+    - git --version
+    - 7z i
 
 workspace:
   root: 'C:\wargame'

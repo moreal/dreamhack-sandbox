@@ -36,8 +36,22 @@ provision:
     - scripts/kali/common.sh
 
 tools:
+  # Each command is argv (no shell, no pipes) and must exit 0 in the guest.
+  # `wargame profile build` runs them after scripts/kali/common.sh, which
+  # names the install source for each one, and only publishes the image when
+  # they all pass.
   verify:
     - python3 --version
+    - python3 -m pip --version
+    - python3 -m venv --help
+    - git --version
+    - curl --version
+    - unzip -v
+    - file --version
+    - gdb --version
+    - objdump --version
+    - gcc --version
+    - make --version
 
 workspace:
   root: /home/kali/wargame
