@@ -1,24 +1,32 @@
-//! `ProfileImageBuilder`: turns a declarative [`Profile`] into a reusable
-//! local Tart image (DESIGN.md §5/§6, MVP.md §13-14, PLAN.md Task 6).
+//! The Tart half of the common image build (`wargame_core::app::profile_build`).
 //!
-//! The pipeline: make sure the base image is local, clear out any previous
-//! build of the same profile image, clone + size a fresh VM, boot it
-//! headless on NAT, install the host's SSH public key over a one-time
-//! password login (`sshpass`, secret only ever in the `SSHPASS` env var --
-//! never argv, never logged), then run the profile's provisioning scripts
-//! and verification commands over that now-keyed SSH connection before
-//! stopping the VM and handing back its image name.
+//! Every step that is not Tart-specific -- copying and running the profile's
+//! provisioning scripts, the `tools.verify` commands, the provisioning log,
+//! the build record -- lives in core. What is left here is exactly what only
+//! Tart can do: make sure the base image is local, clone and size a VM from
+//! it, boot it headless on NAT, install the host's SSH public key over a
+//! one-time password login (`sshpass`, secret only ever in the `SSHPASS` env
+//! var -- never argv, never logged), stop the VM and confirm it really
+//! stopped.
+//!
+//! Tart's "publish" is a no-op by construction: the built VM *is* the image
+//! (`wargame-profile-<name>`), which is why `prepare` clears a previous build
+//! of the same name before cloning.
 
-use std::fs::OpenOptions;
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
+
+use wargame_core::domain::build::PublishedImage;
 use wargame_core::domain::{GuestEndpoint, NetworkMode, Profile, VmRef};
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::process::{Cmd, ProcessRunner};
-use wargame_core::ports::{GuestTransport, ImageRef, StartOptions, VmProvider, VmSpec, VmStatus};
+use wargame_core::ports::image_builder::{BuildRequest, GuestLink, Progress};
+use wargame_core::ports::{
+    GuestTransport, ImageRef, ProfileImageBuilder, StartOptions, VmProvider, VmSpec, VmStatus,
+};
 
 use crate::TartProvider;
 
@@ -38,284 +46,34 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const STOP_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Builds a [`GuestTransport`], deferred until after the host's SSH key has
-/// actually been installed (see [`ProfileImageBuilder::build_profile`]).
+/// actually been installed (see [`TartImageBuilder::connect`]).
 /// The guest user is no longer part of the transport -- it travels in the
 /// [`GuestEndpoint`] each call is addressed with (spec.md §3 FR-4).
 pub type TransportFactory = Box<dyn Fn() -> Arc<dyn GuestTransport> + Send + Sync>;
 
-/// Inputs to [`ProfileImageBuilder::build_profile`] that aren't already part
-/// of the [`Profile`] itself.
-pub struct BuildOptions {
-    /// Directory containing the `scripts/` subtree that a profile's
-    /// `provision.scripts` paths are relative to -- the repo's `profiles/`
-    /// directory, or `$WARGAME_HOME/profiles` for a user override.
-    pub scripts_dir: PathBuf,
-    /// The host's ed25519 public key (contents of `id_ed25519.pub`),
-    /// installed into the guest's `authorized_keys` so future sessions can
-    /// SSH in without ever needing the build-time password again.
-    pub pubkey: String,
-    pub log_path: PathBuf,
-}
-
-pub struct ProfileImageBuilder {
+pub struct TartImageBuilder {
     runner: Arc<dyn ProcessRunner>,
     tart: Arc<TartProvider>,
     transport_factory: TransportFactory,
+    /// The host's ed25519 public key (contents of `id_ed25519.pub`),
+    /// installed into the guest's `authorized_keys` so future sessions can
+    /// SSH in without ever needing the build-time password again.
+    pubkey: String,
 }
 
-impl ProfileImageBuilder {
+impl TartImageBuilder {
     pub fn new(
         runner: Arc<dyn ProcessRunner>,
         tart: Arc<TartProvider>,
         transport_factory: TransportFactory,
+        pubkey: impl Into<String>,
     ) -> Self {
-        ProfileImageBuilder {
+        TartImageBuilder {
             runner,
             tart,
             transport_factory,
+            pubkey: pubkey.into(),
         }
-    }
-
-    pub async fn build_profile(
-        &self,
-        profile: &Profile,
-        opts: &BuildOptions,
-        progress: &mut dyn FnMut(String),
-    ) -> Result<ImageRef> {
-        // Resolution before any side effect: a profile this backend cannot
-        // run must not get as far as pulling an image (spec.md §3 FR-1).
-        let execution = wargame_core::domain::compat::resolve(profile)?;
-
-        let base = ImageRef(profile.image.base.clone());
-        let target_name = profile.image_name();
-        let target_ref = ImageRef(target_name.clone());
-
-        progress(format!("checking for base image {}", base.0));
-        if !self.tart.image_exists(&base).await? {
-            progress(format!("pulling base image {}", base.0));
-            self.tart.pull_image(&base).await?;
-        }
-
-        if self.tart.image_exists(&target_ref).await? {
-            progress(format!("removing previous build of {target_name}"));
-            self.tart
-                .delete(&VmRef::new("tart", target_name.clone()))
-                .await?;
-        }
-
-        progress(format!("cloning {} -> {target_name}", base.0));
-        let vm = self
-            .tart
-            .create(&VmSpec {
-                name: target_name.clone(),
-                image: base,
-                resources: profile.resources,
-                execution,
-                // A build installs packages, so it always runs on NAT
-                // (spec.md §3 FR-6); the launched sessions are isolated.
-                network: NetworkMode::Nat,
-            })
-            .await?;
-
-        match self.provision(&vm, profile, opts, progress).await {
-            Ok(()) => Ok(ImageRef(target_name)),
-            Err(err) => {
-                // A partially provisioned image must never satisfy
-                // `image_exists` for a later `launch` (DESIGN.md §5, NFR-02),
-                // so best-effort tear the VM back down before propagating the
-                // original failure.
-                progress("build failed; cleaning up the partially built VM".to_string());
-                if let Err(stop_err) = self.tart.stop(&vm).await {
-                    tracing::warn!(
-                        "failed to stop VM {} after a failed build: {stop_err}",
-                        vm.name
-                    );
-                }
-                if let Err(delete_err) = self.tart.delete(&vm).await {
-                    tracing::warn!(
-                        "failed to delete VM {} after a failed build: {delete_err}",
-                        vm.name
-                    );
-                }
-                Err(err)
-            }
-        }
-    }
-
-    /// The provisioning steps after the clone: start, wait for an IP,
-    /// install the host key, copy in and run the provisioning scripts, run
-    /// the profile's verify commands, clean up, and stop the VM. Split out
-    /// from [`Self::build_profile`] so any failure here can be met with
-    /// best-effort cleanup of the partially built image.
-    async fn provision(
-        &self,
-        vm: &VmRef,
-        profile: &Profile,
-        opts: &BuildOptions,
-        progress: &mut dyn FnMut(String),
-    ) -> Result<()> {
-        progress("starting the VM headless on NAT".to_string());
-        self.tart
-            .start(
-                vm,
-                &StartOptions {
-                    network: NetworkMode::Nat,
-                    headless: true,
-                    log_path: opts.log_path.clone(),
-                },
-            )
-            .await?;
-
-        progress("waiting for a DHCP lease".to_string());
-        let ip = self.tart.wait_ip(vm, self.tart.boot_timeout()).await?;
-
-        progress("installing the host's SSH key (password login)".to_string());
-        self.install_pubkey(profile, ip.to_string(), &opts.pubkey)
-            .await?;
-
-        let transport = (self.transport_factory)();
-        let endpoint = GuestEndpoint::new(ip, profile.guest.user.clone());
-
-        progress("waiting for SSH to accept the new key".to_string());
-        transport
-            .wait_ready(&endpoint, self.tart.boot_timeout())
-            .await?;
-
-        let log_path = provision_log_path(opts, profile);
-        progress(format!("provisioning log: {}", log_path.display()));
-
-        progress("copying provisioning scripts into the guest".to_string());
-        // `~` is never expanded in `GuestTransport::exec` argv (every
-        // argument is single-quoted before being sent to the guest shell),
-        // so all guest-side paths here are relative to the SSH user's home
-        // directory instead. `scp -r <src>/scripts wg-provision` would, on a
-        // guest where `wg-provision` doesn't already exist, create
-        // `wg-provision` *as* a copy of `scripts` itself -- so create the
-        // destination directory first and copy into it with a trailing
-        // slash, giving `wg-provision/scripts/...` as the profile's script
-        // paths expect.
-        transport
-            .exec(
-                &endpoint,
-                &[
-                    "mkdir".to_string(),
-                    "-p".to_string(),
-                    "wg-provision".to_string(),
-                ],
-            )
-            .await?;
-        transport
-            .copy_in(
-                &endpoint,
-                &opts.scripts_dir.join("scripts"),
-                "wg-provision/",
-            )
-            .await?;
-
-        for script in &profile.provision.scripts {
-            progress(format!("provisioning: {script}"));
-            let remote_path = format!("wg-provision/{script}");
-            let argv = vec!["bash".to_string(), remote_path];
-            let command_desc = argv.join(" ");
-            let out = transport.exec(&endpoint, &argv).await?;
-            log_exec(
-                &log_path,
-                &command_desc,
-                out.status,
-                &out.stdout,
-                &out.stderr,
-            );
-            if out.status != 0 {
-                return Err(WargameError::GuestBootstrapFailed(format!(
-                    "provisioning script {script} failed (exit {}): {}",
-                    out.status,
-                    tail_lines(&combined_output(&out.stdout, &out.stderr), 15)
-                )));
-            }
-        }
-
-        for check in &profile.tools.verify {
-            progress(format!("verifying: {check}"));
-            let argv: Vec<String> = check.split_whitespace().map(str::to_string).collect();
-            if argv.is_empty() {
-                continue;
-            }
-            let command_desc = argv.join(" ");
-            let out = transport.exec(&endpoint, &argv).await?;
-            log_exec(
-                &log_path,
-                &command_desc,
-                out.status,
-                &out.stdout,
-                &out.stderr,
-            );
-            if out.status != 0 {
-                return Err(WargameError::InvalidProfile {
-                    name: profile.name.clone(),
-                    reason: format!(
-                        "verify command {check:?} failed (exit {}): {}",
-                        out.status,
-                        tail_lines(&combined_output(&out.stdout, &out.stderr), 15)
-                    ),
-                });
-            }
-        }
-
-        progress("cleaning up provisioning files".to_string());
-        transport
-            .exec(
-                &endpoint,
-                &[
-                    "rm".to_string(),
-                    "-rf".to_string(),
-                    "wg-provision".to_string(),
-                ],
-            )
-            .await?;
-
-        progress("flushing guest filesystem and shutting down".to_string());
-        match transport.exec(&endpoint, &["sync".to_string()]).await {
-            Ok(out) if out.status != 0 => {
-                tracing::warn!(
-                    vm = %vm.name,
-                    status = out.status,
-                    stderr = %out.stderr,
-                    "sync failed on the guest before stop; proceeding anyway"
-                );
-            }
-            Ok(_) => {}
-            Err(err) => {
-                tracing::warn!(
-                    vm = %vm.name,
-                    error = %err,
-                    "could not run sync on the guest before stop; proceeding anyway"
-                );
-            }
-        }
-        self.tart.stop(vm).await?;
-
-        let deadline = tokio::time::Instant::now() + STOP_POLL_TIMEOUT;
-        loop {
-            match self.tart.status(vm).await {
-                Ok(VmStatus::Running) => {}
-                Ok(_) => break,
-                Err(err) => {
-                    tracing::warn!(
-                        vm = %vm.name,
-                        error = %err,
-                        "failed to check VM status while confirming it stopped"
-                    );
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(WargameError::VmCreationFailed(
-                    "profile VM did not stop cleanly".to_string(),
-                ));
-            }
-            tokio::time::sleep(STOP_POLL_INTERVAL).await;
-        }
-
-        Ok(())
     }
 
     /// Installs `pubkey` into the guest's `authorized_keys` over a
@@ -323,7 +81,7 @@ impl ProfileImageBuilder {
     /// guest's `sshd` finishes starting. `SSHPASS` carries the secret only
     /// through the environment -- it is never part of argv, so it never
     /// appears in a process listing or in anything that logs a `Cmd`'s argv.
-    async fn install_pubkey(&self, profile: &Profile, ip: String, pubkey: &str) -> Result<()> {
+    async fn install_pubkey(&self, profile: &Profile, ip: String) -> Result<()> {
         let password =
             profile
                 .guest
@@ -334,6 +92,7 @@ impl ProfileImageBuilder {
                     reason: "guest.password is required to build a profile image".to_string(),
                 })?;
 
+        let pubkey = &self.pubkey;
         let remote_command = format!(
             "mkdir -p ~/.ssh && chmod 700 ~/.ssh && printf '%s\\n' '{pubkey}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
         );
@@ -371,95 +130,187 @@ impl ProfileImageBuilder {
     }
 }
 
-/// Where provisioning output for `profile` is logged: `opts.log_path`'s
-/// directory (typically `$WARGAME_HOME/logs`), with the file name replaced
-/// by `provision-<profile name>.log` so it doesn't clobber
-/// `profile-build.log` (the Tart `start` console log) and survives across
-/// builds of different profiles.
-fn provision_log_path(opts: &BuildOptions, profile: &Profile) -> PathBuf {
-    let dir = opts
-        .log_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
-    dir.join(format!("provision-{}.log", profile.name))
-}
-
-/// Combines stdout and stderr into one blob for the "last N lines" shown in
-/// an error message -- interleaving isn't preserved (we only get each
-/// stream as a whole from `ExecResult`), but seeing both is more useful to a
-/// user debugging a failure than seeing neither.
-fn combined_output(stdout: &str, stderr: &str) -> String {
-    let mut combined = String::new();
-    combined.push_str(stdout);
-    if !stdout.is_empty() && !stderr.is_empty() && !stdout.ends_with('\n') {
-        combined.push('\n');
+#[async_trait]
+impl ProfileImageBuilder for TartImageBuilder {
+    fn backend(&self) -> &str {
+        "tart"
     }
-    combined.push_str(stderr);
-    combined
-}
 
-/// The last `n` lines of `text` (fewer if it has fewer), for embedding a
-/// bounded amount of guest output directly in an error message.
-fn tail_lines(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
-}
+    /// Tart clones a ready-made base image; there is no OS to install by
+    /// hand, so no installation VM and no `profile create`.
+    fn uses_installer_vm(&self) -> bool {
+        false
+    }
 
-/// Appends one command's output to the provisioning log as a
-/// `==== <command> (exit N) ====` header followed by its stdout and stderr.
-/// Never fails the build: a log write failure is only `tracing::warn`.
-fn log_exec(log_path: &Path, command: &str, status: i32, stdout: &str, stderr: &str) {
-    let mut body = format!("==== {command} (exit {status}) ====\n");
-    if !stdout.is_empty() {
-        body.push_str(stdout);
-        if !stdout.ends_with('\n') {
-            body.push('\n');
+    async fn prepare(&self, req: &BuildRequest<'_>, progress: Progress<'_>) -> Result<()> {
+        let base = ImageRef(req.profile.image.base.clone());
+        progress(format!("checking for base image {}", base.0));
+        if !self.tart.image_exists(&base).await? {
+            progress(format!("pulling base image {}", base.0));
+            self.tart.pull_image(&base).await?;
         }
-    }
-    if !stderr.is_empty() {
-        body.push_str(stderr);
-        if !stderr.ends_with('\n') {
-            body.push('\n');
+
+        // Tart's image *is* the VM, so a previous build of this profile has
+        // to go before a new one can take its name.
+        let target = req.profile.image_name();
+        if self.tart.image_exists(&ImageRef(target.clone())).await? {
+            progress(format!("removing previous build of {target}"));
+            self.tart.delete(&VmRef::new("tart", target)).await?;
         }
+        Ok(())
     }
 
-    if let Some(parent) = log_path.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            tracing::warn!(
-                "failed to create provisioning log directory {}: {err}",
-                parent.display()
-            );
-            return;
-        }
+    async fn clone_for_build(
+        &self,
+        req: &BuildRequest<'_>,
+        progress: Progress<'_>,
+    ) -> Result<VmRef> {
+        let base = req.profile.image.base.clone();
+        let target = req.profile.image_name();
+        progress(format!("cloning {base} -> {target}"));
+        self.tart
+            .create(&VmSpec {
+                name: target,
+                image: ImageRef(base),
+                resources: req.profile.resources,
+                execution: req.execution.clone(),
+                // A build installs packages, so it always runs on NAT
+                // (spec.md §3 FR-6); the launched sessions are isolated.
+                network: NetworkMode::Nat,
+            })
+            .await
     }
-    let opened = OpenOptions::new().create(true).append(true).open(log_path);
-    match opened {
-        Ok(mut file) => {
-            if let Err(err) = file.write_all(body.as_bytes()) {
-                tracing::warn!(
-                    "failed to write provisioning log {}: {err}",
-                    log_path.display()
-                );
+
+    async fn boot(&self, req: &BuildRequest<'_>, vm: &VmRef, progress: Progress<'_>) -> Result<()> {
+        progress("starting the VM headless on NAT".to_string());
+        self.tart
+            .start(
+                vm,
+                &StartOptions {
+                    network: NetworkMode::Nat,
+                    headless: true,
+                    log_path: req.log_path.clone(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn connect(
+        &self,
+        req: &BuildRequest<'_>,
+        vm: &VmRef,
+        progress: Progress<'_>,
+    ) -> Result<GuestLink> {
+        progress("waiting for a DHCP lease".to_string());
+        let ip = self.tart.wait_ip(vm, req.boot_timeout).await?;
+
+        progress("installing the host's SSH key (password login)".to_string());
+        self.install_pubkey(req.profile, ip.to_string()).await?;
+
+        let transport = (self.transport_factory)();
+        let endpoint = GuestEndpoint::new(ip, req.profile.guest.user.clone());
+
+        progress("waiting for SSH to accept the new key".to_string());
+        transport.wait_ready(&endpoint, req.boot_timeout).await?;
+        Ok(GuestLink {
+            endpoint,
+            transport,
+        })
+    }
+
+    async fn shutdown(
+        &self,
+        _req: &BuildRequest<'_>,
+        vm: &VmRef,
+        _progress: Progress<'_>,
+    ) -> Result<()> {
+        self.tart.stop(vm).await?;
+
+        let deadline = tokio::time::Instant::now() + STOP_POLL_TIMEOUT;
+        loop {
+            match self.tart.status(vm).await {
+                Ok(VmStatus::Running) => {}
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    tracing::warn!(
+                        vm = %vm.name,
+                        error = %err,
+                        "failed to check VM status while confirming it stopped"
+                    );
+                }
             }
-        }
-        Err(err) => {
-            tracing::warn!(
-                "failed to open provisioning log {}: {err}",
-                log_path.display()
-            );
+            if tokio::time::Instant::now() >= deadline {
+                return Err(WargameError::VmCreationFailed(
+                    "profile VM did not stop cleanly".to_string(),
+                ));
+            }
+            tokio::time::sleep(STOP_POLL_INTERVAL).await;
         }
     }
+
+    /// The provisioned, stopped VM already *is* the image Tart launches
+    /// from, so publishing is only naming it.
+    async fn publish(
+        &self,
+        req: &BuildRequest<'_>,
+        vm: &VmRef,
+        _progress: Progress<'_>,
+    ) -> Result<PublishedImage> {
+        let _ = vm;
+        let name = req.profile.image_name();
+        Ok(PublishedImage::new(name.clone(), name))
+    }
+
+    async fn discard_image(&self, image: &PublishedImage) -> Result<()> {
+        self.tart
+            .delete(&VmRef::new("tart", image.name.clone()))
+            .await
+    }
+
+    /// NFR-02 (DESIGN.md §5): a build that failed partway through must not
+    /// leave a `wargame-profile-<name>` image behind for a later `launch` to
+    /// mistake for a finished one, so the partially built VM is stopped and
+    /// deleted.
+    async fn cleanup_failed_build(&self, _req: &BuildRequest<'_>, vm: &VmRef) -> Vec<String> {
+        let mut failures = Vec::new();
+        if let Err(err) = self.tart.stop(vm).await {
+            tracing::warn!("failed to stop VM {} after a failed build: {err}", vm.name);
+            failures.push(format!(
+                "could not stop {} after the failure: {err}",
+                vm.name
+            ));
+        }
+        if let Err(err) = self.tart.delete(vm).await {
+            tracing::warn!(
+                "failed to delete VM {} after a failed build: {err}",
+                vm.name
+            );
+            failures.push(format!(
+                "could not delete the partially built image {}: {err}",
+                vm.name
+            ));
+        }
+        failures
+    }
+}
+
+/// Where the Tart backend writes its console log while a build runs.
+pub fn default_build_log(logs_dir: &std::path::Path) -> PathBuf {
+    logs_dir.join("profile-build.log")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::path::Path;
+
+    use wargame_core::app::profile_build::{provision_log_path, run_build_flow};
+    use wargame_core::domain::build::{BuildRecord, BuildSource};
     use wargame_core::domain::{
-        GuestArch, GuestOs, GuestSpec, ImageSpec, ProvisionSpec, Resources, ToolsSpec, VmSettings,
-        WorkspaceSpec,
+        compat, GuestArch, GuestOs, GuestSpec, ImageSpec, ProvisionSpec, Resources, ToolsSpec,
+        VmSettings, WorkspaceSpec,
     };
     use wargame_core::infra::process::Output;
     use wargame_core::testing::{FakeRunner, FakeTransport, TransportCall};
@@ -522,28 +373,38 @@ mod tests {
         Ok(Output::default())
     }
 
-    fn builder(runner: Arc<FakeRunner>, transport: Arc<FakeTransport>) -> ProfileImageBuilder {
+    fn builder(runner: Arc<FakeRunner>, transport: Arc<FakeTransport>) -> TartImageBuilder {
         let tart = Arc::new(TartProvider::new(runner.clone(), TartConfig::default()));
-        ProfileImageBuilder::new(
+        TartImageBuilder::new(
             runner,
             tart,
             Box::new(move || transport.clone() as Arc<dyn GuestTransport>),
+            "ssh-ed25519 AAAA... wargame-vm",
         )
     }
 
-    fn opts() -> BuildOptions {
-        BuildOptions {
-            scripts_dir: PathBuf::from("/repo/profiles"),
-            pubkey: "ssh-ed25519 AAAA... wargame-vm".to_string(),
-            log_path: PathBuf::from("/tmp/build.log"),
-        }
+    fn record(profile: &Profile) -> BuildRecord {
+        BuildRecord::new(
+            profile,
+            "tart",
+            BuildSource::TartBase {
+                image: profile.image.base.clone(),
+            },
+        )
     }
 
-    fn opts_with_log_dir(log_dir: &Path) -> BuildOptions {
-        BuildOptions {
+    fn request<'a>(
+        profile: &'a Profile,
+        record: &'a BuildRecord,
+        log_dir: &Path,
+    ) -> BuildRequest<'a> {
+        BuildRequest {
+            profile,
+            record,
+            execution: compat::resolve(profile).unwrap(),
             scripts_dir: PathBuf::from("/repo/profiles"),
-            pubkey: "ssh-ed25519 AAAA... wargame-vm".to_string(),
             log_path: log_dir.join("profile-build.log"),
+            boot_timeout: Duration::from_secs(300),
         }
     }
 
@@ -554,13 +415,16 @@ mod tests {
         let transport = Arc::new(FakeTransport::new());
         let b = builder(runner.clone(), transport.clone());
         let profile = sample_profile();
+        let record = record(&profile);
+        let req = request(&profile, &record, Path::new("/tmp"));
         let mut messages = Vec::new();
 
-        let image = b
-            .build_profile(&profile, &opts(), &mut |m| messages.push(m))
+        let outcome = run_build_flow(&b, &req, &mut |m| messages.push(m))
             .await
-            .unwrap();
-        assert_eq!(image.0, "wargame-profile-macos-minimal-arm64");
+            .unwrap_or_else(|e| panic!("build failed: {}", e.error));
+        assert_eq!(outcome.image.name, "wargame-profile-macos-minimal-arm64");
+        assert_eq!(outcome.image.id, "wargame-profile-macos-minimal-arm64");
+        assert_eq!(outcome.verification.len(), 2);
         assert!(!messages.is_empty());
 
         let calls = runner.calls();
@@ -704,14 +568,21 @@ mod tests {
         let b = builder(runner, transport);
         let mut profile = sample_profile();
         profile.provision.scripts.clear();
+        let record = record(&profile);
+        let req = request(&profile, &record, Path::new("/tmp"));
 
-        let err = b
-            .build_profile(&profile, &opts(), &mut |_| {})
+        let failure = run_build_flow(&b, &req, &mut |_| {})
             .await
-            .unwrap_err();
+            .err()
+            .expect("the build must fail");
         assert!(
-            matches!(err, WargameError::VmCreationFailed(ref msg) if msg.contains("did not stop cleanly")),
-            "expected a VmCreationFailed about not stopping cleanly, got {err:?}"
+            matches!(failure.error, WargameError::VmCreationFailed(ref msg) if msg.contains("did not stop cleanly")),
+            "expected a VmCreationFailed about not stopping cleanly, got {:?}",
+            failure.error
+        );
+        assert!(
+            !failure.awaiting_install,
+            "Tart has no manual install to wait for"
         );
     }
 
@@ -726,14 +597,15 @@ mod tests {
         let mut profile = sample_profile();
         profile.provision.scripts.clear();
         profile.tools.verify = vec!["test -x /nonexistent".to_string()];
+        let record = record(&profile);
+        let req = request(&profile, &record, Path::new("/tmp"));
 
-        let err = b
-            .build_profile(&profile, &opts(), &mut |_| {})
-            .await
-            .unwrap_err();
+        let failure = run_build_flow(&b, &req, &mut |_| {}).await.err().unwrap();
         assert!(
-            matches!(err, WargameError::InvalidProfile { name, .. } if name == "macos-minimal-arm64")
+            matches!(failure.error, WargameError::InvalidProfile { ref name, .. } if name == "macos-minimal-arm64")
         );
+        assert_eq!(failure.verification.len(), 1);
+        assert_eq!(failure.verification[0].exit_code, 1);
     }
 
     /// NFR-02 (DESIGN.md §5): a build that fails partway through must not
@@ -751,13 +623,12 @@ mod tests {
         let mut profile = sample_profile();
         profile.provision.scripts.clear();
         profile.tools.verify = vec!["test -x /nonexistent".to_string()];
+        let record = record(&profile);
+        let req = request(&profile, &record, Path::new("/tmp"));
 
-        let err = b
-            .build_profile(&profile, &opts(), &mut |_| {})
-            .await
-            .unwrap_err();
+        let failure = run_build_flow(&b, &req, &mut |_| {}).await.err().unwrap();
         assert!(
-            matches!(err, WargameError::InvalidProfile { name, .. } if name == "macos-minimal-arm64")
+            matches!(failure.error, WargameError::InvalidProfile { ref name, .. } if name == "macos-minimal-arm64")
         );
 
         let calls = runner.calls();
@@ -789,12 +660,11 @@ mod tests {
 
         let mut profile = sample_profile();
         profile.guest.password = None;
+        let record = record(&profile);
+        let req = request(&profile, &record, Path::new("/tmp"));
 
-        let err = b
-            .build_profile(&profile, &opts(), &mut |_| {})
-            .await
-            .unwrap_err();
-        assert!(matches!(err, WargameError::InvalidProfile { .. }));
+        let failure = run_build_flow(&b, &req, &mut |_| {}).await.err().unwrap();
+        assert!(matches!(failure.error, WargameError::InvalidProfile { .. }));
         assert!(transport.calls().is_empty());
     }
 
@@ -805,12 +675,15 @@ mod tests {
         let transport = Arc::new(FakeTransport::new());
         let b = builder(runner, transport);
         let profile = sample_profile();
+        let record = record(&profile);
         let log_dir = tempfile::tempdir().unwrap();
-        let opts = opts_with_log_dir(log_dir.path());
+        let req = request(&profile, &record, log_dir.path());
 
-        b.build_profile(&profile, &opts, &mut |_| {}).await.unwrap();
+        run_build_flow(&b, &req, &mut |_| {})
+            .await
+            .unwrap_or_else(|e| panic!("build failed: {}", e.error));
 
-        let log_path = provision_log_path(&opts, &profile);
+        let log_path = provision_log_path(&req.log_path, &profile.name);
         let log = std::fs::read_to_string(&log_path)
             .unwrap_or_else(|e| panic!("expected a provisioning log at {log_path:?}: {e}"));
 
@@ -855,22 +728,20 @@ mod tests {
         let log_dir = tempfile::tempdir().unwrap();
         let b = builder(runner, transport);
         let profile = sample_profile();
-        let opts = opts_with_log_dir(log_dir.path());
+        let record = record(&profile);
+        let req = request(&profile, &record, log_dir.path());
 
-        let err = b
-            .build_profile(&profile, &opts, &mut |_| {})
-            .await
-            .unwrap_err();
+        let failure = run_build_flow(&b, &req, &mut |_| {}).await.err().unwrap();
 
-        let WargameError::InvalidProfile { reason, .. } = err else {
-            panic!("expected InvalidProfile, got {err:?}");
+        let WargameError::InvalidProfile { reason, .. } = failure.error else {
+            panic!("expected InvalidProfile");
         };
         assert!(
             reason.contains("zsh:1: command not found: uv"),
             "error reason should surface the guest's stderr: {reason}"
         );
 
-        let log_path = provision_log_path(&opts, &profile);
+        let log_path = provision_log_path(&req.log_path, &profile.name);
         let log = std::fs::read_to_string(&log_path).unwrap();
         assert!(
             log.contains("==== uv --version (exit 127) ===="),

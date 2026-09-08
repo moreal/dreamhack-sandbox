@@ -43,6 +43,12 @@ pub struct UtmConfig {
     /// Display-name prefix for the VMs this app owns. Nothing outside it is
     /// ever stopped or deleted (spec.md §3 FR-5).
     pub vm_prefix: String,
+    /// Display-name prefix for the build-time VMs: the installation VM
+    /// `profile create` makes and the image VM `profile build` publishes.
+    /// It starts with [`UtmConfig::vm_prefix`] so ownership checks still
+    /// pass, but it is its own namespace so `prune` -- which matches
+    /// sessions, not names -- never mistakes a build VM for an orphan.
+    pub build_prefix: String,
     /// Boot timeout for `mode: emulate` guests.
     pub boot_timeout: Duration,
     /// Boot timeout for `mode: virtualize` guests.
@@ -65,6 +71,7 @@ impl Default for UtmConfig {
         UtmConfig {
             utmctl: None,
             vm_prefix: "wg-".to_string(),
+            build_prefix: "wg-build-".to_string(),
             boot_timeout: Duration::from_secs(1800),
             virtualize_boot_timeout: Duration::from_secs(300),
             stop_timeout: Duration::from_secs(120),
@@ -189,5 +196,16 @@ mod tests {
         assert!(cfg.owns_name("wg-dh-out-of-bound-a1b2c3"));
         assert!(!cfg.owns_name("kindle-vm"));
         assert!(!cfg.owns_name("Windows 11"));
+    }
+
+    /// A build VM is still ours (so it can be stopped and deleted), but it
+    /// is not in the session namespace.
+    #[test]
+    fn build_vms_are_owned_but_outside_the_session_namespace() {
+        let cfg = UtmConfig::default();
+        assert!(cfg.build_prefix.starts_with(&cfg.vm_prefix));
+        assert_ne!(cfg.build_prefix, cfg.vm_prefix);
+        assert!(cfg.owns_name("wg-build-kali-custom"));
+        assert!(cfg.owns_name("wg-build-image-kali-custom"));
     }
 }

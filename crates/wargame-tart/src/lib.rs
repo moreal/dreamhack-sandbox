@@ -7,6 +7,6 @@ pub mod image;
 pub mod list;
 pub mod provider;
 
-pub use build::{BuildOptions, ProfileImageBuilder, TransportFactory};
+pub use build::{default_build_log, TartImageBuilder, TransportFactory};
 pub use list::TartVm;
 pub use provider::{isolated_network_hint, TartConfig, TartProvider};
