@@ -171,6 +171,8 @@ if (Test-Path -LiteralPath $digestFile) {
 # directory at all.
 
 $refusalsFile = Join-Path $notes 'archive-refusals.txt'
+# A re-run reports what *this* run refused, not a union with the last one.
+Remove-Item -LiteralPath $refusalsFile -Force -ErrorAction SilentlyContinue
 
 function Write-Refusal {
     param([string] $Archive, [string] $Reason)

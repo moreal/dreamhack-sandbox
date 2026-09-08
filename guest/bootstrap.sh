@@ -236,6 +236,8 @@ fi
 # all, so a rejection can never leave a half-unpacked tree behind.
 
 REFUSALS="$NOTES/archive-refusals.txt"
+# A re-run reports what *this* run refused, not a union with the last one.
+rm -f "$REFUSALS"
 archive_reason=""
 
 archive_is_safe() {
@@ -344,8 +346,25 @@ fi
 META="$INCOMING/.wargame.json"
 README="$NOTES/README.md"
 
+summarize_raw() {
+  {
+    echo "# Challenge notes"
+    echo
+    echo "(no working python3 in this guest; showing the raw metadata)"
+    echo
+    echo '```json'
+    cat "$META"
+    echo
+    echo '```'
+  } >"$README"
+}
+
 if [ -f "$META" ]; then
-  if command -v python3 >/dev/null 2>&1; then
+  # A guest without a working python3 (a bare macOS image, say) still gets
+  # its notes: the summary is a convenience, never a reason to fail a
+  # launch, so the interpreter's own exit status is handled rather than
+  # left to `set -e`.
+  if command -v python3 >/dev/null 2>&1 &&
     python3 - "$META" "$README" <<'PYEOF'
 import json
 import sys
@@ -371,17 +390,10 @@ lines.append("")
 with open(out_path, "w", encoding="utf-8") as f:
     f.write("\n".join(lines))
 PYEOF
+  then
+    :
   else
-    {
-      echo "# Challenge notes"
-      echo
-      echo "(python3 unavailable in this guest; showing the raw metadata)"
-      echo
-      echo '```json'
-      cat "$META"
-      echo
-      echo '```'
-    } >"$README"
+    summarize_raw
   fi
 else
   {

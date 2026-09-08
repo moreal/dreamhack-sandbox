@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use wargame_core::domain::build::PublishedImage;
-use wargame_core::domain::{GuestEndpoint, NetworkMode, Profile, VmRef};
+use wargame_core::domain::{GuestEndpoint, GuestShell, NetworkMode, Profile, VmRef};
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::process::{Cmd, ProcessRunner};
 use wargame_core::ports::image_builder::{BuildRequest, GuestLink, Progress};
@@ -228,7 +228,14 @@ impl ProfileImageBuilder for TartImageBuilder {
         self.install_pubkey(req.profile, ip.to_string()).await?;
 
         let transport = (self.transport_factory)();
-        let endpoint = GuestEndpoint::new(ip, req.profile.guest.user.clone());
+        // Tart only runs macOS guests here, so this is always a POSIX
+        // endpoint -- but the shell comes from the profile's OS all the
+        // same, so the invariant holds by construction rather than by
+        // convention (spec.md §5 item 3).
+        let endpoint = GuestEndpoint {
+            shell: GuestShell::for_os(req.profile.guest.os),
+            ..GuestEndpoint::new(ip, req.profile.guest.user.clone())
+        };
 
         progress("waiting for SSH to accept the new key".to_string());
         transport.wait_ready(&endpoint, req.boot_timeout).await?;

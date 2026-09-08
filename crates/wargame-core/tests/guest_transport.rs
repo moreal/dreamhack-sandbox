@@ -1004,3 +1004,96 @@ fn malicious_archives_are_refused_whole_and_kept() {
     assert!(!Path::new("/tmp/wargame-evil.txt").exists());
     assert!(!Path::new("/wargame-evil.txt").exists());
 }
+
+/// `bootstrap.sh` must work on both POSIX guests it is shipped for, whose
+/// tools differ: macOS has `shasum` and bsdtar, Kali/Debian has `sha256sum`
+/// and GNU tar. The default test run uses the Nix shell's GNU tools; this
+/// one pins the macOS set explicitly.
+#[test]
+fn the_bash_bootstrap_works_with_the_macos_tool_set() {
+    if !Path::new("/usr/bin/shasum").exists() || !Path::new("/usr/bin/unzip").exists() {
+        eprintln!("skipping: the macOS tool set is not present");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    std::fs::create_dir_all(ws.join("incoming")).unwrap();
+    std::fs::write(ws.join("incoming/challenge.bin"), b"hi\n").unwrap();
+    std::fs::write(
+        ws.join("incoming/.wargame-sha256"),
+        "98ea6e4f216f2fb4b69fff9b3a44842c38686ca685f3f55dc48c5d3fb1107be4  challenge.bin\n",
+    )
+    .unwrap();
+    archive::zip(
+        &ws.join("incoming/challenge.zip"),
+        &[("hello.txt", b"hi\n", 0o100644)],
+    );
+
+    // `/usr/bin:/bin` is exactly what a stock macOS guest has: bsdtar,
+    // shasum (no sha256sum), unzip, bash 3.2.
+    let out = std::process::Command::new("/bin/bash")
+        .env("PATH", "/usr/bin:/bin")
+        .arg(guest_dir().join("bootstrap.sh"))
+        .arg(&ws)
+        .arg("--extract=true")
+        .output()
+        .expect("failed to spawn /bin/bash");
+    assert!(
+        out.status.success(),
+        "bootstrap.sh failed with the macOS tool set: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(ws.join("incoming/extracted/challenge/hello.txt").is_file());
+    assert!(ws.join("notes/README.md").is_file());
+}
+
+/// A guest with no working `python3` still gets its notes and a successful
+/// bootstrap: the metadata summary is a convenience, never a launch
+/// failure.
+#[test]
+fn a_guest_without_python3_still_bootstraps() {
+    if !have("bash") {
+        eprintln!("skipping: bash not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    std::fs::create_dir_all(ws.join("incoming")).unwrap();
+    std::fs::write(
+        ws.join("incoming/.wargame.json"),
+        r#"{"provider":"dreamhack","challenge_id":"11","title":"t","download_sha256":{}}"#,
+    )
+    .unwrap();
+
+    // A `python3` on PATH that always fails, as a macOS image without the
+    // Command Line Tools has.
+    let fake_bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    let fake_python = fake_bin.join("python3");
+    std::fs::write(&fake_python, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = std::process::Command::new(bash())
+        .env("PATH", path)
+        .arg(guest_dir().join("bootstrap.sh"))
+        .arg(&ws)
+        .arg("--extract=false")
+        .output()
+        .expect("failed to spawn bash");
+    assert!(
+        out.status.success(),
+        "a broken python3 must not fail the bootstrap: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let readme = std::fs::read_to_string(ws.join("notes/README.md")).unwrap();
+    assert!(readme.contains("dreamhack"), "{readme}");
+}
