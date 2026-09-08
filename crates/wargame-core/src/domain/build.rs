@@ -277,6 +277,20 @@ impl BuildRecord {
         self.updated_at = OffsetDateTime::now_utc();
     }
 
+    /// Remembers an image that still exists on the backend but is no longer
+    /// the published one, so `prune` keeps skipping it and the next build
+    /// retries deleting it. Recording the same image twice is a no-op.
+    pub fn track_leaked_image(&mut self, image: PublishedImage) {
+        if self.image.as_ref().map(|i| i.id == image.id) == Some(true) {
+            return;
+        }
+        if self.leaked_images.iter().any(|known| known.id == image.id) {
+            return;
+        }
+        self.leaked_images.push(image);
+        self.updated_at = OffsetDateTime::now_utc();
+    }
+
     /// Records a step that could not be undone after a failure.
     pub fn record_cleanup_failure(&mut self, detail: impl Into<String>) {
         self.cleanup_failures.push(detail.into());
@@ -535,6 +549,23 @@ mod tests {
         assert_eq!(
             missing,
             scripts_hash(dir.path(), &["scripts/nope.sh".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_leaked_image_is_tracked_once_and_never_the_published_one() {
+        let mut record = record();
+        record.image = Some(PublishedImage::new("CURRENT", "wg-build-image-kali-custom"));
+        record.track_leaked_image(PublishedImage::new("OLD", "wg-build-image-kali-custom"));
+        record.track_leaked_image(PublishedImage::new("OLD", "wg-build-image-kali-custom"));
+        record.track_leaked_image(PublishedImage::new("CURRENT", "wg-build-image-kali-custom"));
+        assert_eq!(
+            record
+                .leaked_images
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["OLD"]
         );
     }
 

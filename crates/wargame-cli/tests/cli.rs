@@ -94,11 +94,33 @@ fn profiles_json_lists_every_builtin_profile_including_the_templates() {
         .find(|p| p["name"] == "kali-arm64")
         .unwrap();
     assert_eq!(
-        kali["image"],
+        kali["image_state"],
         serde_json::Value::String("not created".to_string())
     );
     assert_eq!(kali["vm"]["backend"], "utm");
     assert_eq!(kali["default"], serde_json::Value::Bool(false));
+
+    // The added keys must not shadow the profile's own `image` (the base
+    // image a Tart profile is built from): `serde(flatten)` does not
+    // de-duplicate, and a parser keeping the last value would silently lose
+    // it.
+    let macos = profiles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "macos-re-arm64")
+        .unwrap();
+    assert_eq!(
+        macos["image"]["base"],
+        "ghcr.io/cirruslabs/macos-sequoia-vanilla:latest"
+    );
+    assert!(macos["image_state"].is_string(), "{macos}");
+    let raw = stdout_of(&out);
+    assert_eq!(
+        raw.matches("\"image\":").count(),
+        profiles.as_array().unwrap().len(),
+        "each row must carry exactly one `image` key:\n{raw}"
+    );
 }
 
 /// spec.md §4's `profile init`: the copy gets its own YAML *and* its own

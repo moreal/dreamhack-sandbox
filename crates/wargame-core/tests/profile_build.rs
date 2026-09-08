@@ -1464,3 +1464,47 @@ async fn each_stage_is_written_down_as_the_build_reaches_it() {
         f.builds.saves()
     );
 }
+
+/// A run that died between "the new image is recorded" and "the old one is
+/// deleted" leaves `previous_image` naming an image that still exists. The
+/// next build must not overwrite that reference with its own replacement:
+/// the image would stop being deleted, and `prune` would stop protecting it.
+#[tokio::test]
+async fn a_stale_previous_image_from_a_killed_run_is_not_lost() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let first = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    let current = first.ready_image().unwrap().clone();
+
+    // As if the process had been killed just after the `Ready` save of an
+    // earlier build: an image it replaced is still named and still exists.
+    let stale = PublishedImage::new("STALE-IMAGE", "wg-build-image-kali-arm64");
+    let mut interrupted = f.record("kali-arm64").await;
+    interrupted.previous_image = Some(stale.clone());
+    f.builds.insert(interrupted);
+
+    let second = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+
+    let discarded = f.utm.discarded.lock().unwrap().clone();
+    assert!(
+        discarded.contains(&stale.id),
+        "the stale image must still be deleted: {discarded:?}"
+    );
+    assert!(
+        discarded.contains(&current.id),
+        "so must the one this build replaced: {discarded:?}"
+    );
+    assert!(
+        second.leaked_images.is_empty(),
+        "{:?}",
+        second.leaked_images
+    );
+    assert_eq!(second.previous_image, None);
+    assert!(f.utm.has_image(&second.ready_image().unwrap().id));
+}

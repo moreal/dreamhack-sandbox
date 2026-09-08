@@ -271,6 +271,11 @@ pub fn print_checks(checks: &[Check], json: bool) {
 /// One `profiles --json` row: the profile itself plus its image-readiness
 /// state, which lives outside the [`Profile`] (it comes from the build
 /// record).
+///
+/// The added keys must not collide with anything [`Profile`] serializes --
+/// `serde(flatten)` writes into the same map with no de-duplication, so a
+/// second `image` key would shadow the profile's own `image: {base: …}` for
+/// every parser that keeps the last value.
 #[derive(Serialize)]
 struct ProfileJson<'a> {
     #[serde(flatten)]
@@ -278,7 +283,7 @@ struct ProfileJson<'a> {
     /// `"ready"`, `"rebuild needed"`, `"not built"`, or the phase a
     /// half-finished build stopped at. `null` when it could not be
     /// determined.
-    image: Option<String>,
+    image_state: Option<String>,
     default: bool,
 }
 
@@ -301,7 +306,7 @@ pub fn print_profiles(
             .enumerate()
             .map(|(i, profile)| ProfileJson {
                 profile,
-                image: status.get(i).cloned().flatten(),
+                image_state: status.get(i).cloned().flatten(),
                 default: profile.name == default_profile,
             })
             .collect();

@@ -664,6 +664,13 @@ pub async fn build(
             if builder.uses_installer_vm() {
                 record.installer_vm = Some(outcome.vm);
             }
+            // A run that died between recording a new image and deleting the
+            // one it replaced left that image behind and still named here.
+            // It exists, so it stays tracked rather than being overwritten
+            // by this build's own replacement.
+            if let Some(stale) = record.previous_image.take() {
+                record.track_leaked_image(stale);
+            }
             // The new image is written down *before* the old one is deleted:
             // a crash in between leaves two images, never none (FR-3).
             //
@@ -731,11 +738,16 @@ async fn discard_replaced_images(
     }
 
     let published = record.image.as_ref().map(|image| image.id.clone());
-    let mut leaked = Vec::new();
+    let mut leaked: Vec<PublishedImage> = Vec::new();
     for image in pending {
         // Never delete what the record currently points at, whatever the
         // bookkeeping says.
         if published.as_deref() == Some(image.id.as_str()) {
+            continue;
+        }
+        // The same image can be named twice (a stale `previous_image` that
+        // was also tracked as leaked); deleting it once is enough.
+        if leaked.iter().any(|done| done.id == image.id) {
             continue;
         }
         if let Err(e) = builder.discard_image(&image).await {
