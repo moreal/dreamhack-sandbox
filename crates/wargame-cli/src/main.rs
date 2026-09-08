@@ -335,6 +335,18 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
     }
 }
 
+/// Generates the host's guest SSH key if it is missing, warning rather than
+/// failing when that is not possible (no `ssh-keygen` on `PATH`, say) --
+/// every command that calls this has real work to report first.
+async fn ensure_host_key_or_warn(ctx: &AppContext) {
+    if let Err(e) = wiring::ensure_host_key(ctx).await {
+        eprintln!(
+            "Warning: could not prepare the host's SSH key: {e}\nGenerate it yourself with:\n  ssh-keygen -t ed25519 -N \"\" -f {}",
+            ctx.dirs.keys_dir().join("id_ed25519").display()
+        );
+    }
+}
+
 /// One profile's image readiness for the `profiles` table: what it would
 /// launch from, or why it cannot yet (spec.md §3 FR-1/FR-3).
 async fn profile_image_line(
@@ -390,9 +402,11 @@ async fn dispatch_profile(ctx: &AppContext, action: ProfileCommand) -> Result<i3
             from_vm,
             sha256,
         } => {
-            // The guest is told to authorize this key, so it has to exist
-            // before the instructions point at it.
-            wiring::ensure_host_key(ctx).await?;
+            // The guest is told to authorize this key, so it should exist
+            // before the instructions point at it -- but a host without
+            // `ssh-keygen` must still get the real answer about its profile
+            // and its ISO, so this never fails the command.
+            ensure_host_key_or_warn(ctx).await;
             let source = match (iso, from_vm) {
                 (Some(path), None) => CreateSource::Iso { path, sha256 },
                 (None, Some(uuid)) => CreateSource::FromVm { uuid },
@@ -426,9 +440,11 @@ async fn dispatch_profile(ctx: &AppContext, action: ProfileCommand) -> Result<i3
 
         ProfileCommand::Build { name } => {
             let name = name.unwrap_or_else(|| ctx.config.general.default_profile.clone());
-            // Both backends need the host key: Tart installs it into the
-            // guest, UTM expects the user to have authorized it.
-            wiring::ensure_host_key(ctx).await?;
+            // Both backends want the host key: Tart installs it into the
+            // guest, UTM expects the user to have authorized it. A failure
+            // here is reported, not fatal: the build itself says precisely
+            // what it could not read when it gets there.
+            ensure_host_key_or_warn(ctx).await;
             println!(
                 "Building the image for profile {name} (this takes tens of minutes the first time; NAT networking is used for provisioning)…"
             );
