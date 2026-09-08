@@ -5,10 +5,10 @@
 # PowerShell. Must be idempotent: `wargame profile build` re-runs it against
 # an already provisioned image.
 #
-# TODO(Task 5): PowerShell execution over the guest transport.
 # TODO(Task 6): the real Windows tool set -- OpenSSH Server, Python 3, Git,
 # 7-Zip -- with the install source and a verification command for each
-# (spec.md §3 FR-3).
+# (spec.md §3 FR-3). A script that needs a reboot before the next one runs
+# exits 3010; the build waits for the guest to come back and continues.
 
 $ErrorActionPreference = 'Stop'
 

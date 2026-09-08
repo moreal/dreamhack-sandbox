@@ -162,7 +162,8 @@ pub async fn stop(ctx: &AppContext, id: &str) -> Result<Session> {
     // (DESIGN.md §5). A failure here must never block the stop itself.
     match transport_for_session(ctx, &session) {
         Ok((endpoint, transport)) => {
-            if let Err(err) = transport.exec(&endpoint, &["sync".to_string()]).await {
+            let flush = crate::infra::GuestOps::for_endpoint(&endpoint).flush();
+            if let Err(err) = transport.exec(&endpoint, &flush).await {
                 tracing::debug!(session = %id, error = %err, "sync before stop failed; stopping anyway");
             }
         }
@@ -337,7 +338,7 @@ mod tests {
             disk: Arc::new(HostDiskSpace),
             profiles: ProfileStore::new(vec![], tmp_path()),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
-            bootstrap_script: "#!/bin/bash\n",
+            bootstrap: crate::app::BootstrapScripts::new("#!/bin/bash\n", "# ps\n"),
         };
         Fixture { ctx, vm, transport }
     }

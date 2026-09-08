@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use wargame_core::domain::build::{BuildSource, PublishedImage};
-use wargame_core::domain::{GuestEndpoint, NetworkMode, VmRef};
+use wargame_core::domain::{GuestEndpoint, GuestShell, NetworkMode, VmRef};
 use wargame_core::error::{Result, WargameError};
 use wargame_core::ports::image_builder::{BuildRequest, GuestLink, InstallerRequest, Progress};
 use wargame_core::ports::{
@@ -185,8 +185,17 @@ impl ProfileImageBuilder for UtmImageBuilder {
         let ip = self.utm.wait_ip(vm, req.boot_timeout).await?;
         progress(format!("guest address: {ip}"));
 
-        let endpoint = GuestEndpoint::new(ip, req.profile.guest.user.clone());
-        progress(format!("waiting for SSH as {endpoint}"));
+        // The guest's OS decides how commands are phrased on this endpoint:
+        // a Windows profile connects as a PowerShell endpoint, so the
+        // transport encodes rather than POSIX-quotes (spec.md §3 FR-4).
+        let endpoint = GuestEndpoint {
+            shell: GuestShell::for_os(req.profile.guest.os),
+            ..GuestEndpoint::new(ip, req.profile.guest.user.clone())
+        };
+        progress(format!(
+            "waiting for SSH as {endpoint} ({} shell)",
+            endpoint.shell
+        ));
         self.transport
             .wait_ready(&endpoint, req.boot_timeout)
             .await

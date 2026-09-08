@@ -35,6 +35,7 @@ use crate::domain::build::{
 use crate::domain::compat::Backend;
 use crate::domain::{GuestOs, GuestShell, Profile, VmRef};
 use crate::error::{Result, WargameError};
+use crate::infra::GuestOps;
 use crate::ports::image_builder::{
     BuildObserver, BuildRequest, GuestLink, InstallerRequest, Progress,
 };
@@ -600,15 +601,20 @@ pub async fn build(
     let execution = resolve_backend(&profile)?;
     let builder = ctx.builders.get(execution.backend.as_str())?;
 
-    // Windows guests need the PowerShell transport and a PowerShell
-    // provisioning path, which is the next task. Refuse here, before the VM
-    // is touched at all, rather than half-provisioning a guest.
-    if GuestShell::for_os(profile.guest.os) == GuestShell::PowerShell {
-        return Err(refuse(
-            &profile.name,
-            "Windows provisioning arrives in Task 5: this build would have to run PowerShell in the guest, and no PowerShell guest transport is wired yet. `profile create` and `profile console` already work, so the installation VM can be prepared in the meantime",
-        ));
-    }
+    // A guest whose shell has no wired transport could never be
+    // provisioned, so refuse before the VM is touched at all rather than
+    // half-provisioning it (spec.md §3 FR-4).
+    ctx.transports
+        .for_shell(GuestShell::for_os(profile.guest.os))
+        .map_err(|e| {
+            refuse(
+                &profile.name,
+                format!(
+                    "its guest is driven through {}, and {e}",
+                    GuestShell::for_os(profile.guest.os)
+                ),
+            )
+        })?;
 
     let record = match ctx.builds.load(&profile.name).await? {
         Some(record) => record,
@@ -1051,41 +1057,38 @@ async fn stage(
 
 /// Copies the profile's `scripts/` tree into the guest and runs each
 /// `provision.scripts` entry there (spec.md §3 FR-3: "설치 스크립트는 반드시
-/// 게스트에서 실행한다").
+/// 게스트에서 실행한다", "macOS/Kali는 Bash, Windows는 PowerShell로 실행한다").
+///
+/// The OS decides every command's shape through [`GuestOps`]; nothing here
+/// tests the guest's operating system.
 async fn provision(req: &BuildRequest<'_>, link: &GuestLink, progress: Progress<'_>) -> Result<()> {
     let profile = req.profile;
+    let ops = GuestOps::for_endpoint(&link.endpoint);
     let log_path = provision_log_path(&req.log_path, &profile.name);
     progress(format!("provisioning log: {}", log_path.display()));
 
     progress("copying provisioning scripts into the guest".to_string());
     // `~` is never expanded in `GuestTransport::exec` argv (every argument
-    // is quoted before being sent to the guest shell), so all guest-side
-    // paths are relative to the SSH user's home directory. `scp -r
-    // <src>/scripts wg-provision` would, on a guest where `wg-provision`
+    // is quoted or encoded before being sent to the guest shell), so all
+    // guest-side paths are relative to the SSH user's home directory. `scp
+    // -r <src>/scripts wg-provision` would, on a guest where `wg-provision`
     // does not already exist, create `wg-provision` *as* a copy of
     // `scripts` -- so make the destination first and copy into it with a
-    // trailing slash.
-    link.transport
-        .exec(
-            &link.endpoint,
-            &[
-                "mkdir".to_string(),
-                "-p".to_string(),
-                "wg-provision".to_string(),
-            ],
-        )
-        .await?;
+    // trailing separator.
+    for argv in ops.mkdir_p(&[PROVISION_DIR.to_string()]) {
+        link.transport.exec(&link.endpoint, &argv).await?;
+    }
     link.transport
         .copy_in(
             &link.endpoint,
             &req.scripts_dir.join("scripts"),
-            "wg-provision/",
+            &ops.dir_dest(PROVISION_DIR),
         )
         .await?;
 
     for script in &profile.provision.scripts {
         progress(format!("provisioning: {script}"));
-        let argv = vec!["bash".to_string(), format!("wg-provision/{script}")];
+        let argv = ops.run_script(&ops.join(PROVISION_DIR, script));
         let out = link.transport.exec(&link.endpoint, &argv).await?;
         log_exec(
             &log_path,
@@ -1120,7 +1123,7 @@ async fn wait_for_reboot(
     link: &GuestLink,
     progress: Progress<'_>,
 ) -> Result<()> {
-    let probe = ["true".to_string()];
+    let probe = GuestOps::for_endpoint(&link.endpoint).probe();
     let deadline = tokio::time::Instant::now() + REBOOT_DROP_TIMEOUT;
     loop {
         match link.transport.exec(&link.endpoint, &probe).await {
@@ -1141,6 +1144,9 @@ async fn wait_for_reboot(
         .wait_ready(&link.endpoint, req.boot_timeout)
         .await
 }
+
+/// Where the profile's `scripts/` tree lands in the guest's home directory.
+const PROVISION_DIR: &str = "wg-provision";
 
 /// How long to wait for SSH to actually drop after a reboot-required script.
 const REBOOT_DROP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -1198,27 +1204,17 @@ async fn verify(
 /// the shutdown. Never fatal: a guest that cannot `sync` still gets a
 /// graceful stop, and the stop itself is what the build actually depends on.
 async fn flush_guest(link: &GuestLink, progress: Progress<'_>) {
+    let ops = GuestOps::for_endpoint(&link.endpoint);
     progress("cleaning up provisioning files".to_string());
     if let Err(e) = link
         .transport
-        .exec(
-            &link.endpoint,
-            &[
-                "rm".to_string(),
-                "-rf".to_string(),
-                "wg-provision".to_string(),
-            ],
-        )
+        .exec(&link.endpoint, &ops.remove_tree(PROVISION_DIR))
         .await
     {
-        tracing::warn!(error = %e, "could not remove wg-provision from the guest");
+        tracing::warn!(error = %e, "could not remove {PROVISION_DIR} from the guest");
     }
     progress("flushing guest filesystem and shutting down".to_string());
-    match link
-        .transport
-        .exec(&link.endpoint, &["sync".to_string()])
-        .await
-    {
+    match link.transport.exec(&link.endpoint, &ops.flush()).await {
         Ok(out) if out.status != 0 => {
             tracing::warn!(
                 status = out.status,

@@ -91,9 +91,11 @@ impl std::fmt::Debug for BackendRegistry {
 }
 
 /// The transports available for talking to a guest, chosen by the endpoint's
-/// [`GuestShell`]. The PowerShell transport is a later task; until it is
-/// registered, a PowerShell endpoint is an error rather than a POSIX
-/// connection that would quote its arguments wrongly.
+/// [`GuestShell`]. `wiring.rs` registers the same endpoint-driven
+/// [`crate::infra::SshGuestTransport`] in both slots; a build with no
+/// PowerShell transport registered refuses a Windows endpoint outright,
+/// rather than opening a POSIX connection that would quote its arguments
+/// wrongly.
 #[derive(Clone)]
 pub struct TransportRegistry {
     posix: Arc<dyn GuestTransport>,

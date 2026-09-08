@@ -458,7 +458,7 @@ mod tests {
             disk: Arc::new(HostDiskSpace),
             profiles: ProfileStore::new(vec![], tmp_path()),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
-            bootstrap_script: "#!/bin/bash\n",
+            bootstrap: crate::app::BootstrapScripts::new("#!/bin/bash\n", "# ps\n"),
         }
     }
 

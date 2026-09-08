@@ -43,7 +43,7 @@ fn context() -> (AppContext, Arc<FakeVmProvider>) {
         disk: Arc::new(HostDiskSpace),
         profiles: ProfileStore::new(vec![], tmp_path()),
         runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
-        bootstrap_script: "#!/bin/bash\n",
+        bootstrap: wargame_core::app::BootstrapScripts::new("#!/bin/bash\n", "# ps\n"),
     };
     (ctx, vm)
 }

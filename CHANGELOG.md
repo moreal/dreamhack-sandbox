@@ -4,6 +4,50 @@ All notable changes to `wargame-vm` are recorded here. This project has not
 yet made a versioned release; entries are grouped by the MVP milestones
 defined in `MVP.md` §36 and the implementation plan in `PLAN.md`.
 
+## [Unreleased] — Multi-OS guests (2026-09-09)
+
+### Added
+
+- **PowerShell guests**: `wargame-core::infra::powershell` encodes a guest
+  command as UTF-16LE + base64 for `powershell -EncodedCommand`, with
+  PowerShell literal quoting instead of POSIX quoting, so Windows paths,
+  spaces, single/double quotes, `$`, backticks, Korean text and newlines
+  reach the guest intact and the command's own exit code (3010 included)
+  comes back.
+- **`guest/bootstrap.ps1`**: the Windows counterpart of `bootstrap.sh` --
+  the same `incoming`/`work`/`notes`/`output` workspace, the same challenge
+  metadata summary, the same SHA-256 verification and the same
+  archive-safety rules.
+- **`wargame-core::infra::GuestOps`**: the single place a guest command's OS
+  shape is decided (`mkdir -p` vs `New-Item`, `bash` vs `powershell -File`,
+  `sync` vs `Write-VolumeCache`, `/` vs `\`), so no application service
+  branches on the guest OS.
+
+### Changed
+
+- **`wargame profile build` provisions Windows** instead of refusing it: the
+  profile's `scripts/windows/*.ps1` are copied into the guest and run with
+  PowerShell, exit code 3010 waits for the reboot and continues, and
+  `tools.verify` runs through the same OS-aware exec. A build whose guest
+  shell has no wired transport is still refused before the VM is touched.
+- **`wargame ssh` into a Windows session lands in PowerShell**, and every
+  lifecycle step (bootstrap, flush-before-stop, resume, gui) uses the
+  session's saved shell rather than assuming POSIX.
+- **Guest readiness** distinguishes SSH, key authentication and the shell
+  itself, and reports which is missing, how long it waited, the timeout used
+  and how to raise it (`WargameError::GuestNotReady`); a missing service is
+  never reported as ready.
+- **Transferred files are verified in the guest**: the host stages an
+  `incoming/.wargame-sha256` list and both bootstrap scripts recompute every
+  digest before anything is unpacked.
+- **Archive extraction refuses a whole archive** when any entry is absolute,
+  traverses with `..` or `..\`, carries a drive letter, UNC prefix or `:`,
+  is a reserved Windows device name, ends in a dot or space, contains a
+  control character, or is a symbolic/hard link. The original stays in
+  `incoming/`, no destination directory is created, and the reason is
+  reported in `notes/archive-refusals.txt`. Extraction still happens only in
+  the guest.
+
 ## [Unreleased] — Usability pass (2026-09-08)
 
 ### Changed

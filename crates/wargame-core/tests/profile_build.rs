@@ -19,7 +19,7 @@ use wargame_core::app::{
 use wargame_core::domain::build::{
     BuildPhase, BuildRecord, BuildSource, BuildStage, PublishedImage,
 };
-use wargame_core::domain::{GuestEndpoint, VmRef};
+use wargame_core::domain::{GuestEndpoint, GuestShell, VmRef};
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::fs::AppDirs;
 use wargame_core::infra::process::ProcessRunner;
@@ -29,6 +29,7 @@ use wargame_core::ports::{
 };
 use wargame_core::testing::{
     FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider, MemoryBuildRepo, MemoryRepo,
+    TransportCall,
 };
 
 // --- fakes ----------------------------------------------------------------
@@ -210,10 +211,12 @@ impl ProfileImageBuilder for FakeBuilder {
         self.record("connect");
         self.should_fail("connect")?;
         Ok(GuestLink {
-            endpoint: GuestEndpoint::new(
-                "10.0.0.9".parse().unwrap(),
-                req.profile.guest.user.clone(),
-            ),
+            // The guest's OS decides the endpoint's shell, exactly as the
+            // real UTM/Tart builders do.
+            endpoint: GuestEndpoint {
+                shell: GuestShell::for_os(req.profile.guest.os),
+                ..GuestEndpoint::new("10.0.0.9".parse().unwrap(), req.profile.guest.user.clone())
+            },
             transport: self
                 .guest
                 .lock()
@@ -512,6 +515,7 @@ fn fixture_with_disk(disk: FakeDisk) -> Fixture {
 
     let utm = Arc::new(FakeBuilder::utm());
     let tart = Arc::new(FakeBuilder::tart());
+    let guest_transport = Arc::new(FakeTransport::new()) as Arc<dyn GuestTransport>;
     let builds = Arc::new(MemoryBuildRepo::new());
     utm.watch(builds.clone());
     tart.watch(builds.clone());
@@ -524,7 +528,10 @@ fn fixture_with_disk(disk: FakeDisk) -> Fixture {
             Arc::new(FakeVmProvider::new()) as Arc<dyn VmProvider>,
             vm_utm as Arc<dyn VmProvider>,
         ]),
-        transports: TransportRegistry::new(Arc::new(FakeTransport::new())),
+        // One transport serves both shells: it phrases each command for the
+        // endpoint it is given, exactly as `wiring.rs` registers it.
+        transports: TransportRegistry::new(guest_transport.clone())
+            .with_powershell(guest_transport),
         repo: Arc::new(MemoryRepo::new()),
         builds: builds.clone(),
         builders: BuilderRegistry::new(vec![
@@ -534,7 +541,7 @@ fn fixture_with_disk(disk: FakeDisk) -> Fixture {
         disk: Arc::new(disk),
         profiles: ProfileStore::new(Vec::new(), profiles_dir),
         runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
-        bootstrap_script: "#!/bin/bash\n",
+        bootstrap: wargame_core::app::BootstrapScripts::new("#!/bin/bash\n", "# ps\n"),
     };
     Fixture {
         ctx,
@@ -1168,17 +1175,77 @@ async fn a_failed_discard_of_the_old_image_is_recorded_not_swallowed() {
     assert!(record.cleanup_failures[0].contains("could not delete"));
 }
 
-/// Windows guests need the PowerShell transport, which is the next task.
+/// A Windows profile now builds like any other, with every guest-side
+/// command phrased for PowerShell (spec.md §3 FR-3/FR-4).
 #[tokio::test]
-async fn a_windows_build_is_refused_before_the_guest_is_touched() {
+async fn a_windows_build_provisions_through_powershell() {
     let f = fixture();
     profile_build::create(&f.ctx, "windows-x86_64", iso_source(&f.iso))
         .await
         .unwrap();
+
+    let record = profile_build::build(&f.ctx, "windows-x86_64", &mut noop)
+        .await
+        .expect("a Windows profile provisions");
+    assert_eq!(record.phase, BuildPhase::Ready);
+
+    let argvs: Vec<Vec<String>> = f
+        .utm
+        .transport
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            TransportCall::Exec { endpoint, argv } => {
+                assert_eq!(
+                    endpoint.shell,
+                    GuestShell::PowerShell,
+                    "a Windows guest is reached as a PowerShell endpoint"
+                );
+                Some(argv)
+            }
+            _ => None,
+        })
+        .collect();
+
+    let flat: Vec<String> = argvs.iter().flatten().cloned().collect();
+    assert!(
+        flat.iter().any(|a| a == "New-Item"),
+        "the workspace is made with New-Item, not mkdir: {argvs:?}"
+    );
+    assert!(
+        !flat
+            .iter()
+            .any(|a| a == "mkdir" || a == "bash" || a == "sync"),
+        "no POSIX command may reach a Windows guest: {argvs:?}"
+    );
+    assert!(
+        argvs
+            .iter()
+            .any(|argv| argv[0] == "powershell" && argv.iter().any(|a| a.ends_with("common.ps1"))),
+        "the profile's .ps1 must be run through PowerShell: {argvs:?}"
+    );
+    assert!(
+        argvs
+            .iter()
+            .any(|argv| argv.iter().any(|a| a.contains("wg-provision\\scripts"))),
+        "guest paths use the Windows separator: {argvs:?}"
+    );
+}
+
+/// A build whose guest shell has no wired transport is refused before the
+/// VM is touched at all, rather than half-provisioned.
+#[tokio::test]
+async fn a_build_without_a_transport_for_the_guest_shell_is_refused_early() {
+    let mut f = fixture();
+    f.ctx.transports = TransportRegistry::new(Arc::new(FakeTransport::new()));
+    profile_build::create(&f.ctx, "windows-x86_64", iso_source(&f.iso))
+        .await
+        .unwrap();
+
     let err = profile_build::build(&f.ctx, "windows-x86_64", &mut noop)
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("Task 5"), "{err}");
+    assert!(err.to_string().contains("powershell"), "{err}");
 
     let record = f.record("windows-x86_64").await;
     assert_eq!(record.phase, BuildPhase::AwaitingInstall);

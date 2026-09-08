@@ -148,10 +148,20 @@ touched by `wargame prune`.
 
 Windows 11 additionally needs TPM 2.0 and Secure Boot, which UTM 4.7.5
 cannot set from a script; `profile create` prints the one-time manual step
-(UTM ▸ Settings ▸ QEMU) for a `windows-*` profile. Windows *provisioning*
-(PowerShell in the guest) is not implemented yet and `profile build` says
-so rather than half-provisioning a guest. You supply the Windows ISO and its
-licence.
+(UTM ▸ Settings ▸ QEMU) for a `windows-*` profile. You supply the Windows
+ISO and its licence.
+
+Windows guests are driven through PowerShell rather than a POSIX shell:
+`profile build` copies `profiles/scripts/windows/*.ps1` into the guest and
+runs each one with `powershell -File`, a script that exits 3010 makes the
+build wait for the reboot and carry on, `tools.verify` runs the same way,
+and `wargame ssh <session>` lands you in PowerShell. Commands cross the wire
+as `-EncodedCommand` (UTF-16LE + base64), so Windows paths, spaces, quotes
+and Korean characters survive intact; files go over `scp`'s SFTP protocol
+with the destination path untouched. The guest needs OpenSSH Server running
+with PowerShell as its default shell — if it is not ready, the wait says
+which of SSH, key authentication or the shell is missing, how long it
+waited and how to raise the timeout.
 
 ```sh
 $ wargame search out_of_bound
@@ -434,7 +444,7 @@ crates/
                        the profile image build
   wargame-cli/         CLI (clap) + TUI (ratatui) composition root
 profiles/              built-in profile YAMLs + their provisioning scripts
-guest/                 bootstrap.sh, run inside the guest only
+guest/                 bootstrap.sh / bootstrap.ps1, run inside the guest only
 scripts/e2e-smoke.sh   manual real-VM smoke test (see Testing)
 ```
 

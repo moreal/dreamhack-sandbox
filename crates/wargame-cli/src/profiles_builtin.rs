@@ -68,11 +68,17 @@ pub fn builtin_provision_scripts() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// The trusted guest bootstrap script (`guest/bootstrap.sh`), handed to
-/// `wargame-core::app::launch` via [`wargame_core::app::AppContext::bootstrap_script`].
+/// The trusted guest bootstrap scripts (`guest/bootstrap.sh` for macOS and
+/// Kali, `guest/bootstrap.ps1` for Windows), handed to
+/// `wargame-core::app::launch` via [`wargame_core::app::AppContext::bootstrap`].
 pub const BOOTSTRAP_SH: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../guest/bootstrap.sh"
+));
+
+pub const BOOTSTRAP_PS1: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../guest/bootstrap.ps1"
 ));
 
 /// `(filename, content)` for every built-in profile YAML, in a stable
@@ -208,7 +214,14 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_script_is_embedded() {
+    fn bootstrap_scripts_are_embedded() {
         assert!(BOOTSTRAP_SH.starts_with("#!/usr/bin/env bash"));
+        assert!(BOOTSTRAP_PS1.starts_with("# wargame-vm"));
+        // Both halves of the workspace contract, so a Windows guest gets the
+        // same layout a POSIX one does (spec.md §3 FR-4).
+        for dir in ["incoming", "work", "notes", "output"] {
+            assert!(BOOTSTRAP_SH.contains(dir), "bootstrap.sh: {dir}");
+            assert!(BOOTSTRAP_PS1.contains(dir), "bootstrap.ps1: {dir}");
+        }
     }
 }

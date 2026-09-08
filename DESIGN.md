@@ -81,7 +81,8 @@ Public search/detail responses are stored as sanitized fixtures under `crates/wa
 │   ├── macos-re-arm64.yaml
 │   └── scripts/macos/{common.sh,reversing.sh}
 ├── guest/
-│   └── bootstrap.sh               # trusted guest bootstrap (embedded via include_str!)
+│   ├── bootstrap.sh               # trusted guest bootstrap, POSIX (embedded via include_str!)
+│   └── bootstrap.ps1              # trusted guest bootstrap, Windows/PowerShell
 ├── docs/
 │   └── (generated plans / notes)
 ├── DESIGN.md, PLAN.md, MVP.md, README.md
@@ -230,8 +231,10 @@ Output: stream of `LaunchEvent` (for CLI progress lines and TUI progress screen)
 3. vm.create(spec) → vm_ref persisted immediately
 4. state Downloading: for each asset → StagingDir, sha256 recorded in session.assets
 5. state Booting: vm.start(headless unless gui) → pid persisted; vm.wait_ip; transport.wait_ready
-6. state Provisioning: copy bootstrap.sh + metadata.json + each asset → ~/wargame/<slug>/incoming/ ;
-   exec `bash ~/wargame/.wg/bootstrap.sh <slug> --extract=<bool>`
+6. state Provisioning: copy the guest's bootstrap script + metadata.json + the
+   SHA-256 list + each asset → <workspace>/<slug>/incoming/ ; run the bootstrap
+   in the guest's own shell (`bash … --extract=<bool>`, or
+   `powershell -File … -Workspace … -Extract …` for a Windows guest)
 7. staging dir deleted (unless config.debug.keep_staging)
 8. state Ready
 On any error: state Failed with last_error; VM is left in place so `wargame delete` can clean it; the error message tells the user the session id.

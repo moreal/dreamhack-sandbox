@@ -61,8 +61,30 @@ pub struct AppContext {
     pub disk: Arc<dyn DiskSpace>,
     pub profiles: ProfileStore,
     pub runner: Arc<dyn ProcessRunner>,
-    /// The trusted guest bootstrap script (`guest/bootstrap.sh`), embedded
-    /// into the `wargame` binary by the CLI crate via `include_str!` and
-    /// handed down here so `app::launch` never has to read it from disk.
-    pub bootstrap_script: &'static str,
+    /// The trusted guest bootstrap scripts, embedded into the `wargame`
+    /// binary by the CLI crate via `include_str!` and handed down here so
+    /// `app::launch` never has to read them from disk.
+    pub bootstrap: BootstrapScripts,
+}
+
+/// The trusted guest bootstrap scripts, one per guest shell
+/// (`guest/bootstrap.sh` and `guest/bootstrap.ps1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapScripts {
+    pub posix: &'static str,
+    pub powershell: &'static str,
+}
+
+impl BootstrapScripts {
+    pub fn new(posix: &'static str, powershell: &'static str) -> Self {
+        BootstrapScripts { posix, powershell }
+    }
+
+    /// The script a guest with this shell runs.
+    pub fn for_shell(&self, shell: crate::domain::GuestShell) -> &'static str {
+        match shell {
+            crate::domain::GuestShell::Posix => self.posix,
+            crate::domain::GuestShell::PowerShell => self.powershell,
+        }
+    }
 }

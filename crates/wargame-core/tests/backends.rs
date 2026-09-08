@@ -422,7 +422,7 @@ fn fixture(profiles: Vec<Profile>) -> Fixture {
         disk: Arc::new(HostDiskSpace),
         profiles: ProfileStore::new(profiles, tmp_path()),
         runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
-        bootstrap_script: "#!/bin/bash\n",
+        bootstrap: wargame_core::app::BootstrapScripts::new("#!/bin/bash\n", "# ps\n"),
     };
     Fixture {
         ctx,
@@ -735,7 +735,7 @@ async fn a_session_whose_backend_is_not_wired_reports_it_by_name() {
         disk: Arc::new(HostDiskSpace),
         profiles: ProfileStore::new(vec![], tmp_path()),
         runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
-        bootstrap_script: "#!/bin/bash\n",
+        bootstrap: wargame_core::app::BootstrapScripts::new("#!/bin/bash\n", "# ps\n"),
     };
     let orphaned = session(
         "s-utm",

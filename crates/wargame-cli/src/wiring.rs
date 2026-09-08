@@ -15,7 +15,7 @@ use std::time::Duration;
 use url::Url;
 
 use wargame_core::app::{
-    AppContext, BackendRegistry, BuilderRegistry, ProfileStore, TransportRegistry,
+    AppContext, BackendRegistry, BootstrapScripts, BuilderRegistry, ProfileStore, TransportRegistry,
 };
 use wargame_core::config::Config;
 use wargame_core::error::{Result, WargameError};
@@ -136,7 +136,10 @@ pub fn build_context(
         disk: Arc::new(HostDiskSpace) as Arc<dyn DiskSpace>,
         profiles,
         runner,
-        bootstrap_script: profiles_builtin::BOOTSTRAP_SH,
+        bootstrap: BootstrapScripts::new(
+            profiles_builtin::BOOTSTRAP_SH,
+            profiles_builtin::BOOTSTRAP_PS1,
+        ),
     })
 }
 
@@ -229,25 +232,29 @@ fn build_vm_backends(
             fake_tart.add_image(profile.image_name());
             fake_utm.add_image(profile.image_name());
         }
+        let fake_transport = Arc::new(FakeTransport::new()) as Arc<dyn GuestTransport>;
         return (
             BackendRegistry::new(vec![
                 fake_tart as Arc<dyn VmProvider>,
                 fake_utm as Arc<dyn VmProvider>,
             ]),
-            TransportRegistry::new(Arc::new(FakeTransport::new()) as Arc<dyn GuestTransport>),
+            TransportRegistry::new(fake_transport.clone()).with_powershell(fake_transport),
         );
     }
 
+    // One transport serves every guest: it phrases each command for the
+    // endpoint's own shell, so the PowerShell slot is the same adapter
+    // (spec.md §3 FR-4).
     let transport = Arc::new(SshGuestTransport::new(
         runner.clone(),
         dirs.keys_dir().join("id_ed25519"),
-    ));
+    )) as Arc<dyn GuestTransport>;
     (
         BackendRegistry::new(vec![
             providers.tart.clone() as Arc<dyn VmProvider>,
             providers.utm.clone() as Arc<dyn VmProvider>,
         ]),
-        TransportRegistry::new(transport as Arc<dyn GuestTransport>),
+        TransportRegistry::new(transport.clone()).with_powershell(transport),
     )
 }
 

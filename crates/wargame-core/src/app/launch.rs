@@ -13,6 +13,7 @@ use crate::domain::{
     Profile, ResolvedBackend, Resources, Session, SessionAsset, SessionState,
 };
 use crate::error::{Result, WargameError};
+use crate::infra::GuestOps;
 use crate::ports::{
     AuthState, DownloadedFile, GuestTransport, ImageRef, StartOptions, VmProvider, VmSpec,
 };
@@ -426,9 +427,13 @@ async fn run_launch(
 /// Writes the trusted bootstrap script and per-launch metadata into the
 /// guest workspace (MVP.md §15's `<root>/<slug>/{incoming,work,notes,
 /// output}/` layout, created by the bootstrap script itself) and runs it.
-/// Never extracts or executes challenge artifacts host-side — only
-/// `copy_in` (scp) and a single, fixed `bash <bootstrap> <dir>
-/// --extract=<bool>` invocation happen here.
+///
+/// Every command and path here comes from [`GuestOps`], so a Windows guest
+/// gets `New-Item`, backslash paths and `bootstrap.ps1` while a macOS or
+/// Kali guest gets exactly the `mkdir -p` / `bash bootstrap.sh` it always
+/// did (spec.md §3 FR-4). Nothing is extracted or executed host-side — only
+/// `copy_in` (scp) and one fixed bootstrap invocation happen here, and the
+/// challenge files themselves are never run.
 #[allow(clippy::too_many_arguments)]
 async fn provision_guest(
     ctx: &AppContext,
@@ -440,39 +445,48 @@ async fn provision_guest(
     staging: &StagingDir,
     downloaded_files: &[DownloadedFile],
 ) -> Result<()> {
-    let workspace_root = profile.workspace.root.trim_end_matches('/');
-    let bootstrap_dir = format!("{workspace_root}/.wg");
-    let incoming_dir = format!("{workspace_root}/{}/incoming", challenge.summary.slug);
+    let ops = GuestOps::for_endpoint(endpoint);
+    let workspace_root = ops.trim_root(&profile.workspace.root);
+    let workspace = ops.join(&workspace_root, &challenge.summary.slug);
+    let bootstrap_dir = ops.join(&workspace_root, ".wg");
+    let incoming_dir = ops.join(&workspace, "incoming");
 
-    let mkdir = transport
-        .exec(
-            endpoint,
-            &[
-                "mkdir".to_string(),
-                "-p".to_string(),
-                bootstrap_dir.clone(),
-                incoming_dir.clone(),
-            ],
-        )
-        .await?;
-    if mkdir.status != 0 {
-        return Err(WargameError::CopyFailed(format!(
-            "mkdir -p on guest failed: {}",
-            mkdir.stderr
-        )));
+    for argv in ops.mkdir_p(&[bootstrap_dir.clone(), incoming_dir.clone()]) {
+        let mkdir = transport.exec(endpoint, &argv).await?;
+        if mkdir.status != 0 {
+            return Err(WargameError::CopyFailed(format!(
+                "creating {} on the guest failed: {}",
+                argv.last().map(String::as_str).unwrap_or_default(),
+                mkdir.stderr
+            )));
+        }
     }
 
-    let bootstrap_path = staging.path.join("bootstrap.sh");
-    std::fs::write(&bootstrap_path, ctx.bootstrap_script)?;
+    let bootstrap_name = ops.bootstrap_name();
+    let bootstrap_path = staging.path.join(bootstrap_name);
+    std::fs::write(&bootstrap_path, ctx.bootstrap.for_shell(endpoint.shell))?;
     transport
-        .copy_in(endpoint, &bootstrap_path, &format!("{bootstrap_dir}/"))
+        .copy_in(endpoint, &bootstrap_path, &ops.dir_dest(&bootstrap_dir))
         .await?;
 
     for file in downloaded_files {
         transport
-            .copy_in(endpoint, &file.path, &format!("{incoming_dir}/"))
+            .copy_in(endpoint, &file.path, &ops.dir_dest(&incoming_dir))
             .await?;
     }
+
+    // The digests the guest checks its copies against (spec.md §3 FR-4:
+    // "게스트 파일 해시는 호스트 staging 해시와 같아야 한다"), in `sha256sum`
+    // layout so neither bootstrap script has to parse JSON.
+    let digest_list: String = downloaded_files
+        .iter()
+        .map(|file| format!("{}  {}\n", file.sha256, file.filename))
+        .collect();
+    let digest_path = staging.path.join(".wargame-sha256");
+    std::fs::write(&digest_path, digest_list)?;
+    transport
+        .copy_in(endpoint, &digest_path, &ops.dir_dest(&incoming_dir))
+        .await?;
 
     let mut download_sha256 = serde_json::Map::new();
     for file in downloaded_files {
@@ -492,15 +506,14 @@ async fn provision_guest(
         serde_json::to_vec_pretty(&metadata).map_err(|e| WargameError::Other(e.to_string()))?;
     std::fs::write(&metadata_path, metadata_bytes)?;
     transport
-        .copy_in(endpoint, &metadata_path, &format!("{incoming_dir}/"))
+        .copy_in(endpoint, &metadata_path, &ops.dir_dest(&incoming_dir))
         .await?;
 
-    let argv = vec![
-        "bash".to_string(),
-        format!("{bootstrap_dir}/bootstrap.sh"),
-        format!("{workspace_root}/{}", challenge.summary.slug),
-        format!("--extract={}", req.extract),
-    ];
+    let argv = ops.run_bootstrap(
+        &ops.join(&bootstrap_dir, bootstrap_name),
+        &workspace,
+        req.extract,
+    );
     let out = transport.exec(endpoint, &argv).await?;
     if out.status != 0 {
         return Err(WargameError::GuestBootstrapFailed(format!(
@@ -592,7 +605,7 @@ mod tests {
             disk: Arc::new(HostDiskSpace),
             profiles: ProfileStore::new(vec![test_profile()], profiles_dir),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
-            bootstrap_script: "#!/bin/bash\necho hi\n",
+            bootstrap: crate::app::BootstrapScripts::new("#!/bin/bash\necho hi\n", "# ps\n"),
         };
         Fixture {
             ctx,
