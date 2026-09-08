@@ -3,8 +3,13 @@
 All notable changes to `wargame-vm` are recorded here.
 
 Entries for the next release are kept as [sacho](https://sacho.dev/) fragments
-under `changes.d/` and compiled into the region below at release time. Do not
-edit that region, or any released section, by hand.
+under `changes.d/` — one file per user-visible change — and compiled into the
+generated region below. Never edit that region, or a released section, by
+hand; add or edit a fragment instead.
+
+This project has not made a versioned release yet. The `[Unreleased]`
+sections after the generated region are frozen notes from the milestones that
+predate sacho, kept for history.
 
 <!-- sacho:unreleased:begin -->
 
@@ -33,9 +38,9 @@ To be released.
     `wargame` picks the one that can run it, so macOS guests keep working
     exactly as before.
 
- -  `wargame profiles` shows what that resolved to -- the guest system and
+ -  `wargame profiles` shows what that resolved to — the guest system and
     architecture, the virtualizer and whether it virtualizes or emulates,
-    and the profile's image state -- and `wargame doctor` reports the health
+    and the profile's image state — and `wargame doctor` reports the health
     of every virtualizer you actually have profiles for. A session made with
     a profile whose virtualizer this build cannot drive still lists and
     still deletes; only starting it is refused.
@@ -79,7 +84,7 @@ To be released.
     PowerShell prompt, and every other command that reaches into the guest
     uses the session's own shell rather than assuming a Unix one.
 
- -  Commands and paths survive the trip intact -- spaces, backslashes,
+ -  Commands and paths survive the trip intact — spaces, backslashes,
     quotes, `$`, and non-ASCII text such as Korean all arrive unmangled, and
     the guest command's own exit code comes back to you.
 
@@ -88,7 +93,7 @@ To be released.
     written alongside them.
 
  -  `wargame doctor --profile <name>` checks only what that one profile needs
-    -- its virtualizer, execution mode, network, image and guest tooling --
+    — its virtualizer, execution mode, network, image and guest tooling —
     instead of everything on the host. Useful when one profile misbehaves and
     the rest are fine.
 
@@ -110,8 +115,8 @@ To be released.
     machine.
 
  -  When a guest never becomes reachable, the error now says what was
-    actually missing -- the SSH service, key authentication, or the shell
-    itself -- along with how long it waited, the timeout in force and how to
+    actually missing — the SSH service, key authentication, or the shell
+    itself — along with how long it waited, the timeout in force and how to
     raise it. A guest whose SSH service has not started is no longer reported
     as ready.
 

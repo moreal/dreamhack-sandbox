@@ -8,7 +8,7 @@ priority: -20
     PowerShell prompt, and every other command that reaches into the guest
     uses the session's own shell rather than assuming a Unix one.
 
- -  Commands and paths survive the trip intact -- spaces, backslashes,
+ -  Commands and paths survive the trip intact — spaces, backslashes,
     quotes, `$`, and non-ASCII text such as Korean all arrive unmangled, and
     the guest command's own exit code comes back to you.
 
