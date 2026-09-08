@@ -375,6 +375,13 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
 /// scripts changed since it was built (spec.md §3 FR-1/FR-3).
 async fn profile_image_check(ctx: &AppContext, profile: &Profile) -> Check {
     let name = profile.name.clone();
+    // Every row leads with what the profile resolved to, so `doctor` names
+    // the guest OS, architecture, backend and execution mode next to the
+    // image state rather than only the last of those (spec.md §3 FR-1).
+    let resolved = match crate::app::backends::resolve_backend(profile) {
+        Ok(resolved) => format!("{}, {}", resolved.guest_label(), resolved.backend_label()),
+        Err(_) => format!("{}/{}", profile.vm.backend, profile.vm.mode),
+    };
     let status = match crate::app::profile_build::image_status(ctx, profile).await {
         Ok(status) => status,
         Err(e) => {
@@ -386,18 +393,17 @@ async fn profile_image_check(ctx: &AppContext, profile: &Profile) -> Check {
             }
         }
     };
-    let backend = status.backend.as_str().to_string();
     let Some(image) = status.image.clone() else {
         return Check {
             name: format!("profile-image:{name}"),
             ok: false,
-            detail: format!("{} on {backend}", status.detail),
+            detail: format!("{resolved} — {}", status.detail),
             hint: Some(format!(
                 "wargame profile create {name} --iso <path>   # then: wargame profile build {name}"
             )),
         };
     };
-    let exists = match ctx.backends.get(&backend) {
+    let exists = match ctx.backends.get(status.backend.as_str()) {
         Ok(vm) => vm.image_exists(&image).await.unwrap_or(false),
         Err(e) => {
             return Check {
@@ -413,9 +419,9 @@ async fn profile_image_check(ctx: &AppContext, profile: &Profile) -> Check {
         name: format!("profile-image:{name}"),
         ok,
         detail: if exists {
-            format!("{} on {backend}", status.detail)
+            format!("{resolved} — {}", status.detail)
         } else {
-            format!("{} is not ready on {backend}", status.detail)
+            format!("{resolved} — {} is not ready", status.detail)
         },
         hint: (!ok).then(|| format!("wargame profile build {name}")),
     }

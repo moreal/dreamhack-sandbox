@@ -127,6 +127,19 @@ pub async fn launch(
     // combination is refused before any backend is even contacted, let alone
     // asked to create, clone or start something (spec.md §3 FR-1).
     let (execution, vm) = provider_for_profile(ctx, &profile)?;
+    // Say what `backend: auto` and the profile's guest actually resolved to
+    // before anything is created, so an emulated x86_64 boot's long wait is
+    // never a surprise (spec.md §3 FR-1, §6's "긴 emulate 부팅").
+    emit(
+        &events,
+        LaunchEvent::Preflight(format!(
+            "profile {}: {} on {}",
+            profile.name,
+            execution.guest_label(),
+            execution.backend_label(),
+        )),
+    )
+    .await;
     let capabilities = vm.capabilities();
     crate::domain::compat::check(&profile, vm.name(), &capabilities)?;
     if !capabilities.supports_network(req.network) {
@@ -173,6 +186,11 @@ pub async fn launch(
             image: image.0.clone(),
         });
     }
+    emit(
+        &events,
+        LaunchEvent::Preflight(format!("image ready: {}", image.0)),
+    )
+    .await;
 
     let required_bytes =
         (profile.resources.disk_gib as f64 * MIN_DISK_FRACTION * GIB as f64) as u64;

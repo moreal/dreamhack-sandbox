@@ -6,8 +6,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::domain::compat::ResolvedBackend;
 use crate::domain::Profile;
 use crate::error::{Result, WargameError};
+
+use super::AppContext;
 
 /// Where profile definitions come from. A `*.yaml` file in `user_dir` whose
 /// `metadata.name` matches a built-in profile overrides it; anything else in
@@ -116,6 +119,127 @@ impl ProfileStore {
     pub fn list(&self) -> Vec<Profile> {
         self.merged().into_values().collect()
     }
+}
+
+/// A profile plus the state spec.md §3 FR-1 asks every profile view to show:
+/// what its OS, architecture, backend and execution mode resolved to, and
+/// whether it has an image to launch from.
+///
+/// This is what `wargame profiles`, `wargame doctor` and the TUI's profile
+/// picker all render, so the three cannot drift apart.
+#[derive(Debug, Clone)]
+pub struct ProfileOverview {
+    pub profile: Profile,
+    /// What the profile's OS/arch/mode resolved to. `None` when it is not a
+    /// supported combination at all -- [`ProfileOverview::unsupported`] then
+    /// says why.
+    pub resolved: Option<ResolvedBackend>,
+    unsupported: Option<String>,
+    /// `"ready"`, `"rebuild needed"`, `"not built"`, `"not created"`, or the
+    /// phase a half-finished build stopped at. `None` when it could not be
+    /// determined.
+    pub image_state: Option<String>,
+}
+
+impl ProfileOverview {
+    /// `"kali/x86_64"`. Falls back to what the profile itself declares when
+    /// the combination does not resolve, so an unsupported profile still
+    /// shows what it asked for.
+    pub fn guest_label(&self) -> String {
+        match &self.resolved {
+            Some(resolved) => resolved.guest_label(),
+            None => format!(
+                "{}/{}",
+                crate::domain::compat::guest_key(
+                    self.profile.guest.os,
+                    self.profile.guest.distribution_key().as_deref(),
+                ),
+                crate::domain::compat::arch_label(self.profile.guest.arch),
+            ),
+        }
+    }
+
+    /// `"utm/emulate"` -- the *resolved* backend, not the profile's
+    /// `backend: auto`, which is what FR-1 asks to be shown.
+    pub fn backend_label(&self) -> String {
+        match &self.resolved {
+            Some(resolved) => resolved.backend_label(),
+            None => format!("{}/{}", self.profile.vm.backend, self.profile.vm.mode),
+        }
+    }
+
+    /// The image-readiness word for a table cell.
+    pub fn image_label(&self) -> &str {
+        self.image_state.as_deref().unwrap_or("unknown")
+    }
+
+    /// Why this profile cannot run at all, when that is the reason its state
+    /// is unknown.
+    pub fn unsupported(&self) -> Option<&str> {
+        self.unsupported.as_deref()
+    }
+
+    /// One line naming everything above, for a status bar or a hint.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}  ·  {}  ·  image: {}",
+            self.guest_label(),
+            self.backend_label(),
+            self.image_label(),
+        )
+    }
+}
+
+/// Builds one profile's [`ProfileOverview`], asking the backend whether the
+/// image it names is actually there (a Tart image the user deleted behind
+/// wargame's back reads as "not built", not "ready").
+pub async fn overview(ctx: &AppContext, profile: &Profile) -> ProfileOverview {
+    let (resolved, unsupported) = match super::backends::resolve_backend(profile) {
+        Ok(resolved) => (Some(resolved), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    ProfileOverview {
+        image_state: image_state(ctx, profile).await,
+        profile: profile.clone(),
+        resolved,
+        unsupported,
+    }
+}
+
+/// Every profile the store knows, in its stable order.
+pub async fn overviews(ctx: &AppContext) -> Vec<ProfileOverview> {
+    let mut out = Vec::new();
+    for profile in ctx.profiles.list() {
+        out.push(overview(ctx, &profile).await);
+    }
+    out
+}
+
+async fn image_state(ctx: &AppContext, profile: &Profile) -> Option<String> {
+    let status = super::profile_build::image_status(ctx, profile)
+        .await
+        .ok()?;
+    let Some(image) = &status.image else {
+        return Some(
+            status
+                .phase
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| "not created".to_string()),
+        );
+    };
+    // A name is not an image: ask the backend whether it is actually there.
+    let exists = match ctx.backends.get(status.backend.as_str()) {
+        Ok(vm) => vm.image_exists(image).await.unwrap_or(false),
+        Err(_) => false,
+    };
+    Some(
+        match (exists, status.rebuild_needed) {
+            (false, _) => "not built",
+            (true, true) => "rebuild needed",
+            (true, false) => "ready",
+        }
+        .to_string(),
+    )
 }
 
 #[cfg(test)]

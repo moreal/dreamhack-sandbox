@@ -13,10 +13,10 @@ use std::time::Instant;
 use clap::{CommandFactory, Parser};
 
 use wargame_core::app::{
-    build_profile_image, create_profile_vm, delete, doctor, doctor_profile, image_status,
-    init_profile, inspect, keep, launch, list_sessions, open, open_gui, open_profile_console,
-    prune, resolve_session, resume, search, ssh_command, stop, AppContext, CreateSource,
-    LaunchEvent, LaunchRequest,
+    build_profile_image, create_profile_vm, delete, doctor, doctor_profile, init_profile, inspect,
+    keep, launch, list_sessions, open, open_gui, open_profile_console, profile_overviews, prune,
+    resolve_session, resume, search, ssh_command, stop, AppContext, CreateSource, LaunchEvent,
+    LaunchRequest,
 };
 use wargame_core::domain::{ChallengeRef, KeepPolicy, NetworkMode, SessionState};
 use wargame_core::error::{Result, WargameError};
@@ -313,17 +313,11 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
         }
 
         Command::Profiles { json } => {
-            let profiles = ctx.profiles.list();
-            let mut status = Vec::with_capacity(profiles.len());
-            for profile in &profiles {
-                status.push(profile_image_line(ctx, profile).await);
-            }
-            output::print_profiles(
-                &profiles,
-                &status,
-                &ctx.config.general.default_profile,
-                json,
-            );
+            // The same overview the TUI's profile picker renders, so the two
+            // cannot disagree about what a profile resolves to or whether it
+            // has an image (spec.md §3 FR-1).
+            let overviews = profile_overviews(ctx).await;
+            output::print_profiles(&overviews, &ctx.config.general.default_profile, json);
             Ok(0)
         }
 
@@ -345,34 +339,6 @@ async fn ensure_host_key_or_warn(ctx: &AppContext) {
             ctx.dirs.keys_dir().join("id_ed25519").display()
         );
     }
-}
-
-/// One profile's image readiness for the `profiles` table: what it would
-/// launch from, or why it cannot yet (spec.md §3 FR-1/FR-3).
-async fn profile_image_line(
-    ctx: &AppContext,
-    profile: &wargame_core::domain::Profile,
-) -> Option<String> {
-    let status = image_status(ctx, profile).await.ok()?;
-    let Some(image) = &status.image else {
-        return Some(
-            status
-                .phase
-                .map(|p| p.as_str().to_string())
-                .unwrap_or_else(|| "not created".to_string()),
-        );
-    };
-    // A name is not an image: ask the backend whether it is actually there
-    // (a Tart image the user deleted, say).
-    let exists = match ctx.backends.get(status.backend.as_str()) {
-        Ok(vm) => vm.image_exists(image).await.unwrap_or(false),
-        Err(_) => false,
-    };
-    Some(match (exists, status.rebuild_needed) {
-        (false, _) => "not built".to_string(),
-        (true, true) => "rebuild needed".to_string(),
-        (true, false) => "ready".to_string(),
-    })
 }
 
 /// `wargame profile init|create|console|build` (spec.md §4).

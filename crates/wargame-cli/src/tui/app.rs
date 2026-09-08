@@ -13,7 +13,7 @@ use wargame_core::domain::{
 use wargame_core::ports::{SearchPage, SearchQuery};
 
 use super::launch::LaunchState;
-use super::problem::{Field, ProblemState};
+use super::problem::{Field, ProblemState, ProfileChoice};
 use super::search::SearchState;
 
 /// Which screen is currently on top (MVP.md §6-7).
@@ -73,14 +73,14 @@ pub struct App {
     pub pending_delete: Option<String>,
     default_profile: String,
     default_network: NetworkMode,
-    available_profiles: Vec<String>,
+    available_profiles: Vec<ProfileChoice>,
 }
 
 impl App {
     pub fn new(
         default_profile: String,
         default_network: NetworkMode,
-        available_profiles: Vec<String>,
+        available_profiles: Vec<ProfileChoice>,
     ) -> Self {
         App {
             screen: Screen::Search,
@@ -297,9 +297,9 @@ impl App {
                 Vec::new()
             }
             KeyCode::Up | KeyCode::Down
-                if problem.field == Field::Profile && !problem.profile_names.is_empty() =>
+                if problem.field == Field::Profile && !problem.profiles.is_empty() =>
             {
-                let len = problem.profile_names.len();
+                let len = problem.profiles.len();
                 problem.profile_index = match key.code {
                     KeyCode::Up => (problem.profile_index + len - 1) % len,
                     _ => (problem.profile_index + 1) % len,
@@ -514,13 +514,27 @@ mod tests {
         Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
+    fn choice(name: &str, guest: &str, backend: &str, image: &str) -> ProfileChoice {
+        ProfileChoice {
+            name: name.to_string(),
+            guest: guest.to_string(),
+            backend: backend.to_string(),
+            image: image.to_string(),
+        }
+    }
+
     fn app() -> App {
         App::new(
             "macos-minimal-arm64".to_string(),
             NetworkMode::Isolated,
             vec![
-                "macos-minimal-arm64".to_string(),
-                "macos-re-arm64".to_string(),
+                choice(
+                    "macos-minimal-arm64",
+                    "macos/arm64",
+                    "tart/virtualize",
+                    "ready",
+                ),
+                choice("macos-re-arm64", "macos/arm64", "tart/virtualize", "ready"),
             ],
         )
     }

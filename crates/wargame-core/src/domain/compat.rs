@@ -132,6 +132,22 @@ impl ResolvedBackend {
             arch_label(self.arch),
         )
     }
+
+    /// `"kali/x86_64"`, `"macos/arm64"` -- the compact guest column of the
+    /// `profiles` table and the TUI's profile picker, where the distribution
+    /// stands in for the OS when there is one.
+    pub fn guest_label(&self) -> String {
+        format!(
+            "{}/{}",
+            guest_key(self.os, self.distribution.as_deref()),
+            arch_label(self.arch)
+        )
+    }
+
+    /// `"utm/emulate"` -- the backend column of the same views.
+    pub fn backend_label(&self) -> String {
+        format!("{}/{}", self.backend, self.mode)
+    }
 }
 
 impl Default for ResolvedBackend {
@@ -196,7 +212,23 @@ fn os_label(os: GuestOs) -> &'static str {
     }
 }
 
-fn arch_label(arch: GuestArch) -> &'static str {
+/// The lowercase key for a guest OS, as profile YAML spells it.
+pub fn os_key(os: GuestOs) -> &'static str {
+    match os {
+        GuestOs::Macos => "macos",
+        GuestOs::Linux => "linux",
+        GuestOs::Windows => "windows",
+    }
+}
+
+/// `"kali"` / `"macos"`: the distribution when a guest has one, else the OS.
+pub fn guest_key(os: GuestOs, distribution: Option<&str>) -> String {
+    distribution
+        .map(str::to_string)
+        .unwrap_or_else(|| os_key(os).to_string())
+}
+
+pub fn arch_label(arch: GuestArch) -> &'static str {
     match arch {
         GuestArch::Arm64 => "arm64",
         GuestArch::X86_64 => "x86_64",

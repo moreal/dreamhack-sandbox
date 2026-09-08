@@ -33,7 +33,9 @@ pub use profile_build::{
     image_status, init as init_profile, launch_image, BuilderRegistry, CreateOutcome, CreateSource,
     InitOutcome, ProfileImageStatus,
 };
-pub use profiles::ProfileStore;
+pub use profiles::{
+    overview as profile_overview, overviews as profile_overviews, ProfileOverview, ProfileStore,
+};
 pub use search::{open, search};
 
 /// Everything an application service needs to do its work (DESIGN.md §7's

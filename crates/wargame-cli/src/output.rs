@@ -5,7 +5,7 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, Table};
 use serde::Serialize;
 use time::OffsetDateTime;
 
-use wargame_core::app::Check;
+use wargame_core::app::{Check, ProfileOverview};
 use wargame_core::domain::{Challenge, KeepPolicy, Profile, Session};
 use wargame_core::ports::SearchPage;
 
@@ -125,14 +125,18 @@ pub fn print_sessions(sessions: &[Session], json: bool) {
     }
     let now = OffsetDateTime::now_utc();
     let mut table = table();
+    // `backend` is per session, not per profile: a host can hold Tart and
+    // UTM sessions side by side, and every lifecycle command routes on the
+    // session's own backend (spec.md §3 FR-5).
     table.set_header(vec![
-        "id", "title", "state", "network", "profile", "keep", "age",
+        "id", "title", "state", "backend", "network", "profile", "keep", "age",
     ]);
     for s in sessions {
         table.add_row(vec![
             s.id.clone(),
             s.display_name.clone(),
             s.state.to_string(),
+            s.backend_name().to_string(),
             s.network.to_string(),
             s.profile.clone(),
             keep_marker(s.keep).to_string(),
@@ -165,6 +169,19 @@ pub fn print_session(session: &Session, log_path: Option<&std::path::Path>, json
     );
     println!("state:     {}", session.state);
     println!("profile:   {}", session.profile);
+    // The guest and the execution settings this session was *created* with,
+    // which is what resume and ssh go back to however the profile has been
+    // edited since (spec.md §3 FR-5).
+    println!(
+        "guest:     {}/{} ({})",
+        wargame_core::domain::compat::guest_key(
+            session.guest_os,
+            session.guest_distribution.as_deref()
+        ),
+        wargame_core::domain::compat::arch_label(session.guest_arch),
+        session.connection.shell,
+    );
+    println!("backend:   {}/{}", session.backend_name(), session.vm_mode);
     println!("network:   {}", session.network);
     println!(
         "resources: {} cpu / {} MiB",
@@ -268,9 +285,21 @@ pub fn print_checks(checks: &[Check], json: bool) {
     }
 }
 
-/// One `profiles --json` row: the profile itself plus its image-readiness
-/// state, which lives outside the [`Profile`] (it comes from the build
-/// record).
+/// What a profile's OS/arch/mode resolved to, as `profiles --json` renders
+/// it. `null` for a profile whose combination is not supported at all --
+/// `unsupported` then says why.
+#[derive(Serialize)]
+struct ResolvedJson {
+    backend: String,
+    mode: String,
+    os: String,
+    arch: String,
+    distribution: Option<String>,
+}
+
+/// One `profiles --json` row: the profile itself plus the state FR-1 asks
+/// every profile view to show, which lives outside the [`Profile`] (the
+/// resolution is computed, the image readiness comes from the build record).
 ///
 /// The added keys must not collide with anything [`Profile`] serializes --
 /// `serde(flatten)` writes into the same map with no de-duplication, so a
@@ -280,34 +309,39 @@ pub fn print_checks(checks: &[Check], json: bool) {
 struct ProfileJson<'a> {
     #[serde(flatten)]
     profile: &'a Profile,
+    /// The resolved backend/mode/guest, i.e. what `backend: auto` actually
+    /// means for this profile on this host.
+    resolved: Option<ResolvedJson>,
+    /// Why the profile does not resolve, when it does not.
+    unsupported: Option<&'a str>,
     /// `"ready"`, `"rebuild needed"`, `"not built"`, or the phase a
     /// half-finished build stopped at. `null` when it could not be
     /// determined.
-    image_state: Option<String>,
+    image_state: Option<&'a str>,
     default: bool,
 }
 
-/// `profiles`, with one image-readiness line per profile (spec.md §3 FR-1:
+/// `profiles`: one row per profile carrying its guest OS/arch, its resolved
+/// backend and execution mode, and its image readiness (spec.md §3 FR-1:
 /// "profiles ... 화면에 OS/arch/backend/mode와 이미지 준비 상태를 표시한다").
-/// `status` is parallel to `profiles`; `None` means the status could not be
-/// determined (an unsupported combination, say).
-pub fn print_profiles(
-    profiles: &[Profile],
-    status: &[Option<String>],
-    default_profile: &str,
-    json: bool,
-) {
+pub fn print_profiles(overviews: &[ProfileOverview], default_profile: &str, json: bool) {
     if json {
-        // The profile's own fields, flattened, plus the state FR-1 asks the
-        // profile list to show. `--json` is what scripts read, so it carries
-        // the same answer the table does.
-        let rows: Vec<ProfileJson<'_>> = profiles
+        // The profile's own fields, flattened, plus the same three answers
+        // the table shows -- `--json` is what scripts read.
+        let rows: Vec<ProfileJson<'_>> = overviews
             .iter()
-            .enumerate()
-            .map(|(i, profile)| ProfileJson {
-                profile,
-                image_state: status.get(i).cloned().flatten(),
-                default: profile.name == default_profile,
+            .map(|o| ProfileJson {
+                profile: &o.profile,
+                resolved: o.resolved.as_ref().map(|r| ResolvedJson {
+                    backend: r.backend.to_string(),
+                    mode: r.mode.to_string(),
+                    os: wargame_core::domain::compat::os_key(r.os).to_string(),
+                    arch: wargame_core::domain::compat::arch_label(r.arch).to_string(),
+                    distribution: r.distribution.clone(),
+                }),
+                unsupported: o.unsupported(),
+                image_state: o.image_state.as_deref(),
+                default: o.profile.name == default_profile,
             })
             .collect();
         print_json(&rows);
@@ -323,36 +357,29 @@ pub fn print_profiles(
         "image",
         "default",
     ]);
-    for (i, p) in profiles.iter().enumerate() {
+    for o in overviews {
+        let p = &o.profile;
         table.add_row(vec![
             p.name.clone(),
             p.description.clone(),
-            format!(
-                "{:?}/{:?}",
-                p.guest
-                    .distribution
-                    .clone()
-                    .unwrap_or(format!("{:?}", p.guest.os)),
-                p.guest.arch
-            )
-            .replace('"', "")
-            .to_lowercase(),
-            format!("{}/{}", p.vm.backend, p.vm.mode),
+            o.guest_label(),
+            o.backend_label(),
             format!(
                 "{} cpu / {} GiB / {} GiB disk",
                 p.resources.cpu,
                 p.resources.memory_mib / 1024,
                 p.resources.disk_gib
             ),
-            status
-                .get(i)
-                .cloned()
-                .flatten()
-                .unwrap_or_else(|| "unknown".to_string()),
+            o.image_label().to_string(),
             if p.name == default_profile { "yes" } else { "" }.to_string(),
         ]);
     }
     println!("{table}");
+    for o in overviews {
+        if let Some(reason) = o.unsupported() {
+            println!("! {}: {reason}", o.profile.name);
+        }
+    }
     println!("Next: wargame profile build <name>   # once per profile; then wargame launch <ref> --profile <name>");
     println!("      wargame profile init <template> --name <new>   # a UTM template (Kali, Windows) to install yourself");
 }

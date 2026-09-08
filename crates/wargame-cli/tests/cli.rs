@@ -123,6 +123,58 @@ fn profiles_json_lists_every_builtin_profile_including_the_templates() {
     );
 }
 
+/// spec.md §3 FR-1: every profile view names the guest OS and architecture,
+/// the *resolved* backend and execution mode, and the image state. `--json`
+/// carries the same answers the table does.
+#[test]
+fn profiles_json_and_table_carry_backend_arch_mode_and_image_state() {
+    let home = tempfile::tempdir().unwrap();
+    let out = fixture_fake_cmd(home.path())
+        .args(["profiles", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let profiles: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    let row = |name: &str| {
+        profiles
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is missing"))
+            .clone()
+    };
+
+    let kali = row("kali-x86_64");
+    assert_eq!(kali["resolved"]["backend"], "utm");
+    assert_eq!(kali["resolved"]["mode"], "emulate");
+    assert_eq!(kali["resolved"]["os"], "linux");
+    assert_eq!(kali["resolved"]["arch"], "x86_64");
+    assert_eq!(kali["resolved"]["distribution"], "kali");
+    assert_eq!(kali["image_state"], "not created");
+
+    // `backend: auto` resolves to a real backend rather than being echoed
+    // back as "auto".
+    let macos = row("macos-re-arm64");
+    assert_eq!(
+        macos["vm"]["backend"], "auto",
+        "the profile still says auto"
+    );
+    assert_eq!(macos["resolved"]["backend"], "tart");
+    assert_eq!(macos["resolved"]["mode"], "virtualize");
+    assert_eq!(macos["resolved"]["distribution"], serde_json::Value::Null);
+
+    let table = fixture_fake_cmd(home.path())
+        .args(["profiles"])
+        .output()
+        .unwrap();
+    let rendered = stdout_of(&table);
+    assert!(rendered.contains("kali/x86_64"), "{rendered}");
+    assert!(rendered.contains("utm/emulate"), "{rendered}");
+    assert!(rendered.contains("tart/virtualize"), "{rendered}");
+    assert!(!rendered.contains("auto/"), "{rendered}");
+}
+
 /// spec.md §4's `profile init`: the copy gets its own YAML *and* its own
 /// scripts, and a second run refuses rather than overwriting.
 #[test]

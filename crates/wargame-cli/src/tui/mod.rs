@@ -25,12 +25,13 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
 use wargame_core::app::{
-    delete, keep, launch as launch_challenge, list_sessions, open, open_gui, resume,
-    search as search_challenges, ssh_command, stop, AppContext, LaunchEvent,
+    delete, keep, launch as launch_challenge, list_sessions, open, open_gui, profile_overviews,
+    resume, search as search_challenges, ssh_command, stop, AppContext, LaunchEvent,
 };
 use wargame_core::error::{Result, WargameError};
 
 use app::{App, Effect, Msg, Screen};
+use problem::ProfileChoice;
 
 type Backend = CrosstermBackend<Stdout>;
 
@@ -51,7 +52,13 @@ pub async fn run(ctx: AppContext) -> Result<i32> {
 
     let default_profile = ctx.config.general.default_profile.clone();
     let default_network = ctx.config.general.default_network;
-    let available_profiles: Vec<String> = ctx.profiles.list().into_iter().map(|p| p.name).collect();
+    // The same overview `wargame profiles` prints, so the picker shows each
+    // profile's guest, backend, mode and image state (spec.md §3 FR-1).
+    let available_profiles: Vec<ProfileChoice> = profile_overviews(&ctx)
+        .await
+        .iter()
+        .map(ProfileChoice::from_overview)
+        .collect();
     let ctx = Arc::new(ctx);
 
     let mut terminal = setup_terminal()?;
