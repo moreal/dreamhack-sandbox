@@ -363,7 +363,9 @@ async fn dispatch_auth(ctx: &AppContext, action: AuthCommand) -> Result<i32> {
                 AuthState::Anonymous => {
                     println!("Not logged in. Searching works anonymously; downloading challenge files needs `wargame auth login`.")
                 }
-                AuthState::Authenticated { display } => println!("Logged in as {display}."),
+                AuthState::Authenticated { display } => {
+                    println!("Logged in ({display}). Next: wargame search <query>")
+                }
             }
             Ok(0)
         }
