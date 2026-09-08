@@ -2,12 +2,11 @@
 //! §7): interactive SSH into a session, and reopening its VM with a
 //! graphical window.
 
-use std::time::Duration;
-
 use crate::domain::SessionState;
 use crate::error::{Result, WargameError};
 use crate::ports::{StartOptions, VmStatus};
 
+use super::backends::{provider_for_session, transport_for_session};
 use super::lifecycle::reconcile;
 use super::AppContext;
 
@@ -23,10 +22,11 @@ pub async fn ssh_command(ctx: &AppContext, id: &str) -> Result<std::process::Com
             to: SessionState::Running,
         });
     }
-    let ip = session.guest_ip.ok_or_else(|| {
-        WargameError::NetworkUnavailable("session has no guest IP yet".to_string())
-    })?;
-    Ok(ctx.transport.interactive_shell_cmd(ip))
+    // The user, port, key and shell all come from the session's own saved
+    // connection, so `wargame ssh` reaches the guest the way the launch did
+    // (spec.md §3 FR-4/FR-5).
+    let (endpoint, transport) = transport_for_session(ctx, &session)?;
+    Ok(transport.interactive_shell_cmd(&endpoint))
 }
 
 /// Reopens a session's VM with a graphical console (DESIGN.md §5's
@@ -48,22 +48,25 @@ pub async fn open_gui(ctx: &AppContext, id: &str) -> Result<()> {
         .clone()
         .ok_or_else(|| WargameError::VmCreationFailed("session has no VM".to_string()))?;
 
-    if ctx.vm.status(&vm_ref).await.unwrap_or(VmStatus::Stopped) == VmStatus::Running {
-        ctx.vm.stop(&vm_ref).await?;
+    let vm = provider_for_session(ctx, &session)?;
+    if vm.status(&vm_ref).await.unwrap_or(VmStatus::Stopped) == VmStatus::Running {
+        vm.stop(&vm_ref).await?;
     }
 
-    let boot_timeout = Duration::from_secs(ctx.config.vm.tart.boot_timeout_secs);
+    let backend = session.vm_provider.parse()?;
+    let boot_timeout = ctx.config.vm.boot_timeout(backend, session.vm_mode);
     let start_opts = StartOptions {
         network: session.network,
         headless: false,
         log_path: ctx.repo.session_dir(id).join("run.log"),
     };
-    let runtime = ctx.vm.start(&vm_ref, &start_opts).await?;
+    let runtime = vm.start(&vm_ref, &start_opts).await?;
     session.runner_pid = runtime.pid;
 
-    let ip = ctx.vm.wait_ip(&vm_ref, boot_timeout).await?;
+    let ip = vm.wait_ip(&vm_ref, boot_timeout).await?;
     session.guest_ip = Some(ip);
-    ctx.transport.wait_ready(ip, boot_timeout).await?;
+    let (endpoint, transport) = transport_for_session(ctx, &session)?;
+    transport.wait_ready(&endpoint, boot_timeout).await?;
 
     if session.state != SessionState::Running {
         session.transition(SessionState::Running)?;
@@ -76,9 +79,10 @@ pub async fn open_gui(ctx: &AppContext, id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::app::profiles::ProfileStore;
+    use crate::app::{BackendRegistry, TransportRegistry};
     use crate::domain::{
-        Challenge, ChallengeRef, ChallengeSummary, GuestArch, GuestOs, KeepPolicy, NetworkMode,
-        Resources, Session,
+        Challenge, ChallengeRef, ChallengeSummary, ExecutionMode, GuestArch, GuestConnection,
+        GuestOs, KeepPolicy, NetworkMode, Resources, Session,
     };
     use crate::infra::fs::AppDirs;
     use crate::infra::process::ProcessRunner;
@@ -119,6 +123,8 @@ mod tests {
             profile: "p".to_string(),
             guest_os: GuestOs::Macos,
             guest_arch: GuestArch::Arm64,
+            guest_distribution: None,
+            vm_mode: ExecutionMode::Virtualize,
             network: NetworkMode::Isolated,
             resources: Resources {
                 cpu: 1,
@@ -133,6 +139,8 @@ mod tests {
             last_error: None,
             runner_pid: None,
             guest_ip: None,
+            connection: GuestConnection::default(),
+            workspace_root: "/Users/admin/wargame".to_string(),
         }
     }
 
@@ -142,8 +150,8 @@ mod tests {
             config: Default::default(),
             dirs: AppDirs { root: tmp_path() },
             wargame: Arc::new(FakeWargameProvider::new()),
-            vm: vm.clone(),
-            transport: Arc::new(FakeTransport::new()),
+            backends: BackendRegistry::new(vec![vm.clone() as Arc<dyn VmProvider>]),
+            transports: TransportRegistry::new(Arc::new(FakeTransport::new())),
             repo: Arc::new(MemoryRepo::new()),
             profiles: ProfileStore::new(vec![], tmp_path()),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
@@ -183,15 +191,15 @@ mod tests {
     async fn open_gui_restarts_with_window_and_updates_ip() {
         let (ctx, vm) = fixture();
         let vm_ref = vm
-            .create(&VmSpec {
-                name: "wg-s".to_string(),
-                image: ImageRef("img".to_string()),
-                resources: Resources {
+            .create(&VmSpec::new(
+                "wg-s".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
                     cpu: 1,
                     memory_mib: 1024,
                     disk_gib: 10,
                 },
-            })
+            ))
             .await
             .unwrap();
         let mut session = sample_session("s", SessionState::Ready);
@@ -208,15 +216,15 @@ mod tests {
     async fn ssh_command_refuses_when_the_vm_exited_behind_a_running_record() {
         let (ctx, vm) = fixture();
         let vm_ref = vm
-            .create(&VmSpec {
-                name: "wg-s".to_string(),
-                image: ImageRef("img".to_string()),
-                resources: Resources {
+            .create(&VmSpec::new(
+                "wg-s".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
                     cpu: 1,
                     memory_mib: 1024,
                     disk_gib: 10,
                 },
-            })
+            ))
             .await
             .unwrap();
         let mut session = sample_session("s", SessionState::Running);
@@ -243,15 +251,15 @@ mod tests {
     async fn open_gui_starts_a_stopped_session_with_a_window() {
         let (ctx, vm) = fixture();
         let vm_ref = vm
-            .create(&VmSpec {
-                name: "wg-s".to_string(),
-                image: ImageRef("img".to_string()),
-                resources: Resources {
+            .create(&VmSpec::new(
+                "wg-s".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
                     cpu: 1,
                     memory_mib: 1024,
                     disk_gib: 10,
                 },
-            })
+            ))
             .await
             .unwrap();
         let mut session = sample_session("s", SessionState::Stopped);

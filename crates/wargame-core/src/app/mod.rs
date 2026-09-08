@@ -4,6 +4,7 @@
 //! `SessionRepository`, `ProcessRunner`), so it runs identically against a
 //! real Tart/Dreamhack/SSH stack or against `crate::testing`'s fakes.
 
+pub mod backends;
 pub mod console;
 pub mod doctor;
 pub mod launch;
@@ -16,8 +17,12 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::infra::fs::AppDirs;
 use crate::infra::process::ProcessRunner;
-use crate::ports::{GuestTransport, SessionRepository, VmProvider, WargameProvider};
+use crate::ports::{SessionRepository, WargameProvider};
 
+pub use backends::{
+    provider_for_profile, provider_for_session, resolve_backend, transport_for_session,
+    BackendRegistry, TransportRegistry,
+};
 pub use console::{open_gui, ssh_command};
 pub use doctor::{doctor, Check};
 pub use launch::{launch, LaunchEvent, LaunchRequest};
@@ -32,8 +37,12 @@ pub struct AppContext {
     pub config: Config,
     pub dirs: AppDirs,
     pub wargame: Arc<dyn WargameProvider>,
-    pub vm: Arc<dyn VmProvider>,
-    pub transport: Arc<dyn GuestTransport>,
+    /// Every wired VM backend. A launch picks one from the profile
+    /// (`app::backends::provider_for_profile`); everything else picks the
+    /// one the session recorded (`app::backends::provider_for_session`).
+    pub backends: BackendRegistry,
+    /// The guest transports, selected per endpoint shell.
+    pub transports: TransportRegistry,
     pub repo: Arc<dyn SessionRepository>,
     pub profiles: ProfileStore,
     pub runner: Arc<dyn ProcessRunner>,

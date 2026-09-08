@@ -1,5 +1,7 @@
 //! Declarative environment profiles (MVP.md §13; DESIGN.md §6).
 
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, WargameError};
@@ -20,6 +22,84 @@ pub enum GuestArch {
     X86_64,
 }
 
+/// Which VM backend a profile asks for (spec.md §3 FR-1's `vm.backend`).
+/// `Auto` -- the default, and what every pre-multi-OS profile YAML means --
+/// lets [`crate::domain::compat::resolve`] pick from the support matrix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendChoice {
+    #[default]
+    Auto,
+    Tart,
+    Utm,
+}
+
+impl BackendChoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendChoice::Auto => "auto",
+            BackendChoice::Tart => "tart",
+            BackendChoice::Utm => "utm",
+        }
+    }
+}
+
+impl std::fmt::Display for BackendChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Hardware virtualization vs. full software emulation (spec.md §3 FR-1's
+/// `vm.mode`). A profile that omits it means `Virtualize`, which is what the
+/// existing Tart/macOS path has always done; `Emulate` is never substituted
+/// silently for an unavailable `Virtualize` (spec.md §1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionMode {
+    #[default]
+    Virtualize,
+    Emulate,
+}
+
+impl ExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExecutionMode::Virtualize => "virtualize",
+            ExecutionMode::Emulate => "emulate",
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ExecutionMode {
+    type Err = WargameError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "virtualize" => Ok(ExecutionMode::Virtualize),
+            "emulate" => Ok(ExecutionMode::Emulate),
+            other => Err(WargameError::Other(format!(
+                "invalid execution mode: {other} (expected \"virtualize\" or \"emulate\")"
+            ))),
+        }
+    }
+}
+
+/// A profile's `vm:` section. Absent in every pre-multi-OS YAML, where the
+/// defaults (`auto` + `virtualize`) reproduce the Tart behaviour exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VmSettings {
+    pub backend: BackendChoice,
+    pub mode: ExecutionMode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resources {
     pub cpu: u32,
@@ -31,8 +111,23 @@ pub struct Resources {
 pub struct GuestSpec {
     pub os: GuestOs,
     pub arch: GuestArch,
+    /// Which Linux distribution the guest is, e.g. `kali` (spec.md §3 FR-1).
+    /// Only meaningful for `os: linux`; absent everywhere else.
+    #[serde(default)]
+    pub distribution: Option<String>,
     pub user: String,
     pub password: Option<String>,
+}
+
+impl GuestSpec {
+    /// The distribution name, lowercased and trimmed, for matching against
+    /// the support matrix.
+    pub fn distribution_key(&self) -> Option<String> {
+        self.distribution
+            .as_deref()
+            .map(|d| d.trim().to_ascii_lowercase())
+            .filter(|d| !d.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +157,8 @@ pub struct Profile {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub vm: VmSettings,
     pub guest: GuestSpec,
     pub image: ImageSpec,
     pub resources: Resources,
@@ -81,6 +178,8 @@ struct RawProfileFile {
     api_version: String,
     kind: String,
     metadata: RawMetadata,
+    #[serde(default)]
+    vm: VmSettings,
     guest: GuestSpec,
     image: ImageSpec,
     resources: RawResources,
@@ -137,6 +236,7 @@ impl Profile {
         Ok(Profile {
             name: raw.metadata.name,
             description: raw.metadata.description,
+            vm: raw.vm,
             guest: raw.guest,
             image: raw.image,
             resources: Resources {
@@ -208,6 +308,78 @@ workspace:
         assert_eq!(p.guest.arch, GuestArch::Arm64);
         assert_eq!(p.provision.scripts.len(), 2);
         assert_eq!(p.image_name(), "wargame-profile-macos-re-arm64");
+    }
+
+    /// The `vm:` section and `guest.distribution` from spec.md §4's example.
+    const KALI: &str = r#"
+apiVersion: wargame.vm/v1
+kind: Profile
+
+metadata:
+  name: kali-custom
+
+vm:
+  backend: utm
+  mode: emulate
+
+guest:
+  os: linux
+  distribution: kali
+  arch: x86_64
+  user: kali
+
+image:
+  base: ""
+
+resources:
+  cpu: 4
+  memory_gib: 8
+  disk_gib: 80
+
+workspace:
+  root: /home/kali/wargame
+"#;
+
+    #[test]
+    fn a_yaml_without_a_vm_section_defaults_to_auto_virtualize() {
+        let p = Profile::from_yaml(SAMPLE).unwrap();
+        assert_eq!(p.vm.backend, BackendChoice::Auto);
+        assert_eq!(p.vm.mode, ExecutionMode::Virtualize);
+        assert_eq!(p.guest.distribution, None);
+    }
+
+    #[test]
+    fn parses_the_vm_section_and_guest_distribution() {
+        let p = Profile::from_yaml(KALI).unwrap();
+        assert_eq!(p.vm.backend, BackendChoice::Utm);
+        assert_eq!(p.vm.mode, ExecutionMode::Emulate);
+        assert_eq!(p.guest.os, GuestOs::Linux);
+        assert_eq!(p.guest.arch, GuestArch::X86_64);
+        assert_eq!(p.guest.distribution.as_deref(), Some("kali"));
+        assert_eq!(p.guest.distribution_key().as_deref(), Some("kali"));
+        assert_eq!(p.guest.user, "kali");
+    }
+
+    #[test]
+    fn distribution_key_is_normalized_and_empty_means_none() {
+        let mut p = Profile::from_yaml(KALI).unwrap();
+        p.guest.distribution = Some("  Kali ".to_string());
+        assert_eq!(p.guest.distribution_key().as_deref(), Some("kali"));
+        p.guest.distribution = Some(String::new());
+        assert_eq!(p.guest.distribution_key(), None);
+    }
+
+    #[test]
+    fn execution_mode_from_str() {
+        assert_eq!(
+            ExecutionMode::from_str("EMULATE").unwrap(),
+            ExecutionMode::Emulate
+        );
+        assert_eq!(
+            ExecutionMode::from_str("virtualize").unwrap(),
+            ExecutionMode::Virtualize
+        );
+        assert!(ExecutionMode::from_str("rosetta").is_err());
     }
 
     #[test]

@@ -508,7 +508,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wargame_core::domain::{ChallengeSummary, Resources};
+    use wargame_core::domain::{ChallengeSummary, ExecutionMode, GuestConnection, Resources};
 
     fn key(code: KeyCode) -> Msg {
         Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -559,6 +559,8 @@ mod tests {
             profile: "macos-re-arm64".to_string(),
             guest_os: wargame_core::domain::GuestOs::Macos,
             guest_arch: wargame_core::domain::GuestArch::Arm64,
+            guest_distribution: None,
+            vm_mode: ExecutionMode::Virtualize,
             network: NetworkMode::Isolated,
             resources: Resources {
                 cpu: 2,
@@ -573,6 +575,8 @@ mod tests {
             last_error: None,
             runner_pid: None,
             guest_ip: None,
+            connection: GuestConnection::default(),
+            workspace_root: "/Users/admin/wargame".to_string(),
         }
     }
 

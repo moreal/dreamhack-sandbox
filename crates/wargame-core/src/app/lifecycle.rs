@@ -5,13 +5,21 @@
 //! real Tart backend or `crate::testing`'s fakes.
 
 use std::collections::HashSet;
-use std::time::Duration;
 
 use crate::domain::{KeepPolicy, Session, SessionState};
 use crate::error::{Result, WargameError};
 use crate::ports::{StartOptions, VmStatus};
 
+use super::backends::{provider_for_session, transport_for_session};
 use super::AppContext;
+
+/// How long a session's own VM may take to boot, from the backend and mode
+/// it was created with -- not from the profile, which may have changed
+/// (spec.md §3 FR-5).
+fn boot_timeout(ctx: &AppContext, session: &Session) -> Result<std::time::Duration> {
+    let backend = session.vm_provider.parse()?;
+    Ok(ctx.config.vm.boot_timeout(backend, session.vm_mode))
+}
 
 pub async fn list_sessions(ctx: &AppContext) -> Result<Vec<Session>> {
     let mut sessions = Vec::new();
@@ -92,7 +100,9 @@ pub async fn reconcile(ctx: &AppContext, mut session: Session) -> Result<Session
     let Some(vm_ref) = &session.vm_ref else {
         return Ok(session);
     };
-    if ctx.vm.status(vm_ref).await? != VmStatus::Stopped {
+    let vm = provider_for_session(ctx, &session)?;
+    let vm_ref = vm_ref.clone();
+    if vm.status(&vm_ref).await? != VmStatus::Stopped {
         return Ok(session);
     }
     tracing::info!(
@@ -130,17 +140,22 @@ pub async fn stop(ctx: &AppContext, id: &str) -> Result<Session> {
             to: SessionState::Stopped,
         });
     }
-    if let Some(ip) = session.guest_ip {
-        // Best-effort: flush the guest's filesystem before asking Tart to
-        // stop it, so a stop that outruns its own graceful-shutdown window
-        // doesn't lose writes that were still dirty in page cache
-        // (DESIGN.md §5). A failure here must never block the stop itself.
-        if let Err(err) = ctx.transport.exec(ip, &["sync".to_string()]).await {
-            tracing::debug!(session = %id, error = %err, "sync before stop failed; stopping anyway");
+    // Best-effort: flush the guest's filesystem before asking the backend to
+    // stop it, so a stop that outruns its own graceful-shutdown window
+    // doesn't lose writes that were still dirty in page cache
+    // (DESIGN.md §5). A failure here must never block the stop itself.
+    match transport_for_session(ctx, &session) {
+        Ok((endpoint, transport)) => {
+            if let Err(err) = transport.exec(&endpoint, &["sync".to_string()]).await {
+                tracing::debug!(session = %id, error = %err, "sync before stop failed; stopping anyway");
+            }
+        }
+        Err(err) => {
+            tracing::debug!(session = %id, error = %err, "no guest transport before stop; stopping anyway");
         }
     }
     if let Some(vm_ref) = &session.vm_ref {
-        ctx.vm.stop(vm_ref).await?;
+        provider_for_session(ctx, &session)?.stop(vm_ref).await?;
     }
     if session.state == SessionState::Ready {
         session.transition(SessionState::Running)?;
@@ -167,18 +182,22 @@ pub async fn resume(ctx: &AppContext, id: &str) -> Result<Session> {
         .clone()
         .ok_or_else(|| WargameError::VmCreationFailed("session has no VM".to_string()))?;
 
-    let boot_timeout = Duration::from_secs(ctx.config.vm.tart.boot_timeout_secs);
+    // Everything here comes from the session's own record: its backend, its
+    // execution mode's boot timeout, its network, its guest user and port.
+    let vm = provider_for_session(ctx, &session)?;
+    let boot_timeout = boot_timeout(ctx, &session)?;
     let start_opts = StartOptions {
         network: session.network,
         headless: true,
         log_path: ctx.repo.session_dir(id).join("run.log"),
     };
-    let runtime = ctx.vm.start(&vm_ref, &start_opts).await?;
+    let runtime = vm.start(&vm_ref, &start_opts).await?;
     session.runner_pid = runtime.pid;
 
-    let ip = ctx.vm.wait_ip(&vm_ref, boot_timeout).await?;
+    let ip = vm.wait_ip(&vm_ref, boot_timeout).await?;
     session.guest_ip = Some(ip);
-    ctx.transport.wait_ready(ip, boot_timeout).await?;
+    let (endpoint, transport) = transport_for_session(ctx, &session)?;
+    transport.wait_ready(&endpoint, boot_timeout).await?;
 
     session.transition(SessionState::Running)?;
     ctx.repo.save(&session).await?;
@@ -196,11 +215,12 @@ pub async fn delete(ctx: &AppContext, id: &str, force: bool) -> Result<()> {
     ctx.repo.save(&session).await?;
 
     if let Some(vm_ref) = &session.vm_ref {
+        let vm = provider_for_session(ctx, &session)?;
         // `status()` failing is treated as "not missing" so we still try the
         // delete rather than silently leaving a VM behind.
-        let status = ctx.vm.status(vm_ref).await.unwrap_or(VmStatus::Stopped);
+        let status = vm.status(vm_ref).await.unwrap_or(VmStatus::Stopped);
         if status != VmStatus::Missing {
-            ctx.vm.delete(vm_ref).await?;
+            vm.delete(vm_ref).await?;
         }
     }
 
@@ -223,21 +243,25 @@ pub async fn keep(ctx: &AppContext, id: &str, keep: bool) -> Result<Session> {
 /// have no corresponding session record (MVP.md §37 / NFR-02). Returns the
 /// names of every orphan found.
 pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<Vec<String>> {
-    let vms = ctx.vm.list().await?;
     let sessions = ctx.repo.list().await?;
-    let known: HashSet<String> = sessions
+    // Ownership is `(backend, stable id)`: an identically named VM on
+    // another backend is a different VM and must not be mistaken for this
+    // one's orphan (spec.md §3 FR-5).
+    let known: HashSet<(String, String)> = sessions
         .iter()
-        .filter_map(|s| s.vm_ref.as_ref().map(|v| v.name.clone()))
+        .filter_map(|s| s.vm_ref.as_ref().map(|v| (v.backend.clone(), v.id.clone())))
         .collect();
 
     let mut orphans = Vec::new();
-    for vm_ref in vms {
-        if known.contains(&vm_ref.name) {
-            continue;
-        }
-        orphans.push(vm_ref.name.clone());
-        if !dry_run {
-            ctx.vm.delete(&vm_ref).await?;
+    for vm in ctx.backends.all() {
+        for vm_ref in vm.list().await? {
+            if known.contains(&(vm_ref.backend.clone(), vm_ref.id.clone())) {
+                continue;
+            }
+            orphans.push(format!("{}/{}", vm_ref.backend, vm_ref.name));
+            if !dry_run {
+                vm.delete(&vm_ref).await?;
+            }
         }
     }
     Ok(orphans)
@@ -247,8 +271,10 @@ pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use crate::app::profiles::ProfileStore;
+    use crate::app::{BackendRegistry, TransportRegistry};
     use crate::domain::{
-        Challenge, ChallengeRef, ChallengeSummary, GuestArch, GuestOs, NetworkMode, Resources,
+        Challenge, ChallengeRef, ChallengeSummary, ExecutionMode, GuestArch, GuestConnection,
+        GuestOs, NetworkMode, Resources,
     };
     use crate::infra::fs::AppDirs;
     use crate::infra::process::ProcessRunner;
@@ -257,6 +283,7 @@ mod tests {
         FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider, MemoryRepo,
     };
     use std::sync::Arc;
+    use std::time::Duration;
     use time::OffsetDateTime;
 
     fn tmp_path() -> std::path::PathBuf {
@@ -276,8 +303,8 @@ mod tests {
             config: Default::default(),
             dirs: AppDirs { root: tmp_path() },
             wargame: Arc::new(FakeWargameProvider::new()),
-            vm: vm.clone(),
-            transport: transport.clone(),
+            backends: BackendRegistry::new(vec![vm.clone() as Arc<dyn VmProvider>]),
+            transports: TransportRegistry::new(transport.clone()),
             repo: Arc::new(MemoryRepo::new()),
             profiles: ProfileStore::new(vec![], tmp_path()),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
@@ -310,6 +337,8 @@ mod tests {
             profile: "p".to_string(),
             guest_os: GuestOs::Macos,
             guest_arch: GuestArch::Arm64,
+            guest_distribution: None,
+            vm_mode: ExecutionMode::Virtualize,
             network: NetworkMode::Isolated,
             resources: Resources {
                 cpu: 1,
@@ -324,6 +353,8 @@ mod tests {
             last_error: None,
             runner_pid: None,
             guest_ip: None,
+            connection: GuestConnection::default(),
+            workspace_root: "/Users/admin/wargame".to_string(),
         }
     }
 
@@ -336,15 +367,15 @@ mod tests {
 
     async fn drifted_session(f: &Fixture, id: &str) {
         let vm_ref =
-            f.vm.create(&VmSpec {
-                name: format!("wg-{id}"),
-                image: ImageRef("img".to_string()),
-                resources: Resources {
+            f.vm.create(&VmSpec::new(
+                format!("wg-{id}"),
+                ImageRef("img".to_string()),
+                Resources {
                     cpu: 1,
                     memory_mib: 1024,
                     disk_gib: 10,
                 },
-            })
+            ))
             .await
             .unwrap();
         let opts = StartOptions {
@@ -528,10 +559,7 @@ mod tests {
         // an out-of-band stop; do not rewrite the record.
         let f = drifted_fixture();
         let mut session = sample_session("s", SessionState::Running, KeepPolicy::Discard);
-        session.vm_ref = Some(crate::domain::VmRef {
-            backend: "fake".to_string(),
-            name: "wg-gone".to_string(),
-        });
+        session.vm_ref = Some(crate::domain::VmRef::new("tart", "wg-gone"));
         f.ctx.repo.save(&session).await.unwrap();
         assert_eq!(
             inspect(&f.ctx, "s").await.unwrap().state,
@@ -543,15 +571,15 @@ mod tests {
     async fn stop_moves_ready_through_running_to_stopped() {
         let Fixture { ctx, vm, .. } = fixture();
         let vm_ref = vm
-            .create(&VmSpec {
-                name: "wg-s".to_string(),
-                image: ImageRef("img".to_string()),
-                resources: Resources {
+            .create(&VmSpec::new(
+                "wg-s".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
                     cpu: 1,
                     memory_mib: 1024,
                     disk_gib: 10,
                 },
-            })
+            ))
             .await
             .unwrap();
         vm.start(
@@ -579,15 +607,15 @@ mod tests {
     async fn stop_syncs_the_guest_before_stopping_when_an_ip_is_known() {
         let Fixture { ctx, vm, transport } = fixture();
         let vm_ref = vm
-            .create(&VmSpec {
-                name: "wg-s".to_string(),
-                image: ImageRef("img".to_string()),
-                resources: Resources {
+            .create(&VmSpec::new(
+                "wg-s".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
                     cpu: 1,
                     memory_mib: 1024,
                     disk_gib: 10,
                 },
-            })
+            ))
             .await
             .unwrap();
         vm.start(
@@ -611,8 +639,8 @@ mod tests {
         let calls = transport.calls();
         assert!(
             calls.iter().any(
-                |c| matches!(c, crate::testing::TransportCall::Exec { ip: call_ip, argv }
-                    if *call_ip == ip && argv == &["sync".to_string()])
+                |c| matches!(c, crate::testing::TransportCall::Exec { endpoint, argv }
+                    if endpoint.host == ip && argv == &["sync".to_string()])
             ),
             "expected a sync exec to the guest before stop: {calls:?}"
         );
@@ -633,15 +661,15 @@ mod tests {
     async fn resume_starts_the_vm_and_marks_running() {
         let Fixture { ctx, vm, .. } = fixture();
         let vm_ref = vm
-            .create(&VmSpec {
-                name: "wg-s".to_string(),
-                image: ImageRef("img".to_string()),
-                resources: Resources {
+            .create(&VmSpec::new(
+                "wg-s".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
                     cpu: 1,
                     memory_mib: 1024,
                     disk_gib: 10,
                 },
-            })
+            ))
             .await
             .unwrap();
         let mut session = sample_session("s", SessionState::Stopped, KeepPolicy::Discard);
@@ -657,15 +685,15 @@ mod tests {
     async fn delete_removes_vm_and_session() {
         let Fixture { ctx, vm, .. } = fixture();
         let vm_ref = vm
-            .create(&VmSpec {
-                name: "wg-s".to_string(),
-                image: ImageRef("img".to_string()),
-                resources: Resources {
+            .create(&VmSpec::new(
+                "wg-s".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
                     cpu: 1,
                     memory_mib: 1024,
                     disk_gib: 10,
                 },
-            })
+            ))
             .await
             .unwrap();
         let mut session = sample_session("s", SessionState::Ready, KeepPolicy::Discard);
@@ -693,40 +721,42 @@ mod tests {
     async fn prune_finds_and_deletes_orphan_vms() {
         let Fixture { ctx, vm, .. } = fixture();
         // A VM with no session record at all.
-        vm.create(&VmSpec {
-            name: "wg-orphan".to_string(),
-            image: ImageRef("img".to_string()),
-            resources: Resources {
+        vm.create(&VmSpec::new(
+            "wg-orphan".to_string(),
+            ImageRef("img".to_string()),
+            Resources {
                 cpu: 1,
                 memory_mib: 1024,
                 disk_gib: 10,
             },
-        })
+        ))
         .await
         .unwrap();
         // A VM that *is* tracked by a session.
         let tracked_ref = vm
-            .create(&VmSpec {
-                name: "wg-tracked".to_string(),
-                image: ImageRef("img".to_string()),
-                resources: Resources {
+            .create(&VmSpec::new(
+                "wg-tracked".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
                     cpu: 1,
                     memory_mib: 1024,
                     disk_gib: 10,
                 },
-            })
+            ))
             .await
             .unwrap();
         let mut session = sample_session("tracked", SessionState::Ready, KeepPolicy::Discard);
         session.vm_ref = Some(tracked_ref);
         ctx.repo.save(&session).await.unwrap();
 
+        // Orphans are reported `<backend>/<name>`: a name alone is not
+        // unique across backends.
         let dry = prune(&ctx, true).await.unwrap();
-        assert_eq!(dry, vec!["wg-orphan".to_string()]);
+        assert_eq!(dry, vec!["tart/wg-orphan".to_string()]);
         assert_eq!(vm.vm_names().len(), 2, "dry run must not delete anything");
 
         let orphans = prune(&ctx, false).await.unwrap();
-        assert_eq!(orphans, vec!["wg-orphan".to_string()]);
+        assert_eq!(orphans, vec!["tart/wg-orphan".to_string()]);
         assert_eq!(vm.vm_names(), vec!["wg-tracked".to_string()]);
     }
 }

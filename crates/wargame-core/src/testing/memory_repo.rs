@@ -61,8 +61,8 @@ impl SessionRepository for MemoryRepo {
 mod tests {
     use super::*;
     use crate::domain::challenge::{Challenge, ChallengeRef, ChallengeSummary};
-    use crate::domain::profile::{GuestArch, GuestOs, Resources};
-    use crate::domain::session::{KeepPolicy, NetworkMode, SessionState};
+    use crate::domain::profile::{ExecutionMode, GuestArch, GuestOs, Resources};
+    use crate::domain::session::{GuestConnection, KeepPolicy, NetworkMode, SessionState};
     use time::OffsetDateTime;
 
     fn sample(id: &str) -> Session {
@@ -89,6 +89,8 @@ mod tests {
             profile: "p".to_string(),
             guest_os: GuestOs::Macos,
             guest_arch: GuestArch::Arm64,
+            guest_distribution: None,
+            vm_mode: ExecutionMode::Virtualize,
             network: NetworkMode::Isolated,
             resources: Resources {
                 cpu: 1,
@@ -103,6 +105,8 @@ mod tests {
             last_error: None,
             runner_pid: None,
             guest_ip: None,
+            connection: GuestConnection::default(),
+            workspace_root: "/Users/admin/wargame".to_string(),
         }
     }
 

@@ -39,8 +39,10 @@ mod tests {
             config: Default::default(),
             dirs: AppDirs { root: tmp_path() },
             wargame,
-            vm: Arc::new(FakeVmProvider::new()),
-            transport: Arc::new(FakeTransport::new()),
+            backends: crate::app::BackendRegistry::new(vec![
+                Arc::new(FakeVmProvider::new()) as Arc<dyn crate::ports::VmProvider>
+            ]),
+            transports: crate::app::TransportRegistry::new(Arc::new(FakeTransport::new())),
             repo: Arc::new(MemoryRepo::new()),
             profiles: ProfileStore::new(vec![], tmp_path()),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,

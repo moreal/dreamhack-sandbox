@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use wargame_core::domain::{NetworkMode, Profile, VmRef};
+use wargame_core::domain::{GuestEndpoint, NetworkMode, Profile, VmRef};
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::process::{Cmd, ProcessRunner};
 use wargame_core::ports::{GuestTransport, ImageRef, StartOptions, VmProvider, VmSpec, VmStatus};
@@ -37,10 +37,11 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Total time budget for that confirmation poll before giving up.
 const STOP_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Builds a [`GuestTransport`] for a given guest username, deferred until
-/// after the host's SSH key has actually been installed (see
-/// [`ProfileImageBuilder::build_profile`]).
-pub type TransportFactory = Box<dyn Fn(&str) -> Arc<dyn GuestTransport> + Send + Sync>;
+/// Builds a [`GuestTransport`], deferred until after the host's SSH key has
+/// actually been installed (see [`ProfileImageBuilder::build_profile`]).
+/// The guest user is no longer part of the transport -- it travels in the
+/// [`GuestEndpoint`] each call is addressed with (spec.md §3 FR-4).
+pub type TransportFactory = Box<dyn Fn() -> Arc<dyn GuestTransport> + Send + Sync>;
 
 /// Inputs to [`ProfileImageBuilder::build_profile`] that aren't already part
 /// of the [`Profile`] itself.
@@ -81,6 +82,10 @@ impl ProfileImageBuilder {
         opts: &BuildOptions,
         progress: &mut dyn FnMut(String),
     ) -> Result<ImageRef> {
+        // Resolution before any side effect: a profile this backend cannot
+        // run must not get as far as pulling an image (spec.md §3 FR-1).
+        let execution = wargame_core::domain::compat::resolve(profile)?;
+
         let base = ImageRef(profile.image.base.clone());
         let target_name = profile.image_name();
         let target_ref = ImageRef(target_name.clone());
@@ -94,10 +99,7 @@ impl ProfileImageBuilder {
         if self.tart.image_exists(&target_ref).await? {
             progress(format!("removing previous build of {target_name}"));
             self.tart
-                .delete(&VmRef {
-                    backend: "tart".to_string(),
-                    name: target_name.clone(),
-                })
+                .delete(&VmRef::new("tart", target_name.clone()))
                 .await?;
         }
 
@@ -108,6 +110,10 @@ impl ProfileImageBuilder {
                 name: target_name.clone(),
                 image: base,
                 resources: profile.resources,
+                execution,
+                // A build installs packages, so it always runs on NAT
+                // (spec.md §3 FR-6); the launched sessions are isolated.
+                network: NetworkMode::Nat,
             })
             .await?;
 
@@ -167,10 +173,13 @@ impl ProfileImageBuilder {
         self.install_pubkey(profile, ip.to_string(), &opts.pubkey)
             .await?;
 
-        let transport = (self.transport_factory)(&profile.guest.user);
+        let transport = (self.transport_factory)();
+        let endpoint = GuestEndpoint::new(ip, profile.guest.user.clone());
 
         progress("waiting for SSH to accept the new key".to_string());
-        transport.wait_ready(ip, self.tart.boot_timeout()).await?;
+        transport
+            .wait_ready(&endpoint, self.tart.boot_timeout())
+            .await?;
 
         let log_path = provision_log_path(opts, profile);
         progress(format!("provisioning log: {}", log_path.display()));
@@ -187,7 +196,7 @@ impl ProfileImageBuilder {
         // paths expect.
         transport
             .exec(
-                ip,
+                &endpoint,
                 &[
                     "mkdir".to_string(),
                     "-p".to_string(),
@@ -196,7 +205,11 @@ impl ProfileImageBuilder {
             )
             .await?;
         transport
-            .copy_in(ip, &opts.scripts_dir.join("scripts"), "wg-provision/")
+            .copy_in(
+                &endpoint,
+                &opts.scripts_dir.join("scripts"),
+                "wg-provision/",
+            )
             .await?;
 
         for script in &profile.provision.scripts {
@@ -204,7 +217,7 @@ impl ProfileImageBuilder {
             let remote_path = format!("wg-provision/{script}");
             let argv = vec!["bash".to_string(), remote_path];
             let command_desc = argv.join(" ");
-            let out = transport.exec(ip, &argv).await?;
+            let out = transport.exec(&endpoint, &argv).await?;
             log_exec(
                 &log_path,
                 &command_desc,
@@ -228,7 +241,7 @@ impl ProfileImageBuilder {
                 continue;
             }
             let command_desc = argv.join(" ");
-            let out = transport.exec(ip, &argv).await?;
+            let out = transport.exec(&endpoint, &argv).await?;
             log_exec(
                 &log_path,
                 &command_desc,
@@ -251,7 +264,7 @@ impl ProfileImageBuilder {
         progress("cleaning up provisioning files".to_string());
         transport
             .exec(
-                ip,
+                &endpoint,
                 &[
                     "rm".to_string(),
                     "-rf".to_string(),
@@ -261,7 +274,7 @@ impl ProfileImageBuilder {
             .await?;
 
         progress("flushing guest filesystem and shutting down".to_string());
-        match transport.exec(ip, &["sync".to_string()]).await {
+        match transport.exec(&endpoint, &["sync".to_string()]).await {
             Ok(out) if out.status != 0 => {
                 tracing::warn!(
                     vm = %vm.name,
@@ -445,7 +458,7 @@ mod tests {
     use super::*;
 
     use wargame_core::domain::{
-        GuestArch, GuestOs, GuestSpec, ImageSpec, ProvisionSpec, Resources, ToolsSpec,
+        GuestArch, GuestOs, GuestSpec, ImageSpec, ProvisionSpec, Resources, ToolsSpec, VmSettings,
         WorkspaceSpec,
     };
     use wargame_core::infra::process::Output;
@@ -457,9 +470,11 @@ mod tests {
         Profile {
             name: "macos-minimal-arm64".to_string(),
             description: String::new(),
+            vm: VmSettings::default(),
             guest: GuestSpec {
                 os: GuestOs::Macos,
                 arch: GuestArch::Arm64,
+                distribution: None,
                 user: "admin".to_string(),
                 password: Some("s3cr3t".to_string()),
             },
@@ -512,7 +527,7 @@ mod tests {
         ProfileImageBuilder::new(
             runner,
             tart,
-            Box::new(move |_user: &str| transport.clone() as Arc<dyn GuestTransport>),
+            Box::new(move || transport.clone() as Arc<dyn GuestTransport>),
         )
     }
 
@@ -613,40 +628,46 @@ mod tests {
 
         // Scripts run in profile order, then verify commands, then cleanup.
         let transport_calls = transport.calls();
-        let TransportCall::Exec { argv, .. } = &transport_calls[0] else {
+        let TransportCall::WaitReady { endpoint } = &transport_calls[0] else {
+            panic!("expected the SSH readiness wait first");
+        };
+        // The guest user comes from the profile, not from the transport.
+        assert_eq!(endpoint.user, "admin");
+        assert_eq!(endpoint.host.to_string(), "10.0.0.7");
+        let TransportCall::Exec { argv, .. } = &transport_calls[1] else {
             panic!("expected the mkdir -p exec before the copy");
         };
         assert_eq!(argv, &["mkdir", "-p", "wg-provision"]);
-        assert!(matches!(transport_calls[1], TransportCall::CopyIn { .. }));
-        let TransportCall::Exec { argv, .. } = &transport_calls[2] else {
+        assert!(matches!(transport_calls[2], TransportCall::CopyIn { .. }));
+        let TransportCall::Exec { argv, .. } = &transport_calls[3] else {
             panic!("expected the first provisioning exec");
         };
         assert_eq!(argv, &["bash", "wg-provision/scripts/macos/common.sh"]);
-        let TransportCall::Exec { argv, .. } = &transport_calls[3] else {
+        let TransportCall::Exec { argv, .. } = &transport_calls[4] else {
             panic!("expected the second provisioning exec");
         };
         assert_eq!(argv, &["bash", "wg-provision/scripts/macos/reversing.sh"]);
-        let TransportCall::Exec { argv, .. } = &transport_calls[4] else {
+        let TransportCall::Exec { argv, .. } = &transport_calls[5] else {
             panic!("expected the first verify exec");
         };
         assert_eq!(argv, &["python3", "--version"]);
-        let TransportCall::Exec { argv, .. } = &transport_calls[5] else {
+        let TransportCall::Exec { argv, .. } = &transport_calls[6] else {
             panic!("expected the second verify exec");
         };
         assert_eq!(argv, &["uv", "--version"]);
-        let TransportCall::Exec { argv, .. } = &transport_calls[6] else {
+        let TransportCall::Exec { argv, .. } = &transport_calls[7] else {
             panic!("expected the cleanup exec");
         };
         assert_eq!(argv, &["rm", "-rf", "wg-provision"]);
-        let TransportCall::Exec { argv, .. } = &transport_calls[7] else {
+        let TransportCall::Exec { argv, .. } = &transport_calls[8] else {
             panic!("expected the pre-stop sync exec");
         };
         assert_eq!(argv, &["sync"]);
-        assert_eq!(transport_calls.len(), 8);
+        assert_eq!(transport_calls.len(), 9);
 
         // The scripts directory was copied in as a whole, from where the
         // per-script exec paths expect to find it.
-        let TransportCall::CopyIn { src, dest, .. } = &transport_calls[1] else {
+        let TransportCall::CopyIn { src, dest, .. } = &transport_calls[2] else {
             unreachable!()
         };
         assert_eq!(src, &Path::new("/repo/profiles/scripts"));

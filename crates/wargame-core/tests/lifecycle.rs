@@ -7,10 +7,12 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 
 use wargame_core::app::profiles::ProfileStore;
-use wargame_core::app::{delete, keep, prune, resume, stop, AppContext};
+use wargame_core::app::{
+    delete, keep, prune, resume, stop, AppContext, BackendRegistry, TransportRegistry,
+};
 use wargame_core::domain::{
-    Challenge, ChallengeRef, ChallengeSummary, GuestArch, GuestOs, KeepPolicy, NetworkMode,
-    Resources, Session, SessionState,
+    Challenge, ChallengeRef, ChallengeSummary, ExecutionMode, GuestArch, GuestConnection, GuestOs,
+    KeepPolicy, NetworkMode, Resources, Session, SessionState,
 };
 use wargame_core::error::WargameError;
 use wargame_core::infra::fs::AppDirs;
@@ -30,8 +32,8 @@ fn context() -> (AppContext, Arc<FakeVmProvider>) {
         config: Default::default(),
         dirs: AppDirs { root: tmp_path() },
         wargame: Arc::new(FakeWargameProvider::new()),
-        vm: vm.clone(),
-        transport: Arc::new(FakeTransport::new()),
+        backends: BackendRegistry::new(vec![vm.clone() as Arc<dyn VmProvider>]),
+        transports: TransportRegistry::new(Arc::new(FakeTransport::new())),
         repo: Arc::new(MemoryRepo::new()),
         profiles: ProfileStore::new(vec![], tmp_path()),
         runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
@@ -72,6 +74,8 @@ fn session(id: &str, state: SessionState, keep: KeepPolicy) -> Session {
         profile: "p".to_string(),
         guest_os: GuestOs::Macos,
         guest_arch: GuestArch::Arm64,
+        guest_distribution: None,
+        vm_mode: ExecutionMode::Virtualize,
         network: NetworkMode::Isolated,
         resources: small_resources(),
         created_at: OffsetDateTime::now_utc(),
@@ -82,6 +86,8 @@ fn session(id: &str, state: SessionState, keep: KeepPolicy) -> Session {
         last_error: None,
         runner_pid: None,
         guest_ip: None,
+        connection: GuestConnection::default(),
+        workspace_root: "/Users/admin/wargame".to_string(),
     }
 }
 
@@ -106,10 +112,7 @@ async fn delete_refuses_a_kept_session_without_force_then_succeeds_with_it() {
 async fn delete_is_fine_when_the_vm_is_already_missing() {
     let (ctx, _vm) = context();
     let mut s = session("no-vm", SessionState::Failed, KeepPolicy::Discard);
-    s.vm_ref = Some(wargame_core::domain::VmRef {
-        backend: "tart".to_string(),
-        name: "wg-no-vm".to_string(),
-    });
+    s.vm_ref = Some(wargame_core::domain::VmRef::new("tart", "wg-no-vm"));
     ctx.repo.save(&s).await.unwrap();
 
     // The fake VM provider never had "wg-no-vm" created, so status() reports
@@ -136,11 +139,11 @@ async fn keep_toggles_the_policy_on_a_stored_session() {
 async fn stop_then_resume_round_trips_through_the_fake_vm() {
     let (ctx, vm) = context();
     let vm_ref = vm
-        .create(&VmSpec {
-            name: "wg-s".to_string(),
-            image: ImageRef("img".to_string()),
-            resources: small_resources(),
-        })
+        .create(&VmSpec::new(
+            "wg-s".to_string(),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
         .await
         .unwrap();
     let mut s = session("s", SessionState::Ready, KeepPolicy::Discard);
@@ -158,19 +161,19 @@ async fn stop_then_resume_round_trips_through_the_fake_vm() {
 #[tokio::test]
 async fn prune_finds_an_orphan_vm_but_leaves_a_tracked_one_alone() {
     let (ctx, vm) = context();
-    vm.create(&VmSpec {
-        name: "wg-orphan".to_string(),
-        image: ImageRef("img".to_string()),
-        resources: small_resources(),
-    })
+    vm.create(&VmSpec::new(
+        "wg-orphan".to_string(),
+        ImageRef("img".to_string()),
+        small_resources(),
+    ))
     .await
     .unwrap();
     let tracked_ref = vm
-        .create(&VmSpec {
-            name: "wg-tracked".to_string(),
-            image: ImageRef("img".to_string()),
-            resources: small_resources(),
-        })
+        .create(&VmSpec::new(
+            "wg-tracked".to_string(),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
         .await
         .unwrap();
     let mut tracked = session("tracked", SessionState::Ready, KeepPolicy::Discard);
@@ -178,10 +181,10 @@ async fn prune_finds_an_orphan_vm_but_leaves_a_tracked_one_alone() {
     ctx.repo.save(&tracked).await.unwrap();
 
     let dry_run = prune(&ctx, true).await.unwrap();
-    assert_eq!(dry_run, vec!["wg-orphan".to_string()]);
+    assert_eq!(dry_run, vec!["tart/wg-orphan".to_string()]);
     assert_eq!(vm.vm_names().len(), 2, "dry run must not delete");
 
     let orphans = prune(&ctx, false).await.unwrap();
-    assert_eq!(orphans, vec!["wg-orphan".to_string()]);
+    assert_eq!(orphans, vec!["tart/wg-orphan".to_string()]);
     assert_eq!(vm.vm_names(), vec!["wg-tracked".to_string()]);
 }

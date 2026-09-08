@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use wargame_core::domain::{GuestArch, GuestOs, ProviderCapabilities, VmRef};
+use wargame_core::domain::{
+    ExecutionMode, GuestArch, GuestOs, NetworkMode, ProviderCapabilities, VmRef,
+};
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::process::{Cmd, ProcessRunner};
 use wargame_core::ports::{
@@ -170,6 +172,10 @@ impl VmProvider for TartProvider {
         ProviderCapabilities {
             guest_os: vec![GuestOs::Macos],
             guest_arch: vec![GuestArch::Arm64],
+            // Tart runs Apple Silicon macOS guests on the hypervisor; it has
+            // no emulation path (spec.md §1's support matrix).
+            modes: vec![ExecutionMode::Virtualize],
+            networks: vec![NetworkMode::Isolated, NetworkMode::Nat],
             graphical_console: true,
             ssh: true,
             snapshots: false,
@@ -287,10 +293,9 @@ impl VmProvider for TartProvider {
             )));
         }
 
-        Ok(VmRef {
-            backend: "tart".to_string(),
-            name: spec.name.clone(),
-        })
+        // Tart addresses a VM by name, so the stable provider id *is* the
+        // name (unlike UTM, where it is a UUID).
+        Ok(VmRef::new("tart", spec.name.clone()))
     }
 
     async fn start(&self, vm: &VmRef, opts: &StartOptions) -> Result<RuntimeInfo> {
@@ -393,10 +398,7 @@ impl VmProvider for TartProvider {
         Ok(vms
             .into_iter()
             .filter(|v| v.name.starts_with(&self.cfg.vm_prefix))
-            .map(|v| VmRef {
-                backend: "tart".to_string(),
-                name: v.name,
-            })
+            .map(|v| VmRef::new("tart", v.name))
             .collect())
     }
 
@@ -519,11 +521,11 @@ mod tests {
         runner.push_success(list_json_with_disk("wg-dh-out-of-bound-a1b2c3", 50)); // list
         runner.push_success(""); // set
         let p = provider(runner.clone());
-        let spec = VmSpec {
-            name: "wg-dh-out-of-bound-a1b2c3".to_string(),
-            image: ImageRef("wargame-profile-macos-re-arm64".to_string()),
-            resources: resources(),
-        };
+        let spec = VmSpec::new(
+            "wg-dh-out-of-bound-a1b2c3".to_string(),
+            ImageRef("wargame-profile-macos-re-arm64".to_string()),
+            resources(),
+        );
 
         let vm = p.create(&spec).await.unwrap();
         assert_eq!(vm.backend, "tart");
@@ -547,11 +549,11 @@ mod tests {
         runner.push_failure(1, "disk too small"); // set
         runner.push_success(""); // delete
         let p = provider(runner.clone());
-        let spec = VmSpec {
-            name: "wg-x".to_string(),
-            image: ImageRef("base".to_string()),
-            resources: resources(),
-        };
+        let spec = VmSpec::new(
+            "wg-x".to_string(),
+            ImageRef("base".to_string()),
+            resources(),
+        );
 
         let err = p.create(&spec).await.unwrap_err();
         assert!(matches!(err, WargameError::VmCreationFailed(_)));
@@ -572,15 +574,15 @@ mod tests {
         runner.push_success(list_json_with_disk("wg-x", 50)); // list: current disk 50 GiB
         runner.push_success(""); // set
         let p = provider(runner.clone());
-        let spec = VmSpec {
-            name: "wg-x".to_string(),
-            image: ImageRef("base".to_string()),
-            resources: Resources {
+        let spec = VmSpec::new(
+            "wg-x".to_string(),
+            ImageRef("base".to_string()),
+            Resources {
                 cpu: 4,
                 memory_mib: 8192,
                 disk_gib: 40, // <= current disk: must not pass --disk-size
             },
-        };
+        );
 
         p.create(&spec).await.unwrap();
 
@@ -597,15 +599,15 @@ mod tests {
         runner.push_success(list_json_with_disk("wg-x", 50)); // list: current disk 50 GiB
         runner.push_success(""); // set
         let p = provider(runner.clone());
-        let spec = VmSpec {
-            name: "wg-x".to_string(),
-            image: ImageRef("base".to_string()),
-            resources: Resources {
+        let spec = VmSpec::new(
+            "wg-x".to_string(),
+            ImageRef("base".to_string()),
+            Resources {
                 cpu: 4,
                 memory_mib: 8192,
                 disk_gib: 60, // > current disk: must pass --disk-size 60
             },
-        };
+        );
 
         p.create(&spec).await.unwrap();
 
@@ -628,15 +630,15 @@ mod tests {
         runner.push_success(list_json_with_disk("some-other-vm", 50));
         runner.push_success(""); // set
         let p = provider(runner.clone());
-        let spec = VmSpec {
-            name: "wg-x".to_string(),
-            image: ImageRef("base".to_string()),
-            resources: Resources {
+        let spec = VmSpec::new(
+            "wg-x".to_string(),
+            ImageRef("base".to_string()),
+            Resources {
                 cpu: 4,
                 memory_mib: 8192,
                 disk_gib: 40,
             },
-        };
+        );
 
         p.create(&spec).await.unwrap();
 
@@ -686,10 +688,7 @@ mod tests {
             }
         });
         let p = provider(runner.clone());
-        let vm = VmRef {
-            backend: "tart".to_string(),
-            name: "wg-x".to_string(),
-        };
+        let vm = VmRef::new("tart", "wg-x".to_string());
 
         let ip = p.wait_ip(&vm, Duration::from_secs(30)).await.unwrap();
         assert_eq!(ip, IpAddr::from_str("10.0.0.5").unwrap());
@@ -724,10 +723,7 @@ mod tests {
             _ => Ok(Output::default()),
         });
         let p = provider(runner.clone());
-        let vm = VmRef {
-            backend: "tart".to_string(),
-            name: "wg-x".to_string(),
-        };
+        let vm = VmRef::new("tart", "wg-x".to_string());
         p.start(
             &vm,
             &StartOptions {
@@ -757,10 +753,7 @@ mod tests {
             })
         });
         let p = provider(runner.clone());
-        let vm = VmRef {
-            backend: "tart".to_string(),
-            name: "wg-x".to_string(),
-        };
+        let vm = VmRef::new("tart", "wg-x".to_string());
 
         let err = p.wait_ip(&vm, Duration::from_millis(10)).await.unwrap_err();
         assert!(matches!(err, WargameError::GuestBootTimeout(_)));
@@ -770,10 +763,7 @@ mod tests {
     async fn start_passes_net_host_only_for_isolated_and_no_graphics_only_headless() {
         let runner = Arc::new(FakeRunner::new());
         let p = provider(runner.clone());
-        let vm = VmRef {
-            backend: "tart".to_string(),
-            name: "wg-x".to_string(),
-        };
+        let vm = VmRef::new("tart", "wg-x".to_string());
         let opts = StartOptions {
             network: NetworkMode::Isolated,
             headless: true,
@@ -803,10 +793,7 @@ mod tests {
         let runner = Arc::new(FakeRunner::new());
         runner.push_success("[]");
         let p = provider(runner.clone());
-        let vm = VmRef {
-            backend: "tart".to_string(),
-            name: "wg-unknown".to_string(),
-        };
+        let vm = VmRef::new("tart", "wg-unknown".to_string());
         assert_eq!(p.status(&vm).await.unwrap(), VmStatus::Missing);
     }
 
@@ -816,10 +803,7 @@ mod tests {
         let list_json = r#"[{"Name":"wg-x","Source":"local","State":"running","Running":true,"Size":1,"Disk":1}]"#;
         runner.push_success(list_json);
         let p = provider(runner.clone());
-        let vm = VmRef {
-            backend: "tart".to_string(),
-            name: "wg-x".to_string(),
-        };
+        let vm = VmRef::new("tart", "wg-x".to_string());
         assert_eq!(p.status(&vm).await.unwrap(), VmStatus::Running);
     }
 
@@ -835,10 +819,7 @@ mod tests {
             _ => Ok(Output::default()),
         });
         let p = provider(runner.clone());
-        let vm = VmRef {
-            backend: "tart".to_string(),
-            name: "wg-x".to_string(),
-        };
+        let vm = VmRef::new("tart", "wg-x".to_string());
 
         p.delete(&vm).await.unwrap();
         let calls = runner.calls();
@@ -859,10 +840,7 @@ mod tests {
             _ => Ok(Output::default()),
         });
         let p = provider(runner.clone());
-        let vm = VmRef {
-            backend: "tart".to_string(),
-            name: "wg-x".to_string(),
-        };
+        let vm = VmRef::new("tart", "wg-x".to_string());
 
         p.delete(&vm).await.unwrap();
         let calls = runner.calls();
@@ -920,10 +898,7 @@ mod tests {
     #[test]
     fn console_delegates_to_console_module() {
         let p = provider(Arc::new(FakeRunner::new()));
-        let vm = VmRef {
-            backend: "tart".to_string(),
-            name: "wg-x".to_string(),
-        };
+        let vm = VmRef::new("tart", "wg-x".to_string());
         let ConsoleDescriptor::Window { argv } = p.console(&vm) else {
             panic!("expected Window descriptor");
         };

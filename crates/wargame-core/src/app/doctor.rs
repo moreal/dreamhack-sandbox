@@ -51,57 +51,61 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
         },
     });
 
-    let healthcheck = ctx.vm.healthcheck().await;
-    checks.push(match &healthcheck {
-        Ok(status) => Check {
-            name: format!("vm-backend:{}", ctx.vm.name()),
-            ok: status.available,
-            detail: status
-                .version
-                .clone()
-                .unwrap_or_else(|| status.detail.clone()),
-            hint: if status.available {
-                None
-            } else {
-                Some(format!("Install/start the {} VM backend", ctx.vm.name()))
+    // One row per wired backend, so a host that has Tart but not UTM (or
+    // the other way round) sees exactly which one is missing.
+    for vm in ctx.backends.all() {
+        let healthcheck = vm.healthcheck().await;
+        checks.push(match &healthcheck {
+            Ok(status) => Check {
+                name: format!("vm-backend:{}", vm.name()),
+                ok: status.available,
+                detail: status
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| status.detail.clone()),
+                hint: if status.available {
+                    None
+                } else {
+                    Some(format!("Install/start the {} VM backend", vm.name()))
+                },
             },
-        },
-        Err(e) => Check {
-            name: format!("vm-backend:{}", ctx.vm.name()),
-            ok: false,
-            detail: e.to_string(),
-            hint: e.hint(),
-        },
-    });
-
-    checks.push(match &healthcheck {
-        Ok(status) => match status.isolated_network {
-            Some(true) => Check {
-                name: "network:isolated".to_string(),
-                ok: true,
-                detail: status.detail.clone(),
-                hint: None,
-            },
-            Some(false) => Check {
-                name: "network:isolated".to_string(),
+            Err(e) => Check {
+                name: format!("vm-backend:{}", vm.name()),
                 ok: false,
-                detail: status.detail.clone(),
-                hint: Some(crate::error::isolated_network_hint(None)),
+                detail: e.to_string(),
+                hint: e.hint(),
             },
-            None => Check {
+        });
+
+        checks.push(match &healthcheck {
+            Ok(status) => match status.isolated_network {
+                Some(true) => Check {
+                    name: "network:isolated".to_string(),
+                    ok: true,
+                    detail: status.detail.clone(),
+                    hint: None,
+                },
+                Some(false) => Check {
+                    name: "network:isolated".to_string(),
+                    ok: false,
+                    detail: status.detail.clone(),
+                    hint: Some(crate::error::isolated_network_hint(None)),
+                },
+                None => Check {
+                    name: "network:isolated".to_string(),
+                    ok: true,
+                    detail: "unknown".to_string(),
+                    hint: None,
+                },
+            },
+            Err(_) => Check {
                 name: "network:isolated".to_string(),
                 ok: true,
                 detail: "unknown".to_string(),
                 hint: None,
             },
-        },
-        Err(_) => Check {
-            name: "network:isolated".to_string(),
-            ok: true,
-            detail: "unknown".to_string(),
-            hint: None,
-        },
-    });
+        });
+    }
 
     checks.push(binary_check(ctx, "ssh", "ssh", Some("Install OpenSSH")));
     checks.push(binary_check(ctx, "scp", "scp", Some("Install OpenSSH")));
@@ -160,17 +164,33 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
 
     for profile in ctx.profiles.list() {
         let image = ImageRef(profile.image_name());
-        let ok = ctx.vm.image_exists(&image).await.unwrap_or(false);
-        checks.push(Check {
-            name: format!("profile-image:{}", profile.name),
-            ok,
-            detail: image.0.clone(),
-            hint: if ok {
-                None
-            } else {
-                Some(format!("wargame profile build {}", profile.name))
+        // The image lives on whichever backend the profile resolves to; an
+        // unsupported or unwired combination is the more useful thing to
+        // report than a missing image.
+        let check = match crate::app::backends::resolve_backend(&profile)
+            .and_then(|resolved| ctx.backends.get(resolved.backend.as_str()))
+        {
+            Ok(vm) => {
+                let ok = vm.image_exists(&image).await.unwrap_or(false);
+                Check {
+                    name: format!("profile-image:{}", profile.name),
+                    ok,
+                    detail: format!("{} on {}", image.0, vm.name()),
+                    hint: if ok {
+                        None
+                    } else {
+                        Some(format!("wargame profile build {}", profile.name))
+                    },
+                }
+            }
+            Err(e) => Check {
+                name: format!("profile-image:{}", profile.name),
+                ok: false,
+                detail: e.to_string(),
+                hint: e.hint(),
             },
-        });
+        };
+        checks.push(check);
     }
 
     checks.push(match ctx.wargame.healthcheck().await {
@@ -208,8 +228,10 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
 mod tests {
     use super::*;
     use crate::app::profiles::ProfileStore;
+    use crate::app::{BackendRegistry, TransportRegistry};
     use crate::infra::fs::AppDirs;
     use crate::infra::process::ProcessRunner;
+    use crate::ports::VmProvider;
     use crate::testing::{
         FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider, MemoryRepo,
     };
@@ -228,8 +250,8 @@ mod tests {
             config: Default::default(),
             dirs: AppDirs { root: tmp_path() },
             wargame: Arc::new(FakeWargameProvider::new()),
-            vm,
-            transport: Arc::new(FakeTransport::new()),
+            backends: BackendRegistry::new(vec![vm as Arc<dyn VmProvider>]),
+            transports: TransportRegistry::new(Arc::new(FakeTransport::new())),
             repo: Arc::new(MemoryRepo::new()),
             profiles: ProfileStore::new(vec![], tmp_path()),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
@@ -305,16 +327,18 @@ mod tests {
     #[tokio::test]
     async fn doctor_reports_missing_profile_images() {
         use crate::domain::{
-            GuestArch, GuestOs, GuestSpec, ImageSpec, Profile, Resources, WorkspaceSpec,
+            GuestArch, GuestOs, GuestSpec, ImageSpec, Profile, Resources, VmSettings, WorkspaceSpec,
         };
         let mut ctx = fixture();
         ctx.profiles = ProfileStore::new(
             vec![Profile {
                 name: "macos-minimal-arm64".to_string(),
                 description: String::new(),
+                vm: VmSettings::default(),
                 guest: GuestSpec {
                     os: GuestOs::Macos,
                     arch: GuestArch::Arm64,
+                    distribution: None,
                     user: "admin".to_string(),
                     password: None,
                 },

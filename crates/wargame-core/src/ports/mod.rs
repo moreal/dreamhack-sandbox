@@ -10,7 +10,7 @@ pub mod vm_provider;
 pub mod wargame_provider;
 
 pub use credential_store::CredentialStore;
-pub use guest_transport::{ExecResult, GuestTransport};
+pub use guest_transport::{ExecResult, GuestEndpoint, GuestShell, GuestTransport};
 pub use session_repo::SessionRepository;
 pub use vm_provider::{
     BackendStatus, ConsoleDescriptor, ImageRef, RuntimeInfo, StartOptions, VmProvider, VmSpec,

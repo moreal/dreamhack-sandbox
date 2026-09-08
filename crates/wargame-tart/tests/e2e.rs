@@ -214,15 +214,15 @@ async fn m0_disposable_vm_proof() {
     let session_id = format!("e2e-{}", std::process::id());
     let vm_name = tart.vm_name(&session_id);
 
-    let spec = VmSpec {
-        name: vm_name.clone(),
+    let spec = VmSpec::new(
+        vm_name.clone(),
         image,
-        resources: Resources {
+        Resources {
             cpu: 2,
             memory_mib: 4096,
             disk_gib: 40,
         },
-    };
+    );
     let vm = tart.create(&spec).await.expect("tart clone/set (create)");
 
     let outcome = run_m0_flow(&tart, &vm).await;

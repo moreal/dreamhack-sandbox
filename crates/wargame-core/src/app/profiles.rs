@@ -71,15 +71,19 @@ impl ProfileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{GuestArch, GuestOs, GuestSpec, ImageSpec, Resources, WorkspaceSpec};
+    use crate::domain::{
+        GuestArch, GuestOs, GuestSpec, ImageSpec, Resources, VmSettings, WorkspaceSpec,
+    };
 
     fn profile(name: &str) -> Profile {
         Profile {
             name: name.to_string(),
             description: String::new(),
+            vm: VmSettings::default(),
             guest: GuestSpec {
                 os: GuestOs::Macos,
                 arch: GuestArch::Arm64,
+                distribution: None,
                 user: "admin".to_string(),
                 password: None,
             },

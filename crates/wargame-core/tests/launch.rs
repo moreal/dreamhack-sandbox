@@ -5,14 +5,17 @@
 use std::sync::Arc;
 
 use wargame_core::app::profiles::ProfileStore;
-use wargame_core::app::{launch, AppContext, LaunchEvent, LaunchRequest};
+use wargame_core::app::{
+    launch, AppContext, BackendRegistry, LaunchEvent, LaunchRequest, TransportRegistry,
+};
 use wargame_core::domain::{
     ChallengeRef, GuestArch, GuestOs, GuestSpec, ImageSpec, NetworkMode, Profile, ProvisionSpec,
-    Resources, SessionState, ToolsSpec, WorkspaceSpec,
+    Resources, SessionState, ToolsSpec, VmSettings, WorkspaceSpec,
 };
 use wargame_core::error::WargameError;
 use wargame_core::infra::fs::AppDirs;
 use wargame_core::infra::process::ProcessRunner;
+use wargame_core::ports::VmProvider;
 use wargame_core::testing::{
     FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider, MemoryRepo,
 };
@@ -25,9 +28,11 @@ fn profile() -> Profile {
     Profile {
         name: "macos-minimal-arm64".to_string(),
         description: String::new(),
+        vm: VmSettings::default(),
         guest: GuestSpec {
             os: GuestOs::Macos,
             arch: GuestArch::Arm64,
+            distribution: None,
             user: "admin".to_string(),
             password: None,
         },
@@ -55,8 +60,8 @@ fn context() -> (AppContext, Arc<FakeVmProvider>, Arc<FakeWargameProvider>) {
         config: Default::default(),
         dirs: AppDirs { root: tmp_path() },
         wargame: wargame.clone(),
-        vm: vm.clone(),
-        transport: Arc::new(FakeTransport::new()),
+        backends: BackendRegistry::new(vec![vm.clone() as Arc<dyn VmProvider>]),
+        transports: TransportRegistry::new(Arc::new(FakeTransport::new())),
         repo: Arc::new(MemoryRepo::new()),
         profiles: ProfileStore::new(vec![profile()], tmp_path()),
         runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
@@ -118,7 +123,9 @@ async fn authentication_required_before_any_session_or_vm() {
 #[tokio::test]
 async fn image_missing_is_reported_and_creates_no_session() {
     let (mut ctx, ..) = context();
-    ctx.vm = Arc::new(FakeVmProvider::new()); // no image added
+    // A registry whose tart backend has no image registered.
+    ctx.backends =
+        BackendRegistry::new(vec![Arc::new(FakeVmProvider::new()) as Arc<dyn VmProvider>]);
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
 
     let err = launch(&ctx, request(), tx).await.unwrap_err();

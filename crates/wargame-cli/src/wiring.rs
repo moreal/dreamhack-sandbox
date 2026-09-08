@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use url::Url;
 
-use wargame_core::app::{AppContext, ProfileStore};
+use wargame_core::app::{AppContext, BackendRegistry, ProfileStore, TransportRegistry};
 use wargame_core::config::Config;
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::fs::AppDirs;
@@ -31,13 +31,6 @@ use wargame_tart::{BuildOptions, ProfileImageBuilder, TartConfig, TartProvider, 
 
 use crate::fixture_provider::FixtureProvider;
 use crate::profiles_builtin;
-
-/// The guest OS user every built-in macOS profile provisions (both
-/// `profiles/*.yaml` files use `guest.user: admin`); the everyday
-/// (post-build) SSH transport wired here is fixed to it rather than
-/// threaded through per-launch, since the MVP ships exactly this one guest
-/// user (DESIGN.md §6).
-const DEFAULT_GUEST_USER: &str = "admin";
 
 /// Writes the built-in profile YAMLs to `$WARGAME_HOME/profiles/`, where
 /// [`ProfileStore`] treats them as user overrides of the embedded set.
@@ -109,7 +102,7 @@ pub fn build_context(
     let builtin_profiles = profiles_builtin::builtin_profiles()?;
 
     let wargame = build_wargame_provider(&config, &dirs, &runner)?;
-    let (vm, transport) = build_vm_backend(&config, &dirs, &runner, &builtin_profiles);
+    let (backends, transports) = build_vm_backends(&config, &dirs, &runner, &builtin_profiles);
 
     let repo: Arc<dyn SessionRepository> =
         Arc::new(JsonSessionRepository::new(dirs.sessions_dir()));
@@ -119,8 +112,8 @@ pub fn build_context(
         config,
         dirs,
         wargame,
-        vm,
-        transport,
+        backends,
+        transports,
         repo,
         profiles,
         runner,
@@ -163,36 +156,43 @@ pub fn build_credential_store(
     }
 }
 
-/// `$WARGAME_VM=fake` -> in-memory fakes (every built-in profile's image is
-/// pre-registered so `wargame launch` needs no prior `profile build`);
-/// anything else -> the real Tart backend over SSH.
-fn build_vm_backend(
+/// Builds the backend registry and the guest transports (spec.md §5 item 1).
+///
+/// `$WARGAME_VM=fake` -> one in-memory fake registered under the `tart`
+/// name, with every built-in profile's image pre-registered so `wargame
+/// launch` needs no prior `profile build`; anything else -> the real Tart
+/// backend. The `utm` slot is filled once the UTM adapter exists; until
+/// then a UTM profile fails with "no \"utm\" backend is wired into this
+/// build" rather than being quietly run on Tart.
+///
+/// The SSH transport carries no guest user: it comes from
+/// `profile.guest.user` at launch and from the session's saved connection
+/// afterwards.
+fn build_vm_backends(
     config: &Config,
     dirs: &AppDirs,
     runner: &Arc<dyn ProcessRunner>,
     builtin_profiles: &[wargame_core::domain::Profile],
-) -> (Arc<dyn VmProvider>, Arc<dyn GuestTransport>) {
+) -> (BackendRegistry, TransportRegistry) {
     if std::env::var("WARGAME_VM").as_deref() == Ok("fake") {
         let fake_vm = Arc::new(FakeVmProvider::new());
         for profile in builtin_profiles {
             fake_vm.add_image(profile.image_name());
         }
         return (
-            fake_vm as Arc<dyn VmProvider>,
-            Arc::new(FakeTransport::new()) as Arc<dyn GuestTransport>,
+            BackendRegistry::new(vec![fake_vm as Arc<dyn VmProvider>]),
+            TransportRegistry::new(Arc::new(FakeTransport::new()) as Arc<dyn GuestTransport>),
         );
     }
 
     let tart = Arc::new(TartProvider::new(runner.clone(), tart_config(config)));
-    let key_path = dirs.keys_dir().join("id_ed25519");
     let transport = Arc::new(SshGuestTransport::new(
         runner.clone(),
-        DEFAULT_GUEST_USER,
-        key_path,
+        dirs.keys_dir().join("id_ed25519"),
     ));
     (
-        tart as Arc<dyn VmProvider>,
-        transport as Arc<dyn GuestTransport>,
+        BackendRegistry::new(vec![tart as Arc<dyn VmProvider>]),
+        TransportRegistry::new(transport as Arc<dyn GuestTransport>),
     )
 }
 
@@ -245,10 +245,9 @@ pub async fn build_profile_image_builder(
     ));
     let runner = ctx.runner.clone();
     let key_path_for_factory = key_path.clone();
-    let transport_factory: TransportFactory = Box::new(move |user: &str| {
+    let transport_factory: TransportFactory = Box::new(move || {
         Arc::new(SshGuestTransport::new(
             runner.clone(),
-            user.to_string(),
             key_path_for_factory.clone(),
         )) as Arc<dyn GuestTransport>
     });
@@ -294,7 +293,8 @@ mod tests {
         std::env::set_var("WARGAME_VM", "fake");
         let ctx = build_context(false, None, Some(tmp_home())).unwrap();
         assert_eq!(ctx.wargame.name(), "fixture");
-        assert_eq!(ctx.vm.name(), "tart");
+        assert_eq!(ctx.backends.names(), vec!["tart"]);
+        assert_eq!(ctx.backends.get("tart").unwrap().name(), "tart");
         assert_eq!(ctx.profiles.list().len(), 2);
         std::env::remove_var("WARGAME_PROVIDER");
         std::env::remove_var("WARGAME_VM");

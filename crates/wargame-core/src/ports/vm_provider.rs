@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::domain::compat::ProviderCapabilities;
+use crate::domain::compat::{ProviderCapabilities, ResolvedBackend};
 use crate::domain::profile::Resources;
 use crate::domain::session::{NetworkMode, VmRef};
 use crate::error::Result;
@@ -14,11 +14,33 @@ use crate::error::Result;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ImageRef(pub String);
 
+/// Everything a backend needs to bring one VM into existence: the image and
+/// resources it always needed, plus the execution configuration the profile
+/// resolved to (spec.md §3 FR-1) -- which backend, which mode, which guest,
+/// and the network the VM is configured for (UTM sets that on the VM, not
+/// only at start time).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmSpec {
     pub name: String,
     pub image: ImageRef,
     pub resources: Resources,
+    pub execution: ResolvedBackend,
+    pub network: NetworkMode,
+}
+
+impl VmSpec {
+    /// A spec for the pre-multi-OS combination (Tart / macOS / arm64 /
+    /// virtualize) on an isolated network -- the defaults every existing
+    /// call site meant.
+    pub fn new(name: impl Into<String>, image: ImageRef, resources: Resources) -> Self {
+        VmSpec {
+            name: name.into(),
+            image,
+            resources,
+            execution: ResolvedBackend::default(),
+            network: NetworkMode::Isolated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,7 +1,6 @@
 //! An in-memory [`GuestTransport`] that records every `exec`/`copy_in` call
 //! and can be configured to fail specific steps or refuse readiness.
 
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -10,16 +9,22 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::error::{Result, WargameError};
-use crate::ports::guest_transport::{ExecResult, GuestTransport};
+use crate::ports::guest_transport::{ExecResult, GuestEndpoint, GuestTransport};
 
+/// Every call records the full [`GuestEndpoint`] it was addressed with, so a
+/// test can assert two sessions reached their guests as different users, on
+/// different ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportCall {
+    WaitReady {
+        endpoint: GuestEndpoint,
+    },
     Exec {
-        ip: IpAddr,
+        endpoint: GuestEndpoint,
         argv: Vec<String>,
     },
     CopyIn {
-        ip: IpAddr,
+        endpoint: GuestEndpoint,
         src: PathBuf,
         dest: String,
     },
@@ -95,16 +100,19 @@ impl Default for FakeTransport {
 
 #[async_trait]
 impl GuestTransport for FakeTransport {
-    async fn wait_ready(&self, _ip: IpAddr, timeout: Duration) -> Result<()> {
+    async fn wait_ready(&self, endpoint: &GuestEndpoint, timeout: Duration) -> Result<()> {
+        self.calls.lock().unwrap().push(TransportCall::WaitReady {
+            endpoint: endpoint.clone(),
+        });
         if self.should_fail("wait_ready") || !*self.ready.lock().unwrap() {
             return Err(WargameError::GuestBootTimeout(timeout));
         }
         Ok(())
     }
 
-    async fn exec(&self, ip: IpAddr, argv: &[String]) -> Result<ExecResult> {
+    async fn exec(&self, endpoint: &GuestEndpoint, argv: &[String]) -> Result<ExecResult> {
         self.calls.lock().unwrap().push(TransportCall::Exec {
-            ip,
+            endpoint: endpoint.clone(),
             argv: argv.to_vec(),
         });
         if self.should_fail("exec") {
@@ -122,9 +130,9 @@ impl GuestTransport for FakeTransport {
         })
     }
 
-    async fn copy_in(&self, ip: IpAddr, src: &Path, dest: &str) -> Result<()> {
+    async fn copy_in(&self, endpoint: &GuestEndpoint, src: &Path, dest: &str) -> Result<()> {
         self.calls.lock().unwrap().push(TransportCall::CopyIn {
-            ip,
+            endpoint: endpoint.clone(),
             src: src.to_path_buf(),
             dest: dest.to_string(),
         });
@@ -134,9 +142,9 @@ impl GuestTransport for FakeTransport {
         Ok(())
     }
 
-    fn interactive_shell_cmd(&self, ip: IpAddr) -> Command {
+    fn interactive_shell_cmd(&self, endpoint: &GuestEndpoint) -> Command {
         let mut cmd = Command::new("true");
-        cmd.arg(ip.to_string());
+        cmd.arg(endpoint.to_string());
         cmd
     }
 }
@@ -144,19 +152,24 @@ impl GuestTransport for FakeTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use std::str::FromStr;
+
+    fn endpoint() -> GuestEndpoint {
+        GuestEndpoint::new(IpAddr::from_str("10.0.0.5").unwrap(), "admin")
+    }
 
     #[tokio::test]
     async fn records_exec_and_copy_in_calls() {
         let transport = FakeTransport::new();
-        let ip = IpAddr::from_str("10.0.0.5").unwrap();
+        let endpoint = endpoint();
 
         transport
-            .exec(ip, &["echo".to_string(), "hi".to_string()])
+            .exec(&endpoint, &["echo".to_string(), "hi".to_string()])
             .await
             .unwrap();
         transport
-            .copy_in(ip, Path::new("/tmp/a.zip"), "~/wargame/incoming/")
+            .copy_in(&endpoint, Path::new("/tmp/a.zip"), "~/wargame/incoming/")
             .await
             .unwrap();
 
@@ -170,8 +183,10 @@ mod tests {
     async fn set_fail_on_makes_the_named_step_error() {
         let transport = FakeTransport::new();
         transport.set_fail_on("exec");
-        let ip = IpAddr::from_str("10.0.0.5").unwrap();
-        let err = transport.exec(ip, &["true".to_string()]).await.unwrap_err();
+        let err = transport
+            .exec(&endpoint(), &["true".to_string()])
+            .await
+            .unwrap_err();
         assert!(matches!(err, WargameError::GuestBootstrapFailed(_)));
     }
 
@@ -179,9 +194,8 @@ mod tests {
     async fn not_ready_times_out() {
         let transport = FakeTransport::new();
         transport.set_ready(false);
-        let ip = IpAddr::from_str("10.0.0.5").unwrap();
         let err = transport
-            .wait_ready(ip, Duration::from_secs(1))
+            .wait_ready(&endpoint(), Duration::from_secs(1))
             .await
             .unwrap_err();
         assert!(matches!(err, WargameError::GuestBootTimeout(_)));

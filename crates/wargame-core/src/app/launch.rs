@@ -3,20 +3,22 @@
 //! exists (NFR-02), VM creation, asset download (staged, hashed, never
 //! executed host-side), boot, and guest-side bootstrap.
 
-use std::net::IpAddr;
-use std::time::Duration;
+use std::sync::Arc;
 
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
 
 use crate::domain::{
-    Challenge, ChallengeRef, KeepPolicy, NetworkMode, Profile, Resources, Session, SessionAsset,
-    SessionState,
+    Challenge, ChallengeRef, GuestConnection, GuestEndpoint, KeepPolicy, NetworkMode, Profile,
+    ResolvedBackend, Resources, Session, SessionAsset, SessionState,
 };
 use crate::error::{Result, WargameError};
-use crate::ports::{AuthState, DownloadedFile, ImageRef, StartOptions, VmSpec};
+use crate::ports::{
+    AuthState, DownloadedFile, GuestTransport, ImageRef, StartOptions, VmProvider, VmSpec,
+};
 use crate::security::StagingDir;
 
+use super::backends::provider_for_profile;
 use super::AppContext;
 
 /// A request to launch one challenge into a fresh session (DESIGN.md §3.4).
@@ -50,7 +52,7 @@ pub enum LaunchEvent {
         size: u64,
     },
     Booting,
-    GuestIp(IpAddr),
+    GuestIp(std::net::IpAddr),
     Bootstrapping,
     Ready {
         session_id: String,
@@ -120,17 +122,29 @@ pub async fn launch(
     .await;
     let profile = ctx.profiles.get(&req.profile)?;
 
-    crate::domain::compat::check(&profile, ctx.vm.name(), &ctx.vm.capabilities())?;
+    // Resolution first: it is pure data, so an unsupported OS/arch/mode
+    // combination is refused before any backend is even contacted, let alone
+    // asked to create, clone or start something (spec.md §3 FR-1).
+    let (execution, vm) = provider_for_profile(ctx, &profile)?;
+    let capabilities = vm.capabilities();
+    crate::domain::compat::check(&profile, vm.name(), &capabilities)?;
+    if !capabilities.supports_network(req.network) {
+        return Err(WargameError::NetworkUnavailable(format!(
+            "the {} backend cannot run a session on the {} network",
+            vm.name(),
+            req.network,
+        )));
+    }
 
     emit(
         &events,
         LaunchEvent::Preflight("checking VM backend".to_string()),
     )
     .await;
-    let backend = ctx.vm.healthcheck().await?;
+    let backend = vm.healthcheck().await?;
     if !backend.available {
         return Err(WargameError::BackendUnavailable {
-            backend: ctx.vm.name().to_string(),
+            backend: vm.name().to_string(),
             reason: backend.detail,
         });
     }
@@ -142,7 +156,7 @@ pub async fn launch(
     }
 
     let image = ImageRef(profile.image_name());
-    if !ctx.vm.image_exists(&image).await? {
+    if !vm.image_exists(&image).await? {
         return Err(WargameError::ImageMissing {
             profile: profile.name.clone(),
             image: image.0.clone(),
@@ -191,10 +205,12 @@ pub async fn launch(
         display_name: challenge.summary.title.clone(),
         challenge: challenge.summary.clone(),
         challenge_snapshot: challenge.clone(),
-        vm_provider: ctx.vm.name().to_string(),
+        vm_provider: execution.backend.as_str().to_string(),
         profile: profile.name.clone(),
         guest_os: profile.guest.os,
         guest_arch: profile.guest.arch,
+        guest_distribution: execution.distribution.clone(),
+        vm_mode: execution.mode,
         network: req.network,
         resources,
         created_at: OffsetDateTime::now_utc(),
@@ -205,6 +221,10 @@ pub async fn launch(
         last_error: None,
         runner_pid: None,
         guest_ip: None,
+        // Snapshotted now so `resume`/`ssh` reconnect the way this launch
+        // did even if the profile is edited afterwards (FR-5).
+        connection: GuestConnection::new(profile.guest.user.clone(), profile.guest.os),
+        workspace_root: profile.workspace.root.clone(),
     };
     ctx.repo.save(&session).await?;
     emit(
@@ -215,7 +235,18 @@ pub async fn launch(
     )
     .await;
 
-    match run_launch(ctx, &req, &profile, &challenge, &mut session, &events).await {
+    match run_launch(
+        ctx,
+        &req,
+        &profile,
+        &challenge,
+        &mut session,
+        &execution,
+        &vm,
+        &events,
+    )
+    .await
+    {
         Ok(()) => Ok(session),
         Err(err) => Err(fail_session(ctx, &mut session, err, &events).await),
     }
@@ -250,20 +281,29 @@ async fn fail_session(
 /// Steps 3-8 of DESIGN.md §3.4: VM creation through to `Ready`. `session`
 /// is saved after every state change so a crash mid-pipeline leaves an
 /// accurate on-disk record.
+#[allow(clippy::too_many_arguments)]
 async fn run_launch(
     ctx: &AppContext,
     req: &LaunchRequest,
     profile: &Profile,
     challenge: &Challenge,
     session: &mut Session,
+    execution: &ResolvedBackend,
+    vm: &Arc<dyn VmProvider>,
     events: &Sender<LaunchEvent>,
 ) -> Result<()> {
+    let boot_timeout = ctx
+        .config
+        .vm
+        .boot_timeout(execution.backend, execution.mode);
     let vm_spec = VmSpec {
         name: format!("{}{}", ctx.config.vm.tart.vm_prefix, session.id),
         image: ImageRef(profile.image_name()),
         resources: session.resources,
+        execution: execution.clone(),
+        network: session.network,
     };
-    let vm_ref = ctx.vm.create(&vm_spec).await?;
+    let vm_ref = vm.create(&vm_spec).await?;
     session.vm_ref = Some(vm_ref.clone());
     ctx.repo.save(session).await?;
     emit(
@@ -316,22 +356,23 @@ async fn run_launch(
     ctx.repo.save(session).await?;
     emit(events, LaunchEvent::Booting).await;
 
-    let boot_timeout = Duration::from_secs(ctx.config.vm.tart.boot_timeout_secs);
     let start_opts = StartOptions {
         network: session.network,
         headless: !req.gui,
         log_path: ctx.repo.session_dir(&session.id).join("run.log"),
     };
-    let runtime = ctx.vm.start(&vm_ref, &start_opts).await?;
+    let runtime = vm.start(&vm_ref, &start_opts).await?;
     session.runner_pid = runtime.pid;
     ctx.repo.save(session).await?;
 
-    let ip = ctx.vm.wait_ip(&vm_ref, boot_timeout).await?;
+    let ip = vm.wait_ip(&vm_ref, boot_timeout).await?;
     session.guest_ip = Some(ip);
     ctx.repo.save(session).await?;
     emit(events, LaunchEvent::GuestIp(ip)).await;
 
-    ctx.transport.wait_ready(ip, boot_timeout).await?;
+    let endpoint = session.connection.endpoint(ip);
+    let transport = ctx.transports.for_endpoint(&endpoint)?;
+    transport.wait_ready(&endpoint, boot_timeout).await?;
 
     session.transition(SessionState::Provisioning)?;
     ctx.repo.save(session).await?;
@@ -342,7 +383,8 @@ async fn run_launch(
         req,
         profile,
         challenge,
-        ip,
+        &endpoint,
+        transport.as_ref(),
         &staging,
         &downloaded_files,
     )
@@ -374,7 +416,8 @@ async fn provision_guest(
     req: &LaunchRequest,
     profile: &Profile,
     challenge: &Challenge,
-    ip: IpAddr,
+    endpoint: &GuestEndpoint,
+    transport: &dyn GuestTransport,
     staging: &StagingDir,
     downloaded_files: &[DownloadedFile],
 ) -> Result<()> {
@@ -382,10 +425,9 @@ async fn provision_guest(
     let bootstrap_dir = format!("{workspace_root}/.wg");
     let incoming_dir = format!("{workspace_root}/{}/incoming", challenge.summary.slug);
 
-    let mkdir = ctx
-        .transport
+    let mkdir = transport
         .exec(
-            ip,
+            endpoint,
             &[
                 "mkdir".to_string(),
                 "-p".to_string(),
@@ -403,13 +445,13 @@ async fn provision_guest(
 
     let bootstrap_path = staging.path.join("bootstrap.sh");
     std::fs::write(&bootstrap_path, ctx.bootstrap_script)?;
-    ctx.transport
-        .copy_in(ip, &bootstrap_path, &format!("{bootstrap_dir}/"))
+    transport
+        .copy_in(endpoint, &bootstrap_path, &format!("{bootstrap_dir}/"))
         .await?;
 
     for file in downloaded_files {
-        ctx.transport
-            .copy_in(ip, &file.path, &format!("{incoming_dir}/"))
+        transport
+            .copy_in(endpoint, &file.path, &format!("{incoming_dir}/"))
             .await?;
     }
 
@@ -430,8 +472,8 @@ async fn provision_guest(
     let metadata_bytes =
         serde_json::to_vec_pretty(&metadata).map_err(|e| WargameError::Other(e.to_string()))?;
     std::fs::write(&metadata_path, metadata_bytes)?;
-    ctx.transport
-        .copy_in(ip, &metadata_path, &format!("{incoming_dir}/"))
+    transport
+        .copy_in(endpoint, &metadata_path, &format!("{incoming_dir}/"))
         .await?;
 
     let argv = vec![
@@ -440,7 +482,7 @@ async fn provision_guest(
         format!("{workspace_root}/{}", challenge.summary.slug),
         format!("--extract={}", req.extract),
     ];
-    let out = ctx.transport.exec(ip, &argv).await?;
+    let out = transport.exec(endpoint, &argv).await?;
     if out.status != 0 {
         return Err(WargameError::GuestBootstrapFailed(format!(
             "bootstrap exited with status {}: {}",
@@ -455,8 +497,10 @@ async fn provision_guest(
 mod tests {
     use super::*;
     use crate::app::profiles::ProfileStore;
+    use crate::app::{BackendRegistry, TransportRegistry};
     use crate::domain::{
-        GuestArch, GuestOs, GuestSpec, ImageSpec, ProvisionSpec, ToolsSpec, WorkspaceSpec,
+        GuestArch, GuestOs, GuestSpec, ImageSpec, ProvisionSpec, ToolsSpec, VmSettings,
+        WorkspaceSpec,
     };
     use crate::infra::fs::AppDirs;
     use crate::infra::process::ProcessRunner;
@@ -475,9 +519,11 @@ mod tests {
         Profile {
             name: "macos-minimal-arm64".to_string(),
             description: String::new(),
+            vm: VmSettings::default(),
             guest: GuestSpec {
                 os: GuestOs::Macos,
                 arch: GuestArch::Arm64,
+                distribution: None,
                 user: "admin".to_string(),
                 password: None,
             },
@@ -516,8 +562,8 @@ mod tests {
             config: Default::default(),
             dirs: AppDirs { root: tmp_path() },
             wargame: wargame.clone(),
-            vm: vm.clone(),
-            transport: transport.clone(),
+            backends: BackendRegistry::new(vec![vm.clone() as Arc<dyn VmProvider>]),
+            transports: TransportRegistry::new(transport.clone()),
             repo: Arc::new(MemoryRepo::new()),
             profiles: ProfileStore::new(vec![test_profile()], profiles_dir),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
@@ -631,7 +677,9 @@ mod tests {
         let Fixture { ctx, .. } = fixture();
         // Don't add "base-image" this time.
         let ctx = AppContext {
-            vm: Arc::new(FakeVmProvider::new()),
+            backends: BackendRegistry::new(vec![
+                Arc::new(FakeVmProvider::new()) as Arc<dyn crate::ports::VmProvider>
+            ]),
             ..ctx
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
