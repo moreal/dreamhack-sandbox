@@ -60,7 +60,10 @@ function Invoke-Native {
         [int[]]                          $AllowedExitCodes = @(0)
     )
     Write-Step $Label
-    & $Command @Arguments
+    # `| Out-Host` rather than letting the command write to the pipeline:
+    # this function returns the exit code, and anything the command printed
+    # would otherwise be returned alongside it as an array.
+    & $Command @Arguments | Out-Host
     $code = $LASTEXITCODE
     Write-Result $Label $code
     if ($AllowedExitCodes -notcontains $code) {
@@ -235,8 +238,13 @@ $checks = @(
 )
 $failed = @()
 foreach ($check in $checks) {
-    & $check.Command @($check.Arguments)
-    $code = $LASTEXITCODE
+    $code = 1
+    try {
+        & $check.Command @($check.Arguments) | Out-Host
+        $code = $LASTEXITCODE
+    } catch {
+        Write-Host "    verify: $($check.Label) -> $($_.Exception.Message)"
+    }
     Write-Host "    verify: $($check.Label) -> exit $code"
     if ($code -ne 0) { $failed += "$($check.Label) (exit $code)" }
 }
