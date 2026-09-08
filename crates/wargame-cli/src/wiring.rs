@@ -39,28 +39,53 @@ use wargame_utm::{RecordImageCatalog, UtmConfig, UtmImageBuilder, UtmProvider};
 use crate::fixture_provider::FixtureProvider;
 use crate::profiles_builtin;
 
-/// Writes the built-in profile YAMLs to `$WARGAME_HOME/profiles/`, where
-/// [`ProfileStore`] treats them as user overrides of the embedded set.
+/// Writes one built-in file into `$WARGAME_HOME/profiles/<rel>`, keeping
+/// whatever the user did to it (spec.md §3 FR-3: "사용자 편집 프로필·사용자
+/// 스크립트를 내장 파일 배포 과정에서 덮어쓰지 않는다").
 ///
 /// A copy the user has edited is theirs and is never touched. A copy that
 /// still equals what the previous binary seeded (kept as a pristine copy
-/// under `profiles/.builtin/`) is replaced, so an unedited profile follows
-/// the binary instead of being frozen at whatever version first ran.
+/// under `profiles/.builtin/`) is replaced, so an unedited file follows the
+/// binary instead of being frozen at whatever version first ran. A file the
+/// built-in set does not name at all -- anything the user added under their
+/// own name -- is never written here, so it cannot be touched either.
+fn seed_builtin_file(dirs: &AppDirs, rel: &str, content: &str) -> Result<()> {
+    let dest = dirs.profiles_dir().join(rel);
+    let pristine = dirs.profiles_dir().join(".builtin").join(rel);
+    let current = std::fs::read_to_string(&dest).ok();
+    let last_seeded = std::fs::read_to_string(&pristine).ok();
+
+    let unedited = current.is_none() || current == last_seeded;
+    if unedited && current.as_deref() != Some(content) {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, content)?;
+    }
+    if last_seeded.as_deref() != Some(content) {
+        if let Some(parent) = pristine.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&pristine, content)?;
+    }
+    Ok(())
+}
+
+/// Seeds the built-in profile YAMLs, which [`ProfileStore`] then treats as
+/// user overrides of the embedded set.
 fn seed_builtin_profile_yamls(dirs: &AppDirs) -> Result<()> {
-    let pristine_dir = dirs.profiles_dir().join(".builtin");
-    std::fs::create_dir_all(&pristine_dir)?;
     for (filename, content) in profiles_builtin::builtin_profile_yamls() {
-        let dest = dirs.profiles_dir().join(filename);
-        let pristine = pristine_dir.join(filename);
-        let current = std::fs::read_to_string(&dest).ok();
-        let last_seeded = std::fs::read_to_string(&pristine).ok();
-        let unedited = current.is_none() || current == last_seeded;
-        if unedited && current.as_deref() != Some(content) {
-            std::fs::write(&dest, content)?;
-        }
-        if last_seeded.as_deref() != Some(content) {
-            std::fs::write(&pristine, content)?;
-        }
+        seed_builtin_file(dirs, filename, content)?;
+    }
+    Ok(())
+}
+
+/// Seeds the built-in provisioning scripts, i.e. the paths the built-in
+/// profiles' `provision.scripts` entries point at, plus the commented
+/// `scripts/custom/` examples.
+fn seed_builtin_scripts(dirs: &AppDirs) -> Result<()> {
+    for (rel, content) in profiles_builtin::builtin_provision_scripts() {
+        seed_builtin_file(dirs, rel, content)?;
     }
     Ok(())
 }
@@ -86,19 +111,7 @@ pub fn build_context(
     })?;
 
     seed_builtin_profile_yamls(&dirs)?;
-    // Unlike the YAMLs, the built-in scripts are overwritten every run: they
-    // are part of the tool, not user configuration, and a stale copy would
-    // silently build images with an older provisioning recipe. Users add
-    // their own scripts under other names.
-    for (rel, content) in profiles_builtin::builtin_provision_scripts() {
-        let dest = dirs.profiles_dir().join(rel);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if std::fs::read_to_string(&dest).ok().as_deref() != Some(content) {
-            std::fs::write(&dest, content)?;
-        }
-    }
+    seed_builtin_scripts(&dirs)?;
 
     let config_path = config_override.unwrap_or_else(|| dirs.config_file());
     let config = Config::load(Some(&config_path))?;
@@ -442,6 +455,64 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&yaml).unwrap(), edited);
     }
 
+    /// spec.md §3 FR-3: "사용자 편집 프로필·사용자 스크립트를 내장 파일
+    /// 배포 과정에서 덮어쓰지 않는다" -- the same rule the YAMLs follow, for
+    /// the scripts. An unedited copy still follows the binary, so a stale
+    /// provisioning recipe is not frozen in place.
+    #[test]
+    fn an_edited_builtin_script_is_kept_but_an_unedited_one_follows_the_binary() {
+        let home = tmp_home();
+        let dirs = AppDirs { root: home.clone() };
+        dirs.ensure_layout().unwrap();
+        let rel = "scripts/kali/common.sh";
+        let script = home.join("profiles").join(rel);
+        let current = profiles_builtin::builtin_provision_scripts()
+            .into_iter()
+            .find(|(path, _)| *path == rel)
+            .map(|(_, content)| content)
+            .unwrap();
+
+        // An older binary seeded a different version and the user left it
+        // alone: the new one replaces it.
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "#!/usr/bin/env bash\necho old\n").unwrap();
+        std::fs::create_dir_all(home.join("profiles/.builtin/scripts/kali")).unwrap();
+        std::fs::write(
+            home.join("profiles/.builtin").join(rel),
+            "#!/usr/bin/env bash\necho old\n",
+        )
+        .unwrap();
+        seed_builtin_scripts(&dirs).unwrap();
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), current);
+
+        // The user edits it: the edit survives every later run.
+        let edited = format!("{current}echo 'my own step'\n");
+        std::fs::write(&script, &edited).unwrap();
+        seed_builtin_scripts(&dirs).unwrap();
+        seed_builtin_scripts(&dirs).unwrap();
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), edited);
+    }
+
+    /// A script the user added under a name of their own is not part of the
+    /// built-in set at all, so seeding neither writes nor removes it.
+    #[test]
+    fn seeding_never_touches_a_users_own_script() {
+        let home = tmp_home();
+        let dirs = AppDirs { root: home.clone() };
+        dirs.ensure_layout().unwrap();
+        let mine = home.join("profiles/scripts/custom/my-tools.sh");
+        std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+        std::fs::write(&mine, "#!/usr/bin/env bash\necho mine\n").unwrap();
+
+        seed_builtin_scripts(&dirs).unwrap();
+        seed_builtin_scripts(&dirs).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&mine).unwrap(),
+            "#!/usr/bin/env bash\necho mine\n"
+        );
+    }
+
     #[test]
     fn build_context_seeds_and_refreshes_builtin_scripts_in_home() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -452,8 +523,14 @@ mod tests {
         let _ctx = build_context(false, None, Some(home.clone())).unwrap();
         assert!(home.join("profiles/scripts/macos/common.sh").is_file());
         assert!(script.is_file());
-        // A stale copy (e.g. from an older binary) is replaced, not kept.
+        // A stale copy (e.g. from an older binary, so the pristine record
+        // matches it) is replaced, not kept.
         std::fs::write(&script, "#!/usr/bin/env bash\necho stale\n").unwrap();
+        std::fs::write(
+            home.join("profiles/.builtin/scripts/macos/reversing.sh"),
+            "#!/usr/bin/env bash\necho stale\n",
+        )
+        .unwrap();
         let _ctx = build_context(false, None, Some(home.clone())).unwrap();
         assert!(!std::fs::read_to_string(&script)
             .unwrap()
