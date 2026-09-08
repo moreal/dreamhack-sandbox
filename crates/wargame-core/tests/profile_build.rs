@@ -39,6 +39,9 @@ struct FakeBuilder {
     backend: String,
     installer: bool,
     transport: Arc<FakeTransport>,
+    /// Overrides `transport` when a test needs a guest that behaves
+    /// differently (a reboot mid-provisioning, say).
+    guest: Mutex<Option<Arc<dyn GuestTransport>>>,
     calls: Mutex<Vec<String>>,
     fail_on: Mutex<Option<&'static str>>,
     created: Mutex<Vec<String>>,
@@ -59,6 +62,7 @@ impl FakeBuilder {
             backend: "utm".to_string(),
             installer: true,
             transport: Arc::new(FakeTransport::new()),
+            guest: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
             fail_on: Mutex::new(None),
             created: Mutex::new(Vec::new()),
@@ -70,6 +74,10 @@ impl FakeBuilder {
             last_profile: Mutex::new(String::new()),
             image_at_discard: Mutex::new(None),
         }
+    }
+
+    fn set_transport(&self, transport: Arc<dyn GuestTransport>) {
+        *self.guest.lock().unwrap() = Some(transport);
     }
 
     fn watch(&self, builds: Arc<MemoryBuildRepo>) {
@@ -191,7 +199,12 @@ impl ProfileImageBuilder for FakeBuilder {
                 "10.0.0.9".parse().unwrap(),
                 req.profile.guest.user.clone(),
             ),
-            transport: self.transport.clone() as Arc<dyn GuestTransport>,
+            transport: self
+                .guest
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| self.transport.clone() as Arc<dyn GuestTransport>),
         })
     }
 
@@ -234,6 +247,74 @@ impl ProfileImageBuilder for FakeBuilder {
     async fn cleanup_failed_build(&self, _req: &BuildRequest<'_>, vm: &VmRef) -> Vec<String> {
         self.record(&format!("cleanup:{}", vm.id));
         self.cleanup_failures.lock().unwrap().clone()
+    }
+}
+
+/// A guest whose provisioning script asks for a reboot: the script exits
+/// 3010, SSH then refuses connections until it comes back.
+struct RebootingTransport {
+    /// Every `wait_ready` this transport was asked for.
+    waits: Mutex<usize>,
+    /// How many `true` probes are still answered with "connection refused"
+    /// before the guest is back.
+    down_for: Mutex<usize>,
+    execs: Mutex<Vec<Vec<String>>>,
+}
+
+impl RebootingTransport {
+    fn new(down_for: usize) -> Self {
+        RebootingTransport {
+            waits: Mutex::new(0),
+            down_for: Mutex::new(down_for),
+            execs: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl GuestTransport for RebootingTransport {
+    async fn wait_ready(
+        &self,
+        _endpoint: &GuestEndpoint,
+        _timeout: std::time::Duration,
+    ) -> Result<()> {
+        *self.waits.lock().unwrap() += 1;
+        Ok(())
+    }
+
+    async fn exec(
+        &self,
+        _endpoint: &GuestEndpoint,
+        argv: &[String],
+    ) -> Result<wargame_core::ports::ExecResult> {
+        self.execs.lock().unwrap().push(argv.to_vec());
+        if argv == ["true".to_string()] {
+            let mut down = self.down_for.lock().unwrap();
+            if *down > 0 {
+                *down -= 1;
+                return Err(WargameError::NetworkUnavailable(
+                    "ssh: connect to host 10.0.0.9 port 22: Connection refused".to_string(),
+                ));
+            }
+        }
+        let status = if argv.first().map(String::as_str) == Some("bash") {
+            3010
+        } else {
+            0
+        };
+        Ok(wargame_core::ports::ExecResult {
+            status,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    async fn copy_in(&self, _endpoint: &GuestEndpoint, _src: &Path, _dest: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn interactive_shell_cmd(&self, _endpoint: &GuestEndpoint) -> std::process::Command {
+        std::process::Command::new("true")
     }
 }
 
@@ -1160,5 +1241,42 @@ async fn a_tart_build_needs_no_record_and_writes_one() {
             .unwrap()
             .0,
         "wargame-profile-macos-re-arm64"
+    );
+}
+
+/// spec.md §3 FR-3: "설치 중 재부팅 필요 상태를 처리하고 다시 연결한다".
+/// A script that exits 3010 is not a failure: the build waits for SSH to
+/// drop and come back, then carries on.
+#[tokio::test]
+async fn a_script_that_asks_for_a_reboot_waits_for_the_guest_and_continues() {
+    let f = fixture();
+    let guest = Arc::new(RebootingTransport::new(1));
+    f.utm
+        .set_transport(guest.clone() as Arc<dyn GuestTransport>);
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+
+    let mut messages = Vec::new();
+    let record = profile_build::build(&f.ctx, "kali-arm64", &mut |m| messages.push(m))
+        .await
+        .unwrap();
+
+    assert_eq!(record.phase, BuildPhase::Ready);
+    assert_eq!(
+        *guest.waits.lock().unwrap(),
+        1,
+        "the build must wait for SSH again after the reboot"
+    );
+    let printed = messages.join("\n");
+    assert!(printed.contains("reboot"), "{printed}");
+    // The verify command still ran, i.e. the flow continued past the reboot.
+    assert_eq!(record.verification.len(), 1);
+    let execs = guest.execs.lock().unwrap().clone();
+    assert!(
+        execs
+            .iter()
+            .any(|argv| argv == &["python3".to_string(), "--version".to_string()]),
+        "{execs:?}"
     );
 }
