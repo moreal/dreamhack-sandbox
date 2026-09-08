@@ -61,6 +61,11 @@ pub struct UtmConfig {
     /// from `[vm.tart].vm_prefix` so the two backends can be namespaced
     /// independently.
     pub vm_prefix: String,
+    /// Display-name prefix for the *build* VMs: the installation VM
+    /// `profile create` makes and the image VM `profile build` publishes.
+    /// Deliberately not the session prefix -- these VMs have no session, and
+    /// `prune` must never mistake them for orphans (spec.md §3 FR-5).
+    pub build_prefix: String,
     /// Boot timeout for `mode: emulate` guests. Full x86_64 emulation is
     /// orders of magnitude slower than virtualization, hence FR-5's 1800 s.
     pub boot_timeout_secs: u64,
@@ -73,6 +78,7 @@ impl Default for UtmConfig {
         UtmConfig {
             utmctl: None,
             vm_prefix: "wg-".to_string(),
+            build_prefix: "wg-build-".to_string(),
             boot_timeout_secs: 1800,
             virtualize_boot_timeout_secs: 300,
         }
@@ -98,6 +104,17 @@ impl VmConfig {
         match backend {
             Backend::Tart => &self.tart.vm_prefix,
             Backend::Utm => &self.utm.vm_prefix,
+        }
+    }
+
+    /// The display-name prefix for the VMs a *build* owns (the installation
+    /// VM and the published image VM), which is never the session prefix.
+    pub fn build_prefix(&self, backend: Backend) -> &str {
+        match backend {
+            // Tart's image is a local image name, not a VM in a namespace;
+            // its build VM keeps carrying the profile image name.
+            Backend::Tart => &self.tart.vm_prefix,
+            Backend::Utm => &self.utm.build_prefix,
         }
     }
 
@@ -224,6 +241,7 @@ keep_staging = false
         let cfg = Config::default();
         assert_eq!(cfg.vm.utm.utmctl, None);
         assert_eq!(cfg.vm.utm.vm_prefix, "wg-");
+        assert_eq!(cfg.vm.utm.build_prefix, "wg-build-");
         assert_eq!(cfg.vm.utm.boot_timeout_secs, 1800);
         assert_eq!(cfg.vm.utm.virtualize_boot_timeout_secs, 300);
 
@@ -246,6 +264,21 @@ keep_staging = false
         let cfg: Config = toml::from_str("[vm.utm]\nvm_prefix = \"wgu-\"\n").unwrap();
         assert_eq!(cfg.vm.vm_prefix(Backend::Tart), "wg-");
         assert_eq!(cfg.vm.vm_prefix(Backend::Utm), "wgu-");
+    }
+
+    /// Build VMs live outside the session namespace so `prune` never sees
+    /// them as orphans (spec.md §3 FR-5).
+    #[test]
+    fn the_build_prefix_is_not_the_session_prefix() {
+        let cfg = Config::default();
+        assert_eq!(cfg.vm.build_prefix(Backend::Utm), "wg-build-");
+        assert_ne!(
+            cfg.vm.build_prefix(Backend::Utm),
+            cfg.vm.vm_prefix(Backend::Utm)
+        );
+
+        let cfg: Config = toml::from_str("[vm.utm]\nbuild_prefix = \"mybuild-\"\n").unwrap();
+        assert_eq!(cfg.vm.build_prefix(Backend::Utm), "mybuild-");
     }
 
     #[test]

@@ -4,8 +4,7 @@
 //! never returns `Err` — a failed check is just a `Check { ok: false, .. }`
 //! row for the CLI/TUI to render.
 
-use crate::domain::{GuestShell, NetworkMode};
-use crate::ports::ImageRef;
+use crate::domain::{GuestShell, NetworkMode, Profile};
 
 use super::AppContext;
 
@@ -140,34 +139,7 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
     });
 
     for profile in ctx.profiles.list() {
-        let image = ImageRef(profile.image_name());
-        // The image lives on whichever backend the profile resolves to; an
-        // unsupported or unwired combination is the more useful thing to
-        // report than a missing image.
-        let check = match crate::app::backends::resolve_backend(&profile)
-            .and_then(|resolved| ctx.backends.get(resolved.backend.as_str()))
-        {
-            Ok(vm) => {
-                let ok = vm.image_exists(&image).await.unwrap_or(false);
-                Check {
-                    name: format!("profile-image:{}", profile.name),
-                    ok,
-                    detail: format!("{} on {}", image.0, vm.name()),
-                    hint: if ok {
-                        None
-                    } else {
-                        Some(format!("wargame profile build {}", profile.name))
-                    },
-                }
-            }
-            Err(e) => Check {
-                name: format!("profile-image:{}", profile.name),
-                ok: false,
-                detail: e.to_string(),
-                hint: e.hint(),
-            },
-        };
-        checks.push(check);
+        checks.push(profile_image_check(ctx, &profile).await);
     }
 
     checks.push(match ctx.wargame.healthcheck().await {
@@ -353,22 +325,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
     }
 
     // 5. Is there an image to launch from?
-    let image = ImageRef(profile.image_name());
-    let image_ready = vm.image_exists(&image).await.unwrap_or(false);
-    checks.push(Check {
-        name: format!("profile-image:{name}"),
-        ok: image_ready,
-        detail: if image_ready {
-            format!("{} on {}", image.0, vm.name())
-        } else {
-            format!("{} is not ready on {}", image.0, vm.name())
-        },
-        hint: if image_ready {
-            None
-        } else {
-            Some(format!("wargame profile build {name}"))
-        },
-    });
+    checks.push(profile_image_check(ctx, &profile).await);
 
     // 6. Room for this profile's disk, not the flat 20 GiB floor.
     checks.push(match crate::infra::disk_free_bytes(&ctx.dirs.root) {
@@ -413,14 +370,68 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
     checks
 }
 
+/// The `profile-image:<name>` row: which image this profile would launch
+/// from, whether the backend actually has it, and whether the profile or its
+/// scripts changed since it was built (spec.md §3 FR-1/FR-3).
+async fn profile_image_check(ctx: &AppContext, profile: &Profile) -> Check {
+    let name = profile.name.clone();
+    let status = match crate::app::profile_build::image_status(ctx, profile).await {
+        Ok(status) => status,
+        Err(e) => {
+            return Check {
+                name: format!("profile-image:{name}"),
+                ok: false,
+                detail: e.to_string(),
+                hint: e.hint(),
+            }
+        }
+    };
+    let backend = status.backend.as_str().to_string();
+    let Some(image) = status.image.clone() else {
+        return Check {
+            name: format!("profile-image:{name}"),
+            ok: false,
+            detail: format!("{} on {backend}", status.detail),
+            hint: Some(format!(
+                "wargame profile create {name} --iso <path>   # then: wargame profile build {name}"
+            )),
+        };
+    };
+    let exists = match ctx.backends.get(&backend) {
+        Ok(vm) => vm.image_exists(&image).await.unwrap_or(false),
+        Err(e) => {
+            return Check {
+                name: format!("profile-image:{name}"),
+                ok: false,
+                detail: e.to_string(),
+                hint: e.hint(),
+            }
+        }
+    };
+    let ok = exists && !status.rebuild_needed;
+    Check {
+        name: format!("profile-image:{name}"),
+        ok,
+        detail: if exists {
+            format!("{} on {backend}", status.detail)
+        } else {
+            format!("{} is not ready on {backend}", status.detail)
+        },
+        hint: (!ok).then(|| format!("wargame profile build {name}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::profiles::ProfileStore;
+    use crate::app::BuilderRegistry;
     use crate::app::{BackendRegistry, TransportRegistry};
     use crate::infra::fs::AppDirs;
     use crate::infra::process::ProcessRunner;
+    use crate::infra::HostDiskSpace;
     use crate::ports::VmProvider;
+    use crate::testing::MemoryBuildRepo;
     use crate::testing::{
         FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider, MemoryRepo,
     };
@@ -442,6 +453,9 @@ mod tests {
             backends: BackendRegistry::new(vec![vm as Arc<dyn VmProvider>]),
             transports: TransportRegistry::new(Arc::new(FakeTransport::new())),
             repo: Arc::new(MemoryRepo::new()),
+            builds: Arc::new(MemoryBuildRepo::new()),
+            builders: BuilderRegistry::default(),
+            disk: Arc::new(HostDiskSpace),
             profiles: ProfileStore::new(vec![], tmp_path()),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
             bootstrap_script: "#!/bin/bash\n",

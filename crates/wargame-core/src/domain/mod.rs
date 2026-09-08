@@ -1,10 +1,15 @@
 //! Provider-neutral domain model (MVP.md §8, §13, §16; DESIGN.md §3.2).
 
+pub mod build;
 pub mod challenge;
 pub mod compat;
 pub mod profile;
 pub mod session;
 
+pub use build::{
+    profile_hash, scripts_hash, BuildPhase, BuildRecord, BuildSource, BuildStage, PublishedImage,
+    VerificationResult,
+};
 pub use challenge::{slugify, Challenge, ChallengeAsset, ChallengeRef, ChallengeSummary};
 pub use compat::{
     check, resolve, Backend, ProviderCapabilities, ResolvedBackend, SupportedCombination, SUPPORTED,

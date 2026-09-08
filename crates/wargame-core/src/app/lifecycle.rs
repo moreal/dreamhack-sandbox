@@ -263,10 +263,17 @@ pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<Vec<String>> {
     // Ownership is `(backend, stable id)`: an identically named VM on
     // another backend is a different VM and must not be mistaken for this
     // one's orphan (spec.md §3 FR-5).
-    let known: HashSet<(String, String)> = sessions
+    let mut known: HashSet<(String, String)> = sessions
         .iter()
         .filter_map(|s| s.vm_ref.as_ref().map(|v| (v.backend.clone(), v.id.clone())))
         .collect();
+    // Build records own VMs that no session ever will: the installation VM
+    // a profile is created with and the image VMs it publishes. They carry
+    // the build prefix rather than the session prefix, but ownership is
+    // decided by the record, not by a name (spec.md §3 FR-5).
+    for record in ctx.builds.list().await? {
+        known.extend(record.owned_vm_ids());
+    }
 
     let mut orphans = Vec::new();
     for vm in ctx.backends.all() {
@@ -287,6 +294,7 @@ pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use crate::app::profiles::ProfileStore;
+    use crate::app::BuilderRegistry;
     use crate::app::{BackendRegistry, TransportRegistry};
     use crate::domain::{
         Challenge, ChallengeRef, ChallengeSummary, ExecutionMode, GuestArch, GuestConnection,
@@ -294,7 +302,9 @@ mod tests {
     };
     use crate::infra::fs::AppDirs;
     use crate::infra::process::ProcessRunner;
+    use crate::infra::HostDiskSpace;
     use crate::ports::{ImageRef, VmProvider, VmSpec};
+    use crate::testing::MemoryBuildRepo;
     use crate::testing::{
         FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider, MemoryRepo,
     };
@@ -322,6 +332,9 @@ mod tests {
             backends: BackendRegistry::new(vec![vm.clone() as Arc<dyn VmProvider>]),
             transports: TransportRegistry::new(transport.clone()),
             repo: Arc::new(MemoryRepo::new()),
+            builds: Arc::new(MemoryBuildRepo::new()),
+            builders: BuilderRegistry::default(),
+            disk: Arc::new(HostDiskSpace),
             profiles: ProfileStore::new(vec![], tmp_path()),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
             bootstrap_script: "#!/bin/bash\n",

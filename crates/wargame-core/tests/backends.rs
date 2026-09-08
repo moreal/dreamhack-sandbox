@@ -9,6 +9,9 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use wargame_core::app::BuilderRegistry;
+use wargame_core::infra::HostDiskSpace;
+use wargame_core::testing::MemoryBuildRepo;
 
 use time::OffsetDateTime;
 
@@ -414,6 +417,9 @@ fn fixture(profiles: Vec<Profile>) -> Fixture {
         ]),
         transports: TransportRegistry::new(transport.clone()),
         repo: Arc::new(MemoryRepo::new()),
+        builds: Arc::new(MemoryBuildRepo::new()),
+        builders: BuilderRegistry::default(),
+        disk: Arc::new(HostDiskSpace),
         profiles: ProfileStore::new(profiles, tmp_path()),
         runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
         bootstrap_script: "#!/bin/bash\n",
@@ -724,6 +730,9 @@ async fn a_session_whose_backend_is_not_wired_reports_it_by_name() {
         backends: BackendRegistry::new(vec![tart as Arc<dyn VmProvider>]),
         transports: TransportRegistry::new(Arc::new(FakeTransport::new())),
         repo: Arc::new(MemoryRepo::new()),
+        builds: Arc::new(MemoryBuildRepo::new()),
+        builders: BuilderRegistry::default(),
+        disk: Arc::new(HostDiskSpace),
         profiles: ProfileStore::new(vec![], tmp_path()),
         runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
         bootstrap_script: "#!/bin/bash\n",

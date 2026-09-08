@@ -59,6 +59,13 @@ impl AppDirs {
         self.root.join("keys")
     }
 
+    /// Where the app-owned build records live, one directory per profile
+    /// (spec.md §5 item 5). Kept beside `sessions/`, never inside it: a
+    /// build record outlives every session made from its image.
+    pub fn builds_dir(&self) -> PathBuf {
+        self.root.join("builds")
+    }
+
     /// Creates every well-known subdirectory (mode 0700 on unix).
     pub fn ensure_layout(&self) -> Result<()> {
         for dir in [
@@ -66,6 +73,7 @@ impl AppDirs {
             self.root.join("config"),
             self.profiles_dir(),
             self.sessions_dir(),
+            self.builds_dir(),
             self.cache_dir(),
             self.logs_dir(),
             self.keys_dir(),
@@ -92,6 +100,16 @@ fn set_mode_0700(_dir: &Path) -> Result<()> {
 /// Bytes free on the filesystem containing `path`.
 pub fn disk_free_bytes(path: &Path) -> Result<u64> {
     Ok(fs2::available_space(path)?)
+}
+
+/// The real host's answer to [`crate::ports::DiskSpace`]. Tests inject a
+/// fake instead of filling a disk.
+pub struct HostDiskSpace;
+
+impl crate::ports::DiskSpace for HostDiskSpace {
+    fn free_bytes(&self, path: &Path) -> Result<u64> {
+        disk_free_bytes(path)
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +139,7 @@ mod tests {
         dirs.ensure_layout().unwrap();
         assert!(dirs.profiles_dir().is_dir());
         assert!(dirs.sessions_dir().is_dir());
+        assert!(dirs.builds_dir().is_dir());
         assert!(dirs.cache_dir().is_dir());
         assert!(dirs.logs_dir().is_dir());
         assert!(dirs.keys_dir().is_dir());

@@ -4,7 +4,7 @@
 //! `$WARGAME_HOME/profiles/`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::domain::Profile;
 use crate::error::{Result, WargameError};
@@ -14,12 +14,62 @@ use crate::error::{Result, WargameError};
 /// `user_dir` is simply an additional profile.
 pub struct ProfileStore {
     builtin: Vec<Profile>,
+    /// `(profile name, YAML text)` for the built-in profiles, so
+    /// `profile init` can copy a template verbatim -- comments included --
+    /// instead of re-serializing a parsed [`Profile`] (spec.md §4).
+    builtin_yaml: Vec<(String, String)>,
     user_dir: PathBuf,
 }
 
 impl ProfileStore {
     pub fn new(builtin: Vec<Profile>, user_dir: PathBuf) -> Self {
-        ProfileStore { builtin, user_dir }
+        ProfileStore {
+            builtin,
+            builtin_yaml: Vec::new(),
+            user_dir,
+        }
+    }
+
+    /// Attaches the built-in YAML texts (the CLI crate embeds them).
+    pub fn with_builtin_yaml(mut self, yamls: Vec<(String, String)>) -> Self {
+        self.builtin_yaml = yamls;
+        self
+    }
+
+    /// Where user profiles and their scripts live
+    /// (`$WARGAME_HOME/profiles`).
+    pub fn user_dir(&self) -> &Path {
+        &self.user_dir
+    }
+
+    /// The YAML document a profile is defined by: the user's copy if there
+    /// is one (so `profile init` templates from what the user actually
+    /// sees), else the built-in text.
+    pub fn yaml_for(&self, name: &str) -> Result<String> {
+        let Ok(entries) = std::fs::read_dir(&self.user_dir) else {
+            return self.builtin_yaml_for(name);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if matches!(Profile::from_yaml(&content), Ok(p) if p.name == name) {
+                return Ok(content);
+            }
+        }
+        self.builtin_yaml_for(name)
+    }
+
+    fn builtin_yaml_for(&self, name: &str) -> Result<String> {
+        self.builtin_yaml
+            .iter()
+            .find(|(profile, _)| profile == name)
+            .map(|(_, yaml)| yaml.clone())
+            .ok_or_else(|| WargameError::ProfileNotFound(name.to_string()))
     }
 
     /// Parses every `*.yaml` file directly under `user_dir`. Unreadable or

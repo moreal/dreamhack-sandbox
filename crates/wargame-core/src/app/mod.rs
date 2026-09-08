@@ -9,6 +9,7 @@ pub mod console;
 pub mod doctor;
 pub mod launch;
 pub mod lifecycle;
+pub mod profile_build;
 pub mod profiles;
 pub mod search;
 
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::infra::fs::AppDirs;
 use crate::infra::process::ProcessRunner;
-use crate::ports::{SessionRepository, WargameProvider};
+use crate::ports::{BuildRecordRepository, DiskSpace, SessionRepository, WargameProvider};
 
 pub use backends::{
     provider_for_profile, provider_for_session, resolve_backend, transport_for_session,
@@ -27,6 +28,11 @@ pub use console::{open_gui, ssh_command};
 pub use doctor::{doctor, doctor_profile, Check};
 pub use launch::{launch, LaunchEvent, LaunchRequest};
 pub use lifecycle::{delete, inspect, keep, list_sessions, prune, resolve_session, resume, stop};
+pub use profile_build::{
+    build as build_profile_image, console as open_profile_console, create as create_profile_vm,
+    image_status, init as init_profile, launch_image, BuilderRegistry, CreateOutcome, CreateSource,
+    InitOutcome, ProfileImageStatus,
+};
 pub use profiles::ProfileStore;
 pub use search::{open, search};
 
@@ -44,6 +50,15 @@ pub struct AppContext {
     /// The guest transports, selected per endpoint shell.
     pub transports: TransportRegistry,
     pub repo: Arc<dyn SessionRepository>,
+    /// The app-owned build records (`$WARGAME_HOME/builds/<profile>`): what
+    /// `profile create`/`profile build` produced, and the only place a UTM
+    /// profile's launchable image is written down (spec.md §5 item 5).
+    pub builds: Arc<dyn BuildRecordRepository>,
+    /// The per-backend image builders `profile build` runs through.
+    pub builders: BuilderRegistry,
+    /// Free-space lookups, behind a port so the checks that refuse a build
+    /// or a launch can be tested without filling a disk.
+    pub disk: Arc<dyn DiskSpace>,
     pub profiles: ProfileStore,
     pub runner: Arc<dyn ProcessRunner>,
     /// The trusted guest bootstrap script (`guest/bootstrap.sh`), embedded

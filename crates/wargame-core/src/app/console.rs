@@ -81,6 +81,7 @@ pub async fn open_gui(ctx: &AppContext, id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::app::profiles::ProfileStore;
+    use crate::app::BuilderRegistry;
     use crate::app::{BackendRegistry, TransportRegistry};
     use crate::domain::{
         Challenge, ChallengeRef, ChallengeSummary, ExecutionMode, GuestArch, GuestConnection,
@@ -88,7 +89,9 @@ mod tests {
     };
     use crate::infra::fs::AppDirs;
     use crate::infra::process::ProcessRunner;
+    use crate::infra::HostDiskSpace;
     use crate::ports::{ImageRef, VmProvider, VmSpec};
+    use crate::testing::MemoryBuildRepo;
     use crate::testing::{
         FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider, MemoryRepo,
     };
@@ -155,6 +158,9 @@ mod tests {
             backends: BackendRegistry::new(vec![vm.clone() as Arc<dyn VmProvider>]),
             transports: TransportRegistry::new(Arc::new(FakeTransport::new())),
             repo: Arc::new(MemoryRepo::new()),
+            builds: Arc::new(MemoryBuildRepo::new()),
+            builders: BuilderRegistry::default(),
+            disk: Arc::new(HostDiskSpace),
             profiles: ProfileStore::new(vec![], tmp_path()),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
             bootstrap_script: "#!/bin/bash\n",

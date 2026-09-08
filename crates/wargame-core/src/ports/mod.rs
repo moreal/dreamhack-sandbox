@@ -4,13 +4,19 @@
 //! `wargame-core::infra`.
 
 pub mod credential_store;
+pub mod disk_space;
 pub mod guest_transport;
+pub mod image_builder;
 pub mod session_repo;
 pub mod vm_provider;
 pub mod wargame_provider;
 
 pub use credential_store::CredentialStore;
+pub use disk_space::DiskSpace;
 pub use guest_transport::{ExecResult, GuestEndpoint, GuestShell, GuestTransport};
+pub use image_builder::{
+    BuildRecordRepository, BuildRequest, GuestLink, InstallerRequest, ProfileImageBuilder, Progress,
+};
 pub use session_repo::SessionRepository;
 pub use vm_provider::{
     BackendCheck, BackendStatus, ConsoleDescriptor, ImageRef, RuntimeInfo, StartOptions,

@@ -1,0 +1,1203 @@
+//! `profile init | create | console | build`: the reusable-image use cases
+//! (spec.md §3 FR-2/FR-3, §4, §5 items 4-5).
+//!
+//! Two layers live here, deliberately separated:
+//!
+//! * [`run_build_flow`] is the **common build flow** in spec.md §5 item 4's
+//!   order -- prepare → clone → boot → connect → provision → verify →
+//!   graceful shutdown → publish. It talks only to a
+//!   [`ProfileImageBuilder`] and a [`GuestTransport`], so the Tart and UTM
+//!   adapters share every step that is not backend-specific, and neither of
+//!   them knows what a build record is.
+//! * The `init`/`create`/`console`/`build` functions own the **build record**
+//!   state machine around that flow: what a re-run reuses, what a failure
+//!   preserves, and when a profile may finally be called ready. Nothing here
+//!   calls `utmctl`, `tart` or AppleScript -- that is what the port is for
+//!   (spec.md §5 item 3).
+//!
+//! The contract the flow exists to enforce: an image becomes launchable only
+//! after every verification passed *and* the guest shut down cleanly *and*
+//! the image was published; a failure never takes the previous good image
+//! away.
+
+use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::domain::build::{
+    profile_hash, scripts_hash, BuildPhase, BuildRecord, BuildSource, BuildStage, PublishedImage,
+    VerificationResult,
+};
+use crate::domain::compat::Backend;
+use crate::domain::{GuestOs, GuestShell, Profile, VmRef};
+use crate::error::{Result, WargameError};
+use crate::ports::image_builder::{BuildRequest, GuestLink, InstallerRequest, Progress};
+use crate::ports::{ImageRef, ProfileImageBuilder};
+use crate::security::hash::sha256_file;
+
+use super::backends::resolve_backend;
+use super::AppContext;
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// The exit code a provisioning script uses to say "reboot me, then carry
+/// on with the next script" -- the Windows Update/MSI convention, reused for
+/// every guest so one profile can mix scripts that need it (spec.md §3 FR-3:
+/// "설치 중 재부팅 필요 상태를 처리하고 다시 연결한다").
+pub const REBOOT_REQUIRED_EXIT_CODE: i32 = 3010;
+
+/// Every wired [`ProfileImageBuilder`], keyed by backend name -- the build
+/// counterpart of [`super::BackendRegistry`].
+#[derive(Clone, Default)]
+pub struct BuilderRegistry {
+    builders: BTreeMap<String, Arc<dyn ProfileImageBuilder>>,
+    order: Vec<String>,
+}
+
+impl BuilderRegistry {
+    pub fn new(builders: Vec<Arc<dyn ProfileImageBuilder>>) -> Self {
+        let mut registry = BuilderRegistry::default();
+        for builder in builders {
+            let name = builder.backend().to_string();
+            if !registry.builders.contains_key(&name) {
+                registry.order.push(name.clone());
+            }
+            registry.builders.insert(name, builder);
+        }
+        registry
+    }
+
+    pub fn get(&self, backend: &str) -> Result<Arc<dyn ProfileImageBuilder>> {
+        self.builders
+            .get(backend)
+            .cloned()
+            .ok_or_else(|| WargameError::BackendUnavailable {
+                backend: backend.to_string(),
+                reason: format!(
+                    "no {backend:?} image builder is wired into this build (available: {})",
+                    if self.order.is_empty() {
+                        "none".to_string()
+                    } else {
+                        self.order.join(", ")
+                    }
+                ),
+            })
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.order.clone()
+    }
+}
+
+impl std::fmt::Debug for BuilderRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuilderRegistry")
+            .field("backends", &self.order)
+            .finish()
+    }
+}
+
+// --- profile init ---------------------------------------------------------
+
+/// What [`init`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitOutcome {
+    pub profile: Profile,
+    /// The new `<name>.yaml`.
+    pub yaml_path: PathBuf,
+    /// The provisioning scripts copied for the new profile, in profile order.
+    pub scripts: Vec<PathBuf>,
+}
+
+/// Copies a template profile under a new name (spec.md §4's `profile init
+/// kali-x86_64 --name kali-custom`).
+///
+/// The copy gets its **own** scripts directory (`scripts/<new name>/`) and
+/// its `provision.scripts` are rewritten to point at it, so the user's edits
+/// are never overwritten when a new binary re-seeds the built-in scripts
+/// (spec.md §3 FR-3's "사용자 편집 프로필·사용자 스크립트를 내장 파일 배포
+/// 과정에서 덮어쓰지 않는다").
+pub async fn init(ctx: &AppContext, template: &str, new_name: &str) -> Result<InitOutcome> {
+    let new_name = new_name.trim();
+    if new_name.is_empty()
+        || !new_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(WargameError::InvalidProfile {
+            name: new_name.to_string(),
+            reason: "a profile name may only contain letters, digits, '-', '_' and '.'".to_string(),
+        });
+    }
+    if new_name == template {
+        return Err(WargameError::InvalidProfile {
+            name: new_name.to_string(),
+            reason: format!("{template} is the template; pick a different --name"),
+        });
+    }
+    if ctx.profiles.get(new_name).is_ok() {
+        return Err(WargameError::InvalidProfile {
+            name: new_name.to_string(),
+            reason: "a profile with this name already exists; pick another --name or edit the existing one".to_string(),
+        });
+    }
+
+    let template_profile = ctx.profiles.get(template)?;
+    let yaml = ctx.profiles.yaml_for(template)?;
+    let profiles_dir = ctx.profiles.user_dir().to_path_buf();
+    let yaml_path = profiles_dir.join(format!("{new_name}.yaml"));
+    if yaml_path.exists() {
+        return Err(WargameError::InvalidProfile {
+            name: new_name.to_string(),
+            reason: format!("{} already exists", yaml_path.display()),
+        });
+    }
+
+    let mut new_yaml = rename_in_yaml(&yaml, &template_profile.name, new_name)?;
+    let mut scripts = Vec::new();
+    for script in &template_profile.provision.scripts {
+        let file_name = Path::new(script)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("provision.sh");
+        let new_rel = format!("scripts/{new_name}/{file_name}");
+        let dest = profiles_dir.join(&new_rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let source = profiles_dir.join(script);
+        if !dest.exists() {
+            match std::fs::read(&source) {
+                Ok(bytes) => std::fs::write(&dest, bytes)?,
+                Err(e) => {
+                    return Err(WargameError::InvalidProfile {
+                        name: template.to_string(),
+                        reason: format!(
+                            "its provisioning script {} is missing ({e}); cannot copy the template",
+                            source.display()
+                        ),
+                    })
+                }
+            }
+        }
+        new_yaml = new_yaml.replace(script.as_str(), &new_rel);
+        scripts.push(dest);
+    }
+
+    std::fs::write(&yaml_path, &new_yaml)?;
+    let profile = Profile::from_yaml(&new_yaml)?;
+    if profile.name != new_name {
+        return Err(WargameError::InvalidProfile {
+            name: new_name.to_string(),
+            reason: format!(
+                "the copied template still calls itself {:?}; edit {} by hand",
+                profile.name,
+                yaml_path.display()
+            ),
+        });
+    }
+    Ok(InitOutcome {
+        profile,
+        yaml_path,
+        scripts,
+    })
+}
+
+/// Replaces `metadata.name` in a profile YAML while leaving every comment
+/// and every other line exactly as the template wrote them.
+fn rename_in_yaml(yaml: &str, old_name: &str, new_name: &str) -> Result<String> {
+    let mut out = String::with_capacity(yaml.len());
+    let mut in_metadata = false;
+    let mut renamed = false;
+    for line in yaml.lines() {
+        if !renamed {
+            if line.starts_with("metadata:") {
+                in_metadata = true;
+            } else if in_metadata {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("name:") {
+                    let indent = &line[..line.len() - trimmed.len()];
+                    out.push_str(&format!("{indent}name: {new_name}\n"));
+                    renamed = true;
+                    continue;
+                }
+                // A new top-level key ends the metadata block.
+                if !line.starts_with(' ') && !line.trim().is_empty() {
+                    in_metadata = false;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !renamed {
+        return Err(WargameError::InvalidProfile {
+            name: old_name.to_string(),
+            reason: "its YAML has no metadata.name line to rename".to_string(),
+        });
+    }
+    Ok(out)
+}
+
+// --- profile create -------------------------------------------------------
+
+/// Where a new UTM profile's image comes from. Exactly one of spec.md §4's
+/// mutually exclusive `--iso` / `--from-vm`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateSource {
+    Iso {
+        path: PathBuf,
+        /// A SHA-256 the user vouches for; verified before any VM exists.
+        sha256: Option<String>,
+    },
+    FromVm {
+        uuid: String,
+    },
+}
+
+/// The result of [`create`], including the guidance the CLI/TUI prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateOutcome {
+    pub record: BuildRecord,
+    /// True when an installation VM already existed for this source and was
+    /// reused rather than created again (spec.md §3 FR-2: "같은 명령을 다시
+    /// 실행하면 설치 VM을 재사용·안내하고 중복 VM/디스크를 만들지 않는다").
+    pub reused: bool,
+    pub guidance: Vec<String>,
+}
+
+/// Creates (or re-uses) the installation VM for a profile.
+pub async fn create(
+    ctx: &AppContext,
+    profile_name: &str,
+    source: CreateSource,
+) -> Result<CreateOutcome> {
+    let profile = ctx.profiles.get(profile_name)?;
+    let execution = resolve_backend(&profile)?;
+    let builder = ctx.builders.get(execution.backend.as_str())?;
+    if !builder.uses_installer_vm() {
+        return Err(WargameError::InvalidProfile {
+            name: profile.name.clone(),
+            reason: format!(
+                "{} profiles build from `image.base`, not from an installation VM: `profile create` is for UTM profiles that install an OS from an ISO or clone an installed VM. Run `wargame profile build {}` instead",
+                execution.backend, profile.name
+            ),
+        });
+    }
+
+    // Everything that can be judged from data alone happens before any VM
+    // is created or cloned (spec.md §6: "불가 조합·ISO 없음·해시 불일치 →
+    // VM/세션 생성 전 실패").
+    let source = validate_source(source)?;
+
+    if let Some(existing) = ctx.builds.load(&profile.name).await? {
+        if !existing.source.same_as(&source) {
+            return Err(WargameError::InvalidProfile {
+                name: profile.name.clone(),
+                reason: format!(
+                    "this profile is already attached to {} (installation VM {}). A profile has exactly one image source; to build from {} instead, make a new profile: `wargame profile init {} --name <new-name>`",
+                    existing.source.describe(),
+                    existing
+                        .installer_vm
+                        .as_ref()
+                        .map(|vm| format!("{} ({})", vm.name, vm.id))
+                        .unwrap_or_else(|| "<none>".to_string()),
+                    source.describe(),
+                    profile.name,
+                ),
+            });
+        }
+        let guidance = create_guidance(ctx, &profile, &existing, true);
+        return Ok(CreateOutcome {
+            record: existing,
+            reused: true,
+            guidance,
+        });
+    }
+
+    let needed = profile.resources.disk_gib.saturating_mul(GIB);
+    let free = ctx.disk.free_bytes(&ctx.dirs.root)?;
+    if free < needed {
+        return Err(WargameError::InsufficientResources(format!(
+            "profile {:?} asks for a {} GiB disk, only {:.1} GiB is free at {}",
+            profile.name,
+            profile.resources.disk_gib,
+            free as f64 / GIB as f64,
+            ctx.dirs.root.display(),
+        )));
+    }
+
+    let name = format!(
+        "{}{}",
+        ctx.config.vm.build_prefix(execution.backend),
+        profile.name
+    );
+    let vm = builder
+        .create_installer_vm(&InstallerRequest {
+            profile: &profile,
+            name,
+            execution: execution.clone(),
+            source: &source,
+        })
+        .await?;
+
+    let mut record = BuildRecord::new(&profile, execution.backend.as_str(), source);
+    record.installer_vm = Some(vm);
+    // The OS still has to be installed (or, for a clone, its SSH and guest
+    // agent still have to answer), so the honest phase is the same for both
+    // sources: waiting on the guest, not building.
+    record.set_phase(BuildPhase::AwaitingInstall);
+    ctx.builds.save(&record).await?;
+
+    let guidance = create_guidance(ctx, &profile, &record, false);
+    Ok(CreateOutcome {
+        record,
+        reused: false,
+        guidance,
+    })
+}
+
+/// Checks an ISO exists, is readable and (if the user gave one) matches its
+/// SHA-256. An unverified ISO is never recorded as verified, and the OS/arch
+/// inside it is never claimed to be checked (spec.md §3 FR-2).
+fn validate_source(source: CreateSource) -> Result<BuildSource> {
+    match source {
+        CreateSource::FromVm { uuid } => {
+            let uuid = uuid.trim().to_string();
+            if uuid.is_empty() {
+                return Err(WargameError::VmNotFound(
+                    "--from-vm needs the source VM's UUID (see `utmctl list`)".to_string(),
+                ));
+            }
+            Ok(BuildSource::UtmVm { uuid })
+        }
+        CreateSource::Iso { path, sha256 } => {
+            let path = std::fs::canonicalize(&path).map_err(|e| {
+                WargameError::Other(format!(
+                    "cannot read the installer ISO {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !path.is_file() {
+                return Err(WargameError::Other(format!(
+                    "the installer ISO {} is not a file",
+                    path.display()
+                )));
+            }
+            std::fs::File::open(&path).map_err(|e| {
+                WargameError::Other(format!(
+                    "cannot read the installer ISO {}: {e}",
+                    path.display()
+                ))
+            })?;
+
+            let mut verified = false;
+            if let Some(expected) = sha256.as_deref() {
+                let expected = expected.trim().to_ascii_lowercase();
+                let (actual, _size) = sha256_file(&path)?;
+                if actual != expected {
+                    return Err(WargameError::HashOrWrite(format!(
+                        "the installer ISO {} does not match --sha256:\n  expected {expected}\n  actual   {actual}\nNothing was created.",
+                        path.display()
+                    )));
+                }
+                verified = true;
+            }
+            Ok(BuildSource::Iso {
+                path,
+                sha256: sha256.map(|s| s.trim().to_ascii_lowercase()),
+                verified_sha256: verified,
+            })
+        }
+    }
+}
+
+/// What the user has to do next, printed by `profile create` on both a first
+/// run and a re-run (spec.md §3 FR-2's "설치용 UUID, 콘솔 여는 방법, OS 설치 후
+/// SSH/guest tools 준비, build 재개 명령을 출력한다").
+fn create_guidance(
+    ctx: &AppContext,
+    profile: &Profile,
+    record: &BuildRecord,
+    reused: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(vm) = &record.installer_vm {
+        lines.push(if reused {
+            format!(
+                "Re-using the installation VM {} ({}) this profile already owns; nothing was created.",
+                vm.name, vm.id
+            )
+        } else {
+            format!("Installation VM {} ({}) created.", vm.name, vm.id)
+        });
+    }
+    lines.push(format!("Source: {}", record.source.describe()));
+    if let BuildSource::Iso {
+        sha256: Some(_),
+        verified_sha256,
+        ..
+    } = &record.source
+    {
+        lines.push(if *verified_sha256 {
+            "SHA-256 verified against the file.".to_string()
+        } else {
+            "SHA-256 recorded but NOT verified.".to_string()
+        });
+    }
+
+    if profile.guest.os == GuestOs::Windows {
+        lines.push(
+            "Windows 11 needs TPM 2.0 and Secure Boot, and UTM 4.7.5 cannot set them from a script (docs/utm-compatibility.md §6). Before installing, open the VM in UTM > Settings > QEMU and enable \"UEFI Boot\", \"TPM 2.0 Device\" and \"Reset UEFI Variables\"."
+                .to_string(),
+        );
+    }
+    lines.push(format!(
+        "1. Open the console:  wargame profile console {}",
+        profile.name
+    ));
+    lines.push(match &record.source {
+        BuildSource::UtmVm { .. } => {
+            "2. The clone already has an OS. Log in through the console and make sure the guest is ready (below).".to_string()
+        }
+        _ => "2. Install the OS in that window. Create the account below; the installer's user must match the profile.".to_string(),
+    });
+    lines.push(format!(
+        "3. In the guest, prepare: user {:?}, an SSH server on port 22, and the QEMU guest agent (UTM reads the guest's address from it -- without it the build cannot find the VM).",
+        profile.guest.user
+    ));
+    if profile.guest.os == GuestOs::Windows {
+        lines.push(
+            "   On Windows that is OpenSSH Server (Settings > Optional features) plus PowerShell as the SSH shell, and the UTM guest tools for the agent."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "   On Debian/Kali: `sudo apt install openssh-server qemu-guest-agent && sudo systemctl enable --now ssh qemu-guest-agent`."
+                .to_string(),
+        );
+    }
+    lines.push(format!(
+        "4. Authorize this host's key: append {} to ~{}/.ssh/authorized_keys in the guest.",
+        ctx.dirs.keys_dir().join("id_ed25519.pub").display(),
+        profile.guest.user,
+    ));
+    lines.push(format!(
+        "5. Then build the reusable image:  wargame profile build {}",
+        profile.name
+    ));
+    lines
+}
+
+// --- profile console ------------------------------------------------------
+
+/// Opens the installation VM's window (spec.md §4's `profile console`).
+pub async fn console(ctx: &AppContext, profile_name: &str) -> Result<()> {
+    let profile = ctx.profiles.get(profile_name)?;
+    let execution = resolve_backend(&profile)?;
+    let builder = ctx.builders.get(execution.backend.as_str())?;
+    if !builder.uses_installer_vm() {
+        return Err(WargameError::InvalidProfile {
+            name: profile.name.clone(),
+            reason: format!(
+                "`profile console` opens the installation VM of a UTM profile; {} profiles build from `image.base` and have no installation VM. Use `wargame gui <session>` for a session's console",
+                execution.backend
+            ),
+        });
+    }
+    let record = require_record(ctx, &profile).await?;
+    let vm = record
+        .installer_vm
+        .as_ref()
+        .ok_or_else(|| no_installer_vm(&profile.name))?;
+    builder.open_console(vm).await
+}
+
+async fn require_record(ctx: &AppContext, profile: &Profile) -> Result<BuildRecord> {
+    ctx.builds
+        .load(&profile.name)
+        .await?
+        .ok_or_else(|| no_installer_vm(&profile.name))
+}
+
+fn no_installer_vm(profile: &str) -> WargameError {
+    WargameError::ImageNotBuilt {
+        profile: profile.to_string(),
+        detail: "it has no installation VM yet".to_string(),
+        hint: format!("wargame profile create {profile} --iso <path>   # or --from-vm <utm-uuid>"),
+    }
+}
+
+// --- profile build --------------------------------------------------------
+
+/// Builds (or rebuilds) a profile's reusable image and updates its build
+/// record. Returns the record as it was saved.
+pub async fn build(
+    ctx: &AppContext,
+    profile_name: &str,
+    progress: Progress<'_>,
+) -> Result<BuildRecord> {
+    let profile = ctx.profiles.get(profile_name)?;
+    let execution = resolve_backend(&profile)?;
+    let builder = ctx.builders.get(execution.backend.as_str())?;
+
+    // Windows guests need the PowerShell transport and a PowerShell
+    // provisioning path, which is the next task. Refuse here, before the VM
+    // is touched at all, rather than half-provisioning a guest.
+    if GuestShell::for_os(profile.guest.os) == GuestShell::PowerShell {
+        return Err(WargameError::InvalidProfile {
+            name: profile.name.clone(),
+            reason: "Windows provisioning arrives in Task 5: this build would have to run PowerShell in the guest, and no PowerShell guest transport is wired yet. `profile create` and `profile console` already work, so the installation VM can be prepared in the meantime".to_string(),
+        });
+    }
+
+    let mut record = match ctx.builds.load(&profile.name).await? {
+        Some(record) => record,
+        None if builder.uses_installer_vm() => return Err(no_installer_vm(&profile.name)),
+        // Tart needs no `profile create`: its source is `image.base`.
+        None => BuildRecord::new(
+            &profile,
+            execution.backend.as_str(),
+            BuildSource::TartBase {
+                image: profile.image.base.clone(),
+            },
+        ),
+    };
+    if record.backend != execution.backend.as_str() {
+        return Err(WargameError::InvalidProfile {
+            name: profile.name.clone(),
+            reason: format!(
+                "its build record was made for the {} backend but the profile now resolves to {}. Make a new profile (`wargame profile init <template> --name <new>`) rather than re-pointing this one",
+                record.backend, execution.backend
+            ),
+        });
+    }
+
+    let scripts_dir = ctx.profiles.user_dir().to_path_buf();
+    let new_profile_hash = profile_hash(&profile);
+    let new_scripts_hash = scripts_hash(&scripts_dir, &profile.provision.scripts);
+
+    let snapshot = record.clone();
+    let request = BuildRequest {
+        profile: &profile,
+        record: &snapshot,
+        execution: execution.clone(),
+        scripts_dir,
+        log_path: ctx.dirs.logs_dir().join("profile-build.log"),
+        boot_timeout: ctx
+            .config
+            .vm
+            .boot_timeout(execution.backend, execution.mode),
+    };
+
+    match run_build_flow(builder.as_ref(), &request, progress).await {
+        Ok(outcome) => {
+            record.verification = outcome.verification;
+            for failure in outcome.cleanup_failures {
+                record.record_cleanup_failure(failure);
+            }
+            if builder.uses_installer_vm() {
+                record.installer_vm = Some(outcome.vm);
+            }
+            // The new image is written down *before* the old one is deleted:
+            // a crash in between leaves two images, never none (FR-3).
+            record.previous_image = record.image.replace(outcome.image);
+            record.profile_hash = new_profile_hash;
+            record.scripts_hash = new_scripts_hash;
+            record.last_error = None;
+            record.set_phase(BuildPhase::Ready);
+            ctx.builds.save(&record).await?;
+
+            if let Some(previous) = record.previous_image.clone() {
+                match builder.discard_image(&previous).await {
+                    Ok(()) => record.previous_image = None,
+                    Err(e) => record.record_cleanup_failure(format!(
+                        "could not delete the replaced image {} ({}): {e}",
+                        previous.name, previous.id
+                    )),
+                }
+                ctx.builds.save(&record).await?;
+            }
+            Ok(record)
+        }
+        Err(failure) => {
+            if !failure.verification.is_empty() {
+                record.verification = failure.verification;
+            }
+            for cleanup_failure in failure.cleanup_failures {
+                record.record_cleanup_failure(cleanup_failure);
+            }
+            if builder.uses_installer_vm() {
+                if let Some(vm) = failure.vm {
+                    record.installer_vm = Some(vm);
+                }
+            }
+            if failure.awaiting_install {
+                // Not a failed build: the guest simply is not installed or
+                // reachable yet, so the profile goes back to waiting rather
+                // than being marked broken (spec.md §6's "OS 설치 미완료" row).
+                record.set_phase(BuildPhase::AwaitingInstall);
+                record.last_error = Some(failure.error.to_string());
+            } else {
+                record.set_phase(BuildPhase::Failed {
+                    stage: failure.stage,
+                    error: failure.error.to_string(),
+                });
+            }
+            ctx.builds.save(&record).await?;
+            Err(failure.error)
+        }
+    }
+}
+
+// --- image readiness (launch / doctor / profiles) -------------------------
+
+/// What a profile has to launch from right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileImageStatus {
+    pub backend: Backend,
+    /// The image `launch` would clone. `None` when nothing is published.
+    pub image: Option<ImageRef>,
+    /// The build record's phase, or `None` when the profile was never
+    /// `profile create`d / built.
+    pub phase: Option<BuildPhase>,
+    /// The profile or its scripts changed since this image was built.
+    pub rebuild_needed: bool,
+    /// One line for `doctor`/`profiles`.
+    pub detail: String,
+}
+
+/// Reads a profile's build record and says what it has to launch from.
+///
+/// Tart keeps its images in Tart's own store, so its image name is always
+/// the answer and the backend's `image_exists` is what decides; UTM has no
+/// registry at all, so the record *is* the registry (spec.md §5 item 5).
+pub async fn image_status(ctx: &AppContext, profile: &Profile) -> Result<ProfileImageStatus> {
+    let execution = resolve_backend(profile)?;
+    let record = ctx.builds.load(&profile.name).await?;
+    let rebuild_needed = record
+        .as_ref()
+        .map(|r| {
+            r.needs_rebuild(
+                &profile_hash(profile),
+                &scripts_hash(ctx.profiles.user_dir(), &profile.provision.scripts),
+            )
+        })
+        .unwrap_or(false);
+
+    let (image, detail) = match execution.backend {
+        Backend::Tart => (Some(ImageRef(profile.image_name())), profile.image_name()),
+        Backend::Utm => match record.as_ref().and_then(|r| r.ready_image()) {
+            Some(published) => (
+                Some(ImageRef(published.id.clone())),
+                format!("{} ({})", published.name, published.id),
+            ),
+            None => (
+                None,
+                match record.as_ref().map(|r| &r.phase) {
+                    Some(phase) => format!("not published yet ({phase})"),
+                    None => "no build record: `wargame profile create` has not run".to_string(),
+                },
+            ),
+        },
+    };
+
+    Ok(ProfileImageStatus {
+        backend: execution.backend,
+        image,
+        phase: record.map(|r| r.phase),
+        rebuild_needed,
+        detail: if rebuild_needed {
+            format!("{detail} (rebuild needed: the profile or its scripts changed)")
+        } else {
+            detail
+        },
+    })
+}
+
+/// The image a launch of `profile` must clone from, or an error that names
+/// the command which would produce one.
+pub async fn launch_image(ctx: &AppContext, profile: &Profile) -> Result<ImageRef> {
+    let status = image_status(ctx, profile).await?;
+    status.image.ok_or_else(|| WargameError::ImageNotBuilt {
+        profile: profile.name.clone(),
+        detail: status.detail,
+        hint: match status.phase {
+            None => format!(
+                "wargame profile create {} --iso <path>   # then: wargame profile build {0}",
+                profile.name
+            ),
+            Some(_) => format!("wargame profile build {}", profile.name),
+        },
+    })
+}
+
+// --- the common build flow ------------------------------------------------
+
+/// What a finished [`run_build_flow`] produced.
+pub struct BuildFlowOutcome {
+    /// The VM that was provisioned (the installation VM, or Tart's clone).
+    pub vm: VmRef,
+    pub image: PublishedImage,
+    pub verification: Vec<VerificationResult>,
+    pub cleanup_failures: Vec<String>,
+}
+
+/// Where a build stopped and what it left behind.
+pub struct BuildFlowError {
+    pub stage: BuildStage,
+    /// The VM the flow was working on, once it exists.
+    pub vm: Option<VmRef>,
+    pub error: WargameError,
+    pub verification: Vec<VerificationResult>,
+    pub cleanup_failures: Vec<String>,
+    /// The guest was never reachable on a backend that installs its OS by
+    /// hand: a wait, not a failure.
+    pub awaiting_install: bool,
+}
+
+impl BuildFlowError {
+    fn new(stage: BuildStage, error: WargameError) -> Self {
+        BuildFlowError {
+            stage,
+            vm: None,
+            error,
+            verification: Vec::new(),
+            cleanup_failures: Vec::new(),
+            awaiting_install: false,
+        }
+    }
+}
+
+/// spec.md §5 item 4's order, once, for every backend:
+/// prepare → clone → boot → connect → provision → verify → graceful
+/// shutdown → publish.
+///
+/// Provisioning and verification are the same everywhere (copy the profile's
+/// scripts into the guest, run them, run `tools.verify`), so they live here;
+/// everything that differs is a [`ProfileImageBuilder`] call.
+pub async fn run_build_flow(
+    builder: &dyn ProfileImageBuilder,
+    req: &BuildRequest<'_>,
+    progress: Progress<'_>,
+) -> std::result::Result<BuildFlowOutcome, BuildFlowError> {
+    let profile = req.profile;
+
+    progress(format!("preparing the {} build", builder.backend()));
+    builder
+        .prepare(req, progress)
+        .await
+        .map_err(|e| BuildFlowError::new(BuildStage::Preparing, e))?;
+
+    let vm = builder
+        .clone_for_build(req, progress)
+        .await
+        .map_err(|e| BuildFlowError::new(BuildStage::Cloning, e))?;
+
+    // From here every failure cleans up after itself before propagating.
+    let outcome = build_from(builder, req, &vm, progress).await;
+    match outcome {
+        Ok(outcome) => Ok(outcome),
+        Err(mut failure) => {
+            progress("build failed; cleaning up".to_string());
+            failure
+                .cleanup_failures
+                .extend(builder.cleanup_failed_build(req, &vm).await);
+            failure.vm = Some(vm);
+            failure.awaiting_install =
+                builder.uses_installer_vm() && failure.stage == BuildStage::Connecting;
+            if failure.awaiting_install {
+                progress(format!(
+                    "the guest never answered. Finish the OS install and the guest setup through `wargame profile console {}`, then run `wargame profile build {0}` again.",
+                    profile.name
+                ));
+            }
+            Err(failure)
+        }
+    }
+}
+
+/// Steps 3-8, split out of [`run_build_flow`] so every failure after the
+/// clone gets the same cleanup.
+async fn build_from(
+    builder: &dyn ProfileImageBuilder,
+    req: &BuildRequest<'_>,
+    vm: &VmRef,
+    progress: Progress<'_>,
+) -> std::result::Result<BuildFlowOutcome, BuildFlowError> {
+    builder
+        .boot(req, vm, progress)
+        .await
+        .map_err(|e| BuildFlowError::new(BuildStage::Booting, e))?;
+
+    let link = builder
+        .connect(req, vm, progress)
+        .await
+        .map_err(|e| BuildFlowError::new(BuildStage::Connecting, e))?;
+
+    provision(req, &link, progress)
+        .await
+        .map_err(|e| BuildFlowError::new(BuildStage::Provisioning, e))?;
+
+    let verification = verify(req, &link, progress).await.map_err(|(results, e)| {
+        let mut failure = BuildFlowError::new(BuildStage::Verifying, e);
+        failure.verification = results;
+        failure
+    })?;
+
+    // Everything from here is "make the image": a guest that does not stop
+    // cleanly must never be published (DESIGN.md §5).
+    flush_guest(&link, progress).await;
+    builder.shutdown(req, vm, progress).await.map_err(|e| {
+        let mut failure = BuildFlowError::new(BuildStage::Publishing, e);
+        failure.verification = verification.clone();
+        failure
+    })?;
+
+    let image = builder.publish(req, vm, progress).await.map_err(|e| {
+        let mut failure = BuildFlowError::new(BuildStage::Publishing, e);
+        failure.verification = verification.clone();
+        failure
+    })?;
+
+    Ok(BuildFlowOutcome {
+        vm: vm.clone(),
+        image,
+        verification,
+        cleanup_failures: Vec::new(),
+    })
+}
+
+/// Copies the profile's `scripts/` tree into the guest and runs each
+/// `provision.scripts` entry there (spec.md §3 FR-3: "설치 스크립트는 반드시
+/// 게스트에서 실행한다").
+async fn provision(req: &BuildRequest<'_>, link: &GuestLink, progress: Progress<'_>) -> Result<()> {
+    let profile = req.profile;
+    let log_path = provision_log_path(&req.log_path, &profile.name);
+    progress(format!("provisioning log: {}", log_path.display()));
+
+    progress("copying provisioning scripts into the guest".to_string());
+    // `~` is never expanded in `GuestTransport::exec` argv (every argument
+    // is quoted before being sent to the guest shell), so all guest-side
+    // paths are relative to the SSH user's home directory. `scp -r
+    // <src>/scripts wg-provision` would, on a guest where `wg-provision`
+    // does not already exist, create `wg-provision` *as* a copy of
+    // `scripts` -- so make the destination first and copy into it with a
+    // trailing slash.
+    link.transport
+        .exec(
+            &link.endpoint,
+            &[
+                "mkdir".to_string(),
+                "-p".to_string(),
+                "wg-provision".to_string(),
+            ],
+        )
+        .await?;
+    link.transport
+        .copy_in(
+            &link.endpoint,
+            &req.scripts_dir.join("scripts"),
+            "wg-provision/",
+        )
+        .await?;
+
+    for script in &profile.provision.scripts {
+        progress(format!("provisioning: {script}"));
+        let argv = vec!["bash".to_string(), format!("wg-provision/{script}")];
+        let out = link.transport.exec(&link.endpoint, &argv).await?;
+        log_exec(
+            &log_path,
+            &argv.join(" "),
+            out.status,
+            &out.stdout,
+            &out.stderr,
+        );
+        if out.status == REBOOT_REQUIRED_EXIT_CODE {
+            progress(format!(
+                "{script} asked for a reboot (exit {REBOOT_REQUIRED_EXIT_CODE}); waiting for the guest to come back"
+            ));
+            wait_for_reboot(req, link, progress).await?;
+            continue;
+        }
+        if out.status != 0 {
+            return Err(WargameError::GuestBootstrapFailed(format!(
+                "provisioning script {script} failed (exit {}): {}",
+                out.status,
+                tail_lines(&combined_output(&out.stdout, &out.stderr), 15)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Waits for the guest's SSH to drop and come back after a script asked for
+/// a reboot. A guest that reboots faster than the first probe is fine: what
+/// matters is that the *next* script runs on a guest that answers.
+async fn wait_for_reboot(
+    req: &BuildRequest<'_>,
+    link: &GuestLink,
+    progress: Progress<'_>,
+) -> Result<()> {
+    let probe = ["true".to_string()];
+    let deadline = tokio::time::Instant::now() + REBOOT_DROP_TIMEOUT;
+    loop {
+        match link.transport.exec(&link.endpoint, &probe).await {
+            Err(_) => break,
+            Ok(out) if out.status != 0 => break,
+            Ok(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "the guest still answered {REBOOT_DROP_TIMEOUT:?} after a reboot request; continuing"
+            );
+            break;
+        }
+        tokio::time::sleep(REBOOT_POLL_INTERVAL).await;
+    }
+    progress("the guest went down; waiting for SSH again".to_string());
+    link.transport
+        .wait_ready(&link.endpoint, req.boot_timeout)
+        .await
+}
+
+/// How long to wait for SSH to actually drop after a reboot-required script.
+const REBOOT_DROP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const REBOOT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Runs `tools.verify` in the guest, recording every command and its exit
+/// code. The first failure ends the build (spec.md §6's "도구 검증 실패:
+/// 명령·exit code·로그 표시, 이전 이미지 보존").
+#[allow(clippy::type_complexity)]
+async fn verify(
+    req: &BuildRequest<'_>,
+    link: &GuestLink,
+    progress: Progress<'_>,
+) -> std::result::Result<Vec<VerificationResult>, (Vec<VerificationResult>, WargameError)> {
+    let profile = req.profile;
+    let log_path = provision_log_path(&req.log_path, &profile.name);
+    let mut results = Vec::new();
+    for check in &profile.tools.verify {
+        let argv: Vec<String> = check.split_whitespace().map(str::to_string).collect();
+        if argv.is_empty() {
+            continue;
+        }
+        progress(format!("verifying: {check}"));
+        let out = match link.transport.exec(&link.endpoint, &argv).await {
+            Ok(out) => out,
+            Err(e) => return Err((results, e)),
+        };
+        log_exec(
+            &log_path,
+            &argv.join(" "),
+            out.status,
+            &out.stdout,
+            &out.stderr,
+        );
+        results.push(VerificationResult {
+            command: check.clone(),
+            exit_code: out.status,
+        });
+        if out.status != 0 {
+            let error = WargameError::InvalidProfile {
+                name: profile.name.clone(),
+                reason: format!(
+                    "verify command {check:?} failed (exit {}): {}",
+                    out.status,
+                    tail_lines(&combined_output(&out.stdout, &out.stderr), 15)
+                ),
+            };
+            return Err((results, error));
+        }
+    }
+    Ok(results)
+}
+
+/// Removes the provisioning files and flushes the guest's filesystem before
+/// the shutdown. Never fatal: a guest that cannot `sync` still gets a
+/// graceful stop, and the stop itself is what the build actually depends on.
+async fn flush_guest(link: &GuestLink, progress: Progress<'_>) {
+    progress("cleaning up provisioning files".to_string());
+    if let Err(e) = link
+        .transport
+        .exec(
+            &link.endpoint,
+            &[
+                "rm".to_string(),
+                "-rf".to_string(),
+                "wg-provision".to_string(),
+            ],
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "could not remove wg-provision from the guest");
+    }
+    progress("flushing guest filesystem and shutting down".to_string());
+    match link
+        .transport
+        .exec(&link.endpoint, &["sync".to_string()])
+        .await
+    {
+        Ok(out) if out.status != 0 => {
+            tracing::warn!(
+                status = out.status,
+                stderr = %out.stderr,
+                "sync failed on the guest before stop; proceeding anyway"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "could not run sync on the guest before stop; proceeding anyway");
+        }
+    }
+}
+
+/// Where provisioning output for `profile` is logged: `log_path`'s
+/// directory (typically `$WARGAME_HOME/logs`) with the file name replaced by
+/// `provision-<profile>.log`, so it never clobbers the backend's own console
+/// log and survives across builds of different profiles.
+pub fn provision_log_path(log_path: &Path, profile: &str) -> PathBuf {
+    let dir = log_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    dir.join(format!("provision-{profile}.log"))
+}
+
+/// Combines stdout and stderr for the "last N lines" shown in an error.
+fn combined_output(stdout: &str, stderr: &str) -> String {
+    let mut combined = String::new();
+    combined.push_str(stdout);
+    if !stdout.is_empty() && !stderr.is_empty() && !stdout.ends_with('\n') {
+        combined.push('\n');
+    }
+    combined.push_str(stderr);
+    combined
+}
+
+/// The last `n` lines of `text`, for embedding a bounded amount of guest
+/// output in an error message.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// Appends one command's output to the provisioning log as a
+/// `==== <command> (exit N) ====` header followed by its output. Never fails
+/// the build: a log write failure is only `tracing::warn`.
+fn log_exec(log_path: &Path, command: &str, status: i32, stdout: &str, stderr: &str) {
+    let mut body = format!("==== {command} (exit {status}) ====\n");
+    for stream in [stdout, stderr] {
+        if !stream.is_empty() {
+            body.push_str(stream);
+            if !stream.ends_with('\n') {
+                body.push('\n');
+            }
+        }
+    }
+
+    if let Some(parent) = log_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                "failed to create provisioning log directory {}: {err}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    match OpenOptions::new().create(true).append(true).open(log_path) {
+        Ok(mut file) => {
+            if let Err(err) = file.write_all(body.as_bytes()) {
+                tracing::warn!(
+                    "failed to write provisioning log {}: {err}",
+                    log_path.display()
+                );
+            }
+        }
+        Err(err) => tracing::warn!(
+            "failed to open provisioning log {}: {err}",
+            log_path.display()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEMPLATE: &str = r#"apiVersion: wargame.vm/v1
+kind: Profile
+
+metadata:
+  name: kali-arm64
+  description: "Kali template"
+
+vm:
+  backend: utm
+  mode: virtualize
+
+guest:
+  os: linux
+  distribution: kali
+  arch: arm64
+  user: kali
+
+image:
+  base: ""
+
+resources:
+  cpu: 4
+  memory_gib: 8
+  disk_gib: 80
+
+provision:
+  scripts:
+    - scripts/kali/common.sh
+
+tools:
+  verify:
+    - python3 --version
+
+workspace:
+  root: /home/kali/wargame
+"#;
+
+    #[test]
+    fn renaming_a_template_keeps_every_other_line_including_comments() {
+        let renamed = rename_in_yaml(TEMPLATE, "kali-arm64", "kali-custom").unwrap();
+        assert!(renamed.contains("  name: kali-custom\n"));
+        assert!(renamed.contains("  description: \"Kali template\""));
+        assert!(renamed.contains("distribution: kali"));
+        let profile = Profile::from_yaml(&renamed).unwrap();
+        assert_eq!(profile.name, "kali-custom");
+    }
+
+    #[test]
+    fn renaming_only_touches_the_metadata_name() {
+        // `guest.user` is also a `name`-adjacent scalar; only metadata.name
+        // may change, and only once.
+        let yaml = TEMPLATE.replace("  user: kali", "  user: kali\n  name: not-metadata");
+        let renamed = rename_in_yaml(&yaml, "kali-arm64", "kali-custom").unwrap();
+        assert!(renamed.contains("  name: not-metadata"));
+        assert_eq!(renamed.matches("kali-custom").count(), 1);
+    }
+
+    #[test]
+    fn a_yaml_without_metadata_name_is_refused() {
+        assert!(rename_in_yaml("kind: Profile\n", "x", "y").is_err());
+    }
+
+    #[test]
+    fn the_provision_log_sits_next_to_the_build_log() {
+        assert_eq!(
+            provision_log_path(Path::new("/home/logs/profile-build.log"), "kali-custom"),
+            PathBuf::from("/home/logs/provision-kali-custom.log")
+        );
+    }
+
+    #[test]
+    fn tail_lines_never_panics_on_short_output() {
+        assert_eq!(tail_lines("a\nb", 15), "a\nb");
+        assert_eq!(tail_lines("", 3), "");
+    }
+}

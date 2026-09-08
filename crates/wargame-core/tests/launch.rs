@@ -3,6 +3,9 @@
 //! as an external crate would use it (the public `AppContext` API only).
 
 use std::sync::Arc;
+use wargame_core::app::BuilderRegistry;
+use wargame_core::infra::HostDiskSpace;
+use wargame_core::testing::MemoryBuildRepo;
 
 use wargame_core::app::profiles::ProfileStore;
 use wargame_core::app::{
@@ -63,6 +66,9 @@ fn context() -> (AppContext, Arc<FakeVmProvider>, Arc<FakeWargameProvider>) {
         backends: BackendRegistry::new(vec![vm.clone() as Arc<dyn VmProvider>]),
         transports: TransportRegistry::new(Arc::new(FakeTransport::new())),
         repo: Arc::new(MemoryRepo::new()),
+        builds: Arc::new(MemoryBuildRepo::new()),
+        builders: BuilderRegistry::default(),
+        disk: Arc::new(HostDiskSpace),
         profiles: ProfileStore::new(vec![profile()], tmp_path()),
         runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
         bootstrap_script: "#!/bin/bash\necho hi\n",

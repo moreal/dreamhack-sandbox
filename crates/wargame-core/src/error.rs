@@ -27,6 +27,17 @@ pub enum WargameError {
     Incompatible(String),
     #[error("image {image} missing for profile {profile}")]
     ImageMissing { profile: String, image: String },
+    /// A profile whose backend builds its image through `profile create` +
+    /// `profile build` has nothing published yet (spec.md §3 FR-2's "YAML의
+    /// 빈 UTM base는 build record가 있어야만 build/launch 가능하다는 뜻이다").
+    /// Carries its own hint because the next step differs: an installation
+    /// VM has to be created first, or an existing one finished and built.
+    #[error("profile {profile} has no built image: {detail}")]
+    ImageNotBuilt {
+        profile: String,
+        detail: String,
+        hint: String,
+    },
     #[error("insufficient resources: {0}")]
     InsufficientResources(String),
     #[error("VM backend {backend} unavailable: {reason}")]
@@ -132,6 +143,7 @@ impl WargameError {
             WargameError::ImageMissing { profile, .. } => {
                 Some(format!("wargame profile build {profile}"))
             }
+            WargameError::ImageNotBuilt { hint, .. } => Some(hint.clone()),
             WargameError::AuthenticationRequired { .. } => {
                 Some("wargame auth login".to_string())
             }

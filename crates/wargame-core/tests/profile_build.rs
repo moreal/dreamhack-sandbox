@@ -1,0 +1,1164 @@
+//! `profile init | create | console | build` over fakes (spec.md §3 FR-2/
+//! FR-3, §7 AC-04/05/06/09).
+//!
+//! Nothing here touches UTM, Tart or a real VM: a [`FakeBuilder`] stands in
+//! for the backend half of the build flow, so the record state machine --
+//! what a re-run reuses, what a failure preserves, when a profile may be
+//! called ready -- is exercised on its own, including the failure injections
+//! AC-09 asks for.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+
+use wargame_core::app::profile_build::{self, CreateSource};
+use wargame_core::app::{
+    AppContext, BackendRegistry, BuilderRegistry, ProfileStore, TransportRegistry,
+};
+use wargame_core::domain::build::{
+    BuildPhase, BuildRecord, BuildSource, BuildStage, PublishedImage,
+};
+use wargame_core::domain::{GuestEndpoint, VmRef};
+use wargame_core::error::{Result, WargameError};
+use wargame_core::infra::fs::AppDirs;
+use wargame_core::infra::process::ProcessRunner;
+use wargame_core::ports::image_builder::{BuildRequest, GuestLink, InstallerRequest, Progress};
+use wargame_core::ports::{
+    BuildRecordRepository, DiskSpace, GuestTransport, ProfileImageBuilder, VmProvider,
+};
+use wargame_core::testing::{
+    FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider, MemoryBuildRepo, MemoryRepo,
+};
+
+// --- fakes ----------------------------------------------------------------
+
+/// A backend that records every build step it was asked for and can be made
+/// to fail at any one of them.
+struct FakeBuilder {
+    backend: String,
+    installer: bool,
+    transport: Arc<FakeTransport>,
+    calls: Mutex<Vec<String>>,
+    fail_on: Mutex<Option<&'static str>>,
+    created: Mutex<Vec<String>>,
+    published: Mutex<Vec<String>>,
+    discarded: Mutex<Vec<String>>,
+    cleanup_failures: Mutex<Vec<String>>,
+    next_id: Mutex<u32>,
+    /// The record store, so `discard_image` can prove the *new* image was
+    /// already persisted when the old one was deleted.
+    builds: Mutex<Option<Arc<MemoryBuildRepo>>>,
+    last_profile: Mutex<String>,
+    image_at_discard: Mutex<Option<String>>,
+}
+
+impl FakeBuilder {
+    fn utm() -> Self {
+        FakeBuilder {
+            backend: "utm".to_string(),
+            installer: true,
+            transport: Arc::new(FakeTransport::new()),
+            calls: Mutex::new(Vec::new()),
+            fail_on: Mutex::new(None),
+            created: Mutex::new(Vec::new()),
+            published: Mutex::new(Vec::new()),
+            discarded: Mutex::new(Vec::new()),
+            cleanup_failures: Mutex::new(Vec::new()),
+            next_id: Mutex::new(0),
+            builds: Mutex::new(None),
+            last_profile: Mutex::new(String::new()),
+            image_at_discard: Mutex::new(None),
+        }
+    }
+
+    fn watch(&self, builds: Arc<MemoryBuildRepo>) {
+        *self.builds.lock().unwrap() = Some(builds);
+    }
+
+    fn tart() -> Self {
+        FakeBuilder {
+            backend: "tart".to_string(),
+            installer: false,
+            ..FakeBuilder::utm()
+        }
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn record(&self, call: &str) {
+        self.calls.lock().unwrap().push(call.to_string());
+    }
+
+    fn set_fail_on(&self, step: &'static str) {
+        *self.fail_on.lock().unwrap() = Some(step);
+    }
+
+    /// Makes cleanup after a failed build report a leftover.
+    fn set_cleanup_failure(&self, detail: &str) {
+        self.cleanup_failures
+            .lock()
+            .unwrap()
+            .push(detail.to_string());
+    }
+
+    fn should_fail(&self, step: &str) -> Result<()> {
+        if self.fail_on.lock().unwrap().map(|s| s == step) == Some(true) {
+            return Err(WargameError::VmCreationFailed(format!(
+                "fake {step} failure"
+            )));
+        }
+        Ok(())
+    }
+
+    fn new_id(&self, prefix: &str) -> String {
+        let mut n = self.next_id.lock().unwrap();
+        *n += 1;
+        format!("{prefix}-{n}")
+    }
+}
+
+#[async_trait]
+impl ProfileImageBuilder for FakeBuilder {
+    fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    fn uses_installer_vm(&self) -> bool {
+        self.installer
+    }
+
+    async fn create_installer_vm(&self, req: &InstallerRequest<'_>) -> Result<VmRef> {
+        self.record("create_installer_vm");
+        self.should_fail("create_installer_vm")?;
+        self.created.lock().unwrap().push(req.name.clone());
+        Ok(VmRef {
+            backend: self.backend.clone(),
+            id: self.new_id("INSTALLER"),
+            name: req.name.clone(),
+        })
+    }
+
+    async fn open_console(&self, vm: &VmRef) -> Result<()> {
+        self.record(&format!("open_console:{}", vm.id));
+        self.should_fail("open_console")
+    }
+
+    async fn prepare(&self, _req: &BuildRequest<'_>, _progress: Progress<'_>) -> Result<()> {
+        self.record("prepare");
+        self.should_fail("prepare")
+    }
+
+    async fn clone_for_build(
+        &self,
+        req: &BuildRequest<'_>,
+        _progress: Progress<'_>,
+    ) -> Result<VmRef> {
+        self.record("clone_for_build");
+        self.should_fail("clone_for_build")?;
+        if self.installer {
+            return req.installer_vm().cloned().ok_or_else(|| {
+                WargameError::VmNotFound("no installation VM in the record".to_string())
+            });
+        }
+        let name = req.profile.image_name();
+        self.created.lock().unwrap().push(name.clone());
+        Ok(VmRef::new(self.backend.clone(), name))
+    }
+
+    async fn boot(
+        &self,
+        _req: &BuildRequest<'_>,
+        vm: &VmRef,
+        _progress: Progress<'_>,
+    ) -> Result<()> {
+        self.record(&format!("boot:{}", vm.id));
+        self.should_fail("boot")
+    }
+
+    async fn connect(
+        &self,
+        req: &BuildRequest<'_>,
+        _vm: &VmRef,
+        _progress: Progress<'_>,
+    ) -> Result<GuestLink> {
+        self.record("connect");
+        self.should_fail("connect")?;
+        Ok(GuestLink {
+            endpoint: GuestEndpoint::new(
+                "10.0.0.9".parse().unwrap(),
+                req.profile.guest.user.clone(),
+            ),
+            transport: self.transport.clone() as Arc<dyn GuestTransport>,
+        })
+    }
+
+    async fn shutdown(
+        &self,
+        _req: &BuildRequest<'_>,
+        vm: &VmRef,
+        _progress: Progress<'_>,
+    ) -> Result<()> {
+        self.record(&format!("shutdown:{}", vm.id));
+        self.should_fail("shutdown")
+    }
+
+    async fn publish(
+        &self,
+        req: &BuildRequest<'_>,
+        _vm: &VmRef,
+        _progress: Progress<'_>,
+    ) -> Result<PublishedImage> {
+        self.record("publish");
+        *self.last_profile.lock().unwrap() = req.profile.name.clone();
+        self.should_fail("publish")?;
+        let name = format!("wg-build-image-{}", req.profile.name);
+        self.published.lock().unwrap().push(name.clone());
+        Ok(PublishedImage::new(self.new_id("IMAGE"), name))
+    }
+
+    async fn discard_image(&self, image: &PublishedImage) -> Result<()> {
+        self.record(&format!("discard_image:{}", image.id));
+        self.discarded.lock().unwrap().push(image.id.clone());
+        let watched = self.builds.lock().unwrap().clone();
+        if let Some(builds) = watched {
+            let profile = self.last_profile.lock().unwrap().clone();
+            let current = builds.load(&profile).await?;
+            *self.image_at_discard.lock().unwrap() = current.and_then(|r| r.image.map(|i| i.id));
+        }
+        self.should_fail("discard_image")
+    }
+
+    async fn cleanup_failed_build(&self, _req: &BuildRequest<'_>, vm: &VmRef) -> Vec<String> {
+        self.record(&format!("cleanup:{}", vm.id));
+        self.cleanup_failures.lock().unwrap().clone()
+    }
+}
+
+/// A disk with however much free space a test wants.
+struct FakeDisk(Mutex<u64>);
+
+impl FakeDisk {
+    fn with_gib(gib: u64) -> Self {
+        FakeDisk(Mutex::new(gib * 1024 * 1024 * 1024))
+    }
+}
+
+impl DiskSpace for FakeDisk {
+    fn free_bytes(&self, _path: &Path) -> Result<u64> {
+        Ok(*self.0.lock().unwrap())
+    }
+}
+
+// --- fixture --------------------------------------------------------------
+
+const KALI_YAML: &str = r#"apiVersion: wargame.vm/v1
+kind: Profile
+
+metadata:
+  name: kali-arm64
+  description: "Kali template"
+
+vm:
+  backend: utm
+  mode: virtualize
+
+guest:
+  os: linux
+  distribution: kali
+  arch: arm64
+  user: kali
+
+image:
+  base: ""
+
+resources:
+  cpu: 4
+  memory_gib: 8
+  disk_gib: 80
+
+provision:
+  scripts:
+    - scripts/kali/common.sh
+
+tools:
+  verify:
+    - python3 --version
+
+workspace:
+  root: /home/kali/wargame
+"#;
+
+const WINDOWS_YAML: &str = r#"apiVersion: wargame.vm/v1
+kind: Profile
+
+metadata:
+  name: windows-x86_64
+
+vm:
+  backend: utm
+  mode: emulate
+
+guest:
+  os: windows
+  arch: x86_64
+  user: wargame
+
+image:
+  base: ""
+
+resources:
+  cpu: 4
+  memory_gib: 8
+  disk_gib: 80
+
+provision:
+  scripts:
+    - scripts/windows/common.ps1
+
+workspace:
+  root: 'C:\wargame'
+"#;
+
+const MACOS_YAML: &str = r#"apiVersion: wargame.vm/v1
+kind: Profile
+
+metadata:
+  name: macos-re-arm64
+
+guest:
+  os: macos
+  arch: arm64
+  user: admin
+
+image:
+  base: ghcr.io/cirruslabs/macos-sequoia-vanilla:latest
+
+resources:
+  cpu: 4
+  memory_gib: 8
+  disk_gib: 60
+
+provision:
+  scripts:
+    - scripts/macos/common.sh
+
+tools:
+  verify:
+    - python3 --version
+
+workspace:
+  root: /Users/admin/wargame
+"#;
+
+struct Fixture {
+    ctx: AppContext,
+    utm: Arc<FakeBuilder>,
+    tart: Arc<FakeBuilder>,
+    builds: Arc<MemoryBuildRepo>,
+    home: PathBuf,
+    iso: PathBuf,
+}
+
+impl Fixture {
+    fn profiles_dir(&self) -> PathBuf {
+        self.home.join("profiles")
+    }
+
+    async fn record(&self, profile: &str) -> BuildRecord {
+        self.builds
+            .load(profile)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected a build record for {profile}"))
+    }
+}
+
+fn fixture() -> Fixture {
+    fixture_with_disk(FakeDisk::with_gib(500))
+}
+
+fn fixture_with_disk(disk: FakeDisk) -> Fixture {
+    let home = tempfile::tempdir().unwrap().keep();
+    let dirs = AppDirs { root: home.clone() };
+    dirs.ensure_layout().unwrap();
+    let profiles_dir = dirs.profiles_dir();
+    std::fs::write(profiles_dir.join("kali-arm64.yaml"), KALI_YAML).unwrap();
+    std::fs::write(profiles_dir.join("windows-x86_64.yaml"), WINDOWS_YAML).unwrap();
+    std::fs::write(profiles_dir.join("macos-re-arm64.yaml"), MACOS_YAML).unwrap();
+    for (rel, body) in [
+        ("scripts/kali/common.sh", "#!/usr/bin/env bash\necho kali\n"),
+        ("scripts/windows/common.ps1", "Write-Host windows\n"),
+        ("scripts/macos/common.sh", "#!/usr/bin/env bash\necho mac\n"),
+    ] {
+        let path = profiles_dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    let iso = home.join("kali.iso");
+    std::fs::write(&iso, b"not really an iso").unwrap();
+
+    let utm = Arc::new(FakeBuilder::utm());
+    let tart = Arc::new(FakeBuilder::tart());
+    let builds = Arc::new(MemoryBuildRepo::new());
+    utm.watch(builds.clone());
+    tart.watch(builds.clone());
+    let vm_utm = Arc::new(FakeVmProvider::with_backend("utm"));
+    let ctx = AppContext {
+        config: Default::default(),
+        dirs,
+        wargame: Arc::new(FakeWargameProvider::new()),
+        backends: BackendRegistry::new(vec![
+            Arc::new(FakeVmProvider::new()) as Arc<dyn VmProvider>,
+            vm_utm as Arc<dyn VmProvider>,
+        ]),
+        transports: TransportRegistry::new(Arc::new(FakeTransport::new())),
+        repo: Arc::new(MemoryRepo::new()),
+        builds: builds.clone(),
+        builders: BuilderRegistry::new(vec![
+            utm.clone() as Arc<dyn ProfileImageBuilder>,
+            tart.clone() as Arc<dyn ProfileImageBuilder>,
+        ]),
+        disk: Arc::new(disk),
+        profiles: ProfileStore::new(Vec::new(), profiles_dir),
+        runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
+        bootstrap_script: "#!/bin/bash\n",
+    };
+    Fixture {
+        ctx,
+        utm,
+        tart,
+        builds,
+        home,
+        iso,
+    }
+}
+
+fn iso_source(path: &Path) -> CreateSource {
+    CreateSource::Iso {
+        path: path.to_path_buf(),
+        sha256: None,
+    }
+}
+
+fn noop(_: String) {}
+
+// --- profile init ---------------------------------------------------------
+
+#[tokio::test]
+async fn init_copies_the_template_with_its_own_scripts_directory() {
+    let f = fixture();
+    let outcome = profile_build::init(&f.ctx, "kali-arm64", "kali-custom")
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.profile.name, "kali-custom");
+    assert_eq!(
+        outcome.profile.provision.scripts,
+        vec!["scripts/kali-custom/common.sh".to_string()],
+        "the copy must own its scripts so re-seeding the built-ins cannot overwrite them"
+    );
+    assert!(outcome.yaml_path.is_file());
+    assert!(f
+        .profiles_dir()
+        .join("scripts/kali-custom/common.sh")
+        .is_file());
+    // The template itself is untouched.
+    assert_eq!(
+        std::fs::read_to_string(f.profiles_dir().join("kali-arm64.yaml")).unwrap(),
+        KALI_YAML
+    );
+    // And the new profile is visible to the store.
+    assert_eq!(
+        f.ctx.profiles.get("kali-custom").unwrap().guest.user,
+        "kali"
+    );
+}
+
+#[tokio::test]
+async fn init_refuses_a_name_that_already_exists() {
+    let f = fixture();
+    profile_build::init(&f.ctx, "kali-arm64", "kali-custom")
+        .await
+        .unwrap();
+    let err = profile_build::init(&f.ctx, "kali-arm64", "kali-custom")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WargameError::InvalidProfile { .. }),
+        "{err:?}"
+    );
+    let err = profile_build::init(&f.ctx, "kali-arm64", "kali-arm64")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WargameError::InvalidProfile { .. }),
+        "{err:?}"
+    );
+}
+
+// --- profile create -------------------------------------------------------
+
+#[tokio::test]
+async fn create_makes_one_installer_vm_and_records_it_as_awaiting_install() {
+    let f = fixture();
+    let outcome = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+
+    assert!(!outcome.reused);
+    assert_eq!(outcome.record.phase, BuildPhase::AwaitingInstall);
+    let vm = outcome.record.installer_vm.clone().unwrap();
+    assert_eq!(
+        vm.name, "wg-build-kali-arm64",
+        "an installation VM must carry the build prefix, not the session one"
+    );
+    assert!(outcome.record.ready_image().is_none());
+
+    let guidance = outcome.guidance.join("\n");
+    assert!(guidance.contains(&vm.id), "the installer UUID is printed");
+    assert!(guidance.contains("wargame profile console kali-arm64"));
+    assert!(guidance.contains("qemu-guest-agent"));
+    assert!(guidance.contains("wargame profile build kali-arm64"));
+
+    assert_eq!(f.record("kali-arm64").await.installer_vm, Some(vm));
+}
+
+/// spec.md §3 FR-2: "같은 명령을 다시 실행하면 설치 VM을 재사용·안내하고
+/// 중복 VM/디스크를 만들지 않는다".
+#[tokio::test]
+async fn create_re_run_with_the_same_source_reuses_the_installer_vm() {
+    let f = fixture();
+    let first = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let again = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+
+    assert!(again.reused);
+    assert_eq!(again.record.installer_vm, first.record.installer_vm);
+    assert_eq!(
+        f.utm
+            .calls()
+            .iter()
+            .filter(|c| *c == "create_installer_vm")
+            .count(),
+        1,
+        "a re-run must not create a second VM: {:?}",
+        f.utm.calls()
+    );
+    assert!(again.guidance.join("\n").contains("Re-using"));
+}
+
+#[tokio::test]
+async fn create_with_a_different_source_is_a_conflict_that_names_both() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let other = f.home.join("other.iso");
+    std::fs::write(&other, b"another").unwrap();
+
+    let err = profile_build::create(&f.ctx, "kali-arm64", iso_source(&other))
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("kali.iso"), "{message}");
+    assert!(message.contains("other.iso"), "{message}");
+    assert!(message.contains("profile init"), "{message}");
+    assert_eq!(
+        f.utm
+            .calls()
+            .iter()
+            .filter(|c| *c == "create_installer_vm")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn create_verifies_a_given_sha256_before_any_vm_exists() {
+    let f = fixture();
+    let err = profile_build::create(
+        &f.ctx,
+        "kali-arm64",
+        CreateSource::Iso {
+            path: f.iso.clone(),
+            sha256: Some("0".repeat(64)),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, WargameError::HashOrWrite(_)), "{err:?}");
+    assert!(
+        f.utm.calls().is_empty(),
+        "nothing may be created before the hash matches: {:?}",
+        f.utm.calls()
+    );
+    assert!(f.builds.load("kali-arm64").await.unwrap().is_none());
+
+    // The real hash is accepted and recorded as verified.
+    let (digest, _) = wargame_core::security::hash::sha256_file(&f.iso).unwrap();
+    let outcome = profile_build::create(
+        &f.ctx,
+        "kali-arm64",
+        CreateSource::Iso {
+            path: f.iso.clone(),
+            sha256: Some(digest),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome.record.source,
+        BuildSource::Iso {
+            verified_sha256: true,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn create_refuses_a_missing_iso_before_any_vm_exists() {
+    let f = fixture();
+    let err = profile_build::create(&f.ctx, "kali-arm64", iso_source(Path::new("/no/such.iso")))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("/no/such.iso"), "{err}");
+    assert!(f.utm.calls().is_empty());
+}
+
+#[tokio::test]
+async fn create_refuses_when_the_disk_cannot_hold_the_profile() {
+    let f = fixture_with_disk(FakeDisk::with_gib(10)); // the profile asks for 80
+    let err = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WargameError::InsufficientResources(_)),
+        "{err:?}"
+    );
+    assert!(f.utm.calls().is_empty(), "{:?}", f.utm.calls());
+    assert!(f.builds.load("kali-arm64").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn create_on_a_tart_profile_explains_that_tart_uses_image_base() {
+    let f = fixture();
+    let err = profile_build::create(&f.ctx, "macos-re-arm64", iso_source(&f.iso))
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("image.base"), "{message}");
+    assert!(message.contains("profile build"), "{message}");
+    assert!(f.tart.calls().is_empty());
+}
+
+// --- profile console ------------------------------------------------------
+
+#[tokio::test]
+async fn console_opens_the_installer_vm_and_refuses_tart() {
+    let f = fixture();
+    let err = profile_build::console(&f.ctx, "kali-arm64")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("installation VM"),
+        "a profile with no record must be told to create one: {err}"
+    );
+    assert!(err.hint().unwrap().contains("profile create"));
+
+    let outcome = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    profile_build::console(&f.ctx, "kali-arm64").await.unwrap();
+    let id = outcome.record.installer_vm.unwrap().id;
+    assert!(f.utm.calls().contains(&format!("open_console:{id}")));
+
+    let err = profile_build::console(&f.ctx, "macos-re-arm64")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("installation VM"), "{err}");
+}
+
+// --- profile build --------------------------------------------------------
+
+#[tokio::test]
+async fn build_without_a_record_names_profile_create() {
+    let f = fixture();
+    let err = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap_err();
+    assert!(
+        err.hint().unwrap().contains("wargame profile create"),
+        "{err}"
+    );
+    assert!(f.utm.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_successful_build_runs_every_step_in_order_and_publishes_a_ready_image() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let mut messages = Vec::new();
+    let record = profile_build::build(&f.ctx, "kali-arm64", &mut |m| messages.push(m))
+        .await
+        .unwrap();
+
+    let steps: Vec<String> = f
+        .utm
+        .calls()
+        .into_iter()
+        .filter(|c| c != "create_installer_vm")
+        .map(|c| c.split(':').next().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            "prepare",
+            "clone_for_build",
+            "boot",
+            "connect",
+            "shutdown",
+            "publish",
+        ],
+        "spec.md §5 item 4's order"
+    );
+
+    assert_eq!(record.phase, BuildPhase::Ready);
+    let image = record.ready_image().expect("a ready record has an image");
+    assert_eq!(image.name, "wg-build-image-kali-arm64");
+    assert_eq!(record.previous_image, None);
+    assert_eq!(record.verification.len(), 1);
+    assert_eq!(record.verification[0].command, "python3 --version");
+    assert!(record.verification[0].passed());
+    assert!(!record.profile_hash.is_empty());
+    assert!(!record.scripts_hash.is_empty());
+    assert!(record.last_error.is_none());
+    assert!(record.cleanup_failures.is_empty());
+    assert!(!messages.is_empty());
+
+    // The scripts really were copied in and run in the guest.
+    let guest_calls: Vec<String> = f
+        .utm
+        .transport
+        .calls()
+        .into_iter()
+        .map(|c| format!("{c:?}"))
+        .collect();
+    assert!(
+        guest_calls
+            .iter()
+            .any(|c| c.contains("wg-provision/scripts/kali/common.sh")),
+        "{guest_calls:?}"
+    );
+    assert!(guest_calls.iter().any(|c| c.contains("CopyIn")));
+}
+
+/// The launchable image only exists once the build published it.
+#[tokio::test]
+async fn an_unbuilt_utm_profile_is_not_launchable_but_a_built_one_is() {
+    let f = fixture();
+    let profile = f.ctx.profiles.get("kali-arm64").unwrap();
+    let err = profile_build::launch_image(&f.ctx, &profile)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WargameError::ImageNotBuilt { .. }), "{err:?}");
+    assert!(err.hint().unwrap().contains("profile create"));
+
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    // Created but not built: still nothing to launch, and the hint moves on
+    // to `profile build`.
+    let err = profile_build::launch_image(&f.ctx, &profile)
+        .await
+        .unwrap_err();
+    assert!(err.hint().unwrap().contains("profile build"), "{err}");
+
+    let record = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    let image = profile_build::launch_image(&f.ctx, &profile).await.unwrap();
+    assert_eq!(
+        image.0,
+        record.ready_image().unwrap().id,
+        "a UTM launch clones the published image VM by UUID"
+    );
+}
+
+/// spec.md §3 FR-3: editing the profile or its scripts asks for a rebuild.
+#[tokio::test]
+async fn changing_a_provisioning_script_marks_the_image_as_needing_a_rebuild() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    let profile = f.ctx.profiles.get("kali-arm64").unwrap();
+    assert!(
+        !profile_build::image_status(&f.ctx, &profile)
+            .await
+            .unwrap()
+            .rebuild_needed
+    );
+
+    std::fs::write(
+        f.profiles_dir().join("scripts/kali/common.sh"),
+        "#!/usr/bin/env bash\necho more tools\n",
+    )
+    .unwrap();
+    let status = profile_build::image_status(&f.ctx, &profile).await.unwrap();
+    assert!(status.rebuild_needed);
+    assert!(
+        status.detail.contains("rebuild needed"),
+        "{}",
+        status.detail
+    );
+    // ... and the old image is still launchable in the meantime.
+    assert!(status.image.is_some());
+}
+
+/// spec.md §6's "OS 설치 미완료" row: an unreachable guest is a wait, not a
+/// failure, and never a ready image.
+#[tokio::test]
+async fn a_guest_that_never_answers_stays_awaiting_install() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    f.utm.set_fail_on("connect");
+
+    let mut messages = Vec::new();
+    let err = profile_build::build(&f.ctx, "kali-arm64", &mut |m| messages.push(m))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("connect"), "{err}");
+
+    let record = f.record("kali-arm64").await;
+    assert_eq!(record.phase, BuildPhase::AwaitingInstall);
+    assert!(record.ready_image().is_none());
+    assert!(
+        record.installer_vm.is_some(),
+        "the installer VM is preserved"
+    );
+    let printed = messages.join("\n");
+    assert!(
+        printed.contains("wargame profile console kali-arm64"),
+        "{printed}"
+    );
+}
+
+/// AC-09: a failed verification preserves the previous image, records the
+/// failing command, and never marks the profile ready.
+#[tokio::test]
+async fn a_failed_verification_preserves_the_previous_image() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let first = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    let good_image = first.ready_image().unwrap().clone();
+
+    f.utm.transport.set_exec_responder(|argv| {
+        if argv == ["python3".to_string(), "--version".to_string()] {
+            wargame_core::ports::ExecResult {
+                status: 127,
+                stdout: String::new(),
+                stderr: "bash: python3: command not found".to_string(),
+            }
+        } else {
+            wargame_core::ports::ExecResult {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        }
+    });
+
+    let err = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("python3 --version"), "{message}");
+    assert!(message.contains("127"), "{message}");
+
+    let record = f.record("kali-arm64").await;
+    assert_eq!(
+        record.phase,
+        BuildPhase::Failed {
+            stage: BuildStage::Verifying,
+            error: message,
+        }
+    );
+    assert_eq!(
+        record.ready_image(),
+        Some(&good_image),
+        "the last good image must survive a failed rebuild"
+    );
+    assert_eq!(record.verification.last().unwrap().exit_code, 127);
+    assert!(
+        f.utm.discarded.lock().unwrap().is_empty(),
+        "nothing may be deleted when the build failed"
+    );
+    assert_eq!(
+        f.utm.published.lock().unwrap().len(),
+        1,
+        "a failed build must not publish"
+    );
+}
+
+/// AC-09 / docs/utm-compatibility.md T12: a VM that will not stop fails the
+/// build in the publishing stage, records the cleanup failure and leaves the
+/// previous image alone.
+#[tokio::test]
+async fn a_stop_that_fails_records_a_cleanup_failure_and_keeps_the_old_image() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let first = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    let good_image = first.ready_image().unwrap().clone();
+
+    f.utm.set_fail_on("shutdown");
+    f.utm
+        .set_cleanup_failure("qemu-aarch64-softmmu (pid 4242) still holds the VM's files");
+    let err = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("shutdown"), "{err}");
+
+    let record = f.record("kali-arm64").await;
+    assert!(matches!(
+        record.phase,
+        BuildPhase::Failed {
+            stage: BuildStage::Publishing,
+            ..
+        }
+    ));
+    assert_eq!(record.ready_image(), Some(&good_image));
+    assert_eq!(record.cleanup_failures.len(), 1);
+    assert!(record.cleanup_failures[0].contains("pid 4242"));
+    assert!(f.utm.discarded.lock().unwrap().is_empty());
+}
+
+/// A build that was interrupted mid-phase re-runs against the installation
+/// VM the record already owns instead of creating a second one.
+#[tokio::test]
+async fn an_interrupted_build_resumes_without_duplicating_vms() {
+    let f = fixture();
+    let created = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    // Simulate a process that died between `connect` and `publish`.
+    let mut interrupted = created.record.clone();
+    interrupted.set_phase(BuildPhase::Provisioning);
+    f.builds.insert(interrupted);
+
+    let record = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    assert_eq!(record.phase, BuildPhase::Ready);
+    assert_eq!(
+        record.installer_vm, created.record.installer_vm,
+        "the same installation VM must be reused"
+    );
+    assert_eq!(
+        f.utm
+            .calls()
+            .iter()
+            .filter(|c| *c == "create_installer_vm")
+            .count(),
+        1
+    );
+}
+
+/// The previously published image is deleted only after the new one is
+/// written down, and a failure to delete it is recorded rather than lost.
+#[tokio::test]
+async fn a_rebuild_replaces_the_image_and_only_then_deletes_the_old_one() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let first = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    let old = first.ready_image().unwrap().clone();
+
+    let second = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    let new = second.ready_image().unwrap().clone();
+    assert_ne!(new.id, old.id);
+    assert_eq!(second.previous_image, None, "the old image was discarded");
+    assert_eq!(
+        f.utm.discarded.lock().unwrap().clone(),
+        vec![old.id.clone()]
+    );
+
+    let calls = f.utm.calls();
+    let publish_idx = calls.iter().position(|c| c == "publish").unwrap();
+    let discard_idx = calls
+        .iter()
+        .position(|c| c.starts_with("discard_image"))
+        .unwrap();
+    assert!(
+        publish_idx < discard_idx,
+        "the replacement must exist before the old image is deleted"
+    );
+    assert_eq!(
+        f.utm.image_at_discard.lock().unwrap().clone(),
+        Some(new.id),
+        "the new image must already be written down when the old one is deleted"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_discard_of_the_old_image_is_recorded_not_swallowed() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    f.utm.set_fail_on("discard_image");
+
+    let record = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    assert_eq!(
+        record.phase,
+        BuildPhase::Ready,
+        "the new image is still good"
+    );
+    assert!(
+        record.previous_image.is_some(),
+        "the old image is still there"
+    );
+    assert_eq!(record.cleanup_failures.len(), 1);
+    assert!(record.cleanup_failures[0].contains("could not delete"));
+}
+
+/// Windows guests need the PowerShell transport, which is the next task.
+#[tokio::test]
+async fn a_windows_build_is_refused_before_the_guest_is_touched() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "windows-x86_64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let err = profile_build::build(&f.ctx, "windows-x86_64", &mut noop)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Task 5"), "{err}");
+
+    let record = f.record("windows-x86_64").await;
+    assert_eq!(record.phase, BuildPhase::AwaitingInstall);
+    assert!(record.ready_image().is_none());
+    assert!(
+        !f.utm.calls().iter().any(|c| c == "connect"),
+        "the guest must not be touched: {:?}",
+        f.utm.calls()
+    );
+}
+
+#[tokio::test]
+async fn a_windows_create_prints_the_manual_tpm_and_secure_boot_step() {
+    let f = fixture();
+    let outcome = profile_build::create(&f.ctx, "windows-x86_64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let guidance = outcome.guidance.join("\n");
+    assert!(guidance.contains("TPM 2.0"), "{guidance}");
+    assert!(guidance.contains("Secure Boot"), "{guidance}");
+    assert!(guidance.contains("OpenSSH Server"), "{guidance}");
+}
+
+/// The VMs a build record owns have no session, but they are not orphans:
+/// `prune` must leave them alone (spec.md §3 FR-5).
+#[tokio::test]
+async fn prune_never_deletes_a_vm_a_build_record_owns() {
+    let f = fixture();
+    let vm_utm = f.ctx.backends.get("utm").unwrap();
+    // Two VMs exist on the backend: one this app's build record owns, one
+    // nobody claims.
+    let record = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap()
+        .record;
+    let installer = record.installer_vm.clone().unwrap();
+    vm_utm
+        .create(&wargame_core::ports::VmSpec::new(
+            installer.id.clone(),
+            wargame_core::ports::ImageRef("src".to_string()),
+            f.ctx.profiles.get("kali-arm64").unwrap().resources,
+        ))
+        .await
+        .unwrap();
+    vm_utm
+        .create(&wargame_core::ports::VmSpec::new(
+            "wg-orphan",
+            wargame_core::ports::ImageRef("src".to_string()),
+            f.ctx.profiles.get("kali-arm64").unwrap().resources,
+        ))
+        .await
+        .unwrap();
+
+    let pruned = wargame_core::app::prune(&f.ctx, true).await.unwrap();
+    assert_eq!(pruned, vec!["utm/wg-orphan".to_string()]);
+}
+
+// --- the Tart path stays what it was --------------------------------------
+
+#[tokio::test]
+async fn a_tart_build_needs_no_record_and_writes_one() {
+    let f = fixture();
+    let record = profile_build::build(&f.ctx, "macos-re-arm64", &mut noop)
+        .await
+        .unwrap();
+    assert_eq!(record.backend, "tart");
+    assert!(matches!(record.source, BuildSource::TartBase { .. }));
+    assert_eq!(record.phase, BuildPhase::Ready);
+    assert!(record.installer_vm.is_none(), "Tart has no installation VM");
+    let steps: Vec<String> = f
+        .tart
+        .calls()
+        .into_iter()
+        .map(|c| c.split(':').next().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            "prepare",
+            "clone_for_build",
+            "boot",
+            "connect",
+            "shutdown",
+            "publish"
+        ]
+    );
+
+    // Tart still launches from its own image name, not from the record.
+    let profile = f.ctx.profiles.get("macos-re-arm64").unwrap();
+    assert_eq!(
+        profile_build::launch_image(&f.ctx, &profile)
+            .await
+            .unwrap()
+            .0,
+        "wargame-profile-macos-re-arm64"
+    );
+}

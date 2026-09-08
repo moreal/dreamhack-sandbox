@@ -20,9 +20,12 @@ pub async fn open(ctx: &AppContext, r: &ChallengeRef) -> Result<Challenge> {
 mod tests {
     use super::*;
     use crate::app::profiles::ProfileStore;
+    use crate::app::BuilderRegistry;
     use crate::infra::fs::AppDirs;
     use crate::infra::process::ProcessRunner;
+    use crate::infra::HostDiskSpace;
     use crate::ports::WargameProvider;
+    use crate::testing::MemoryBuildRepo;
     use crate::testing::{
         FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider, MemoryRepo,
     };
@@ -44,6 +47,9 @@ mod tests {
             ]),
             transports: crate::app::TransportRegistry::new(Arc::new(FakeTransport::new())),
             repo: Arc::new(MemoryRepo::new()),
+            builds: Arc::new(MemoryBuildRepo::new()),
+            builders: BuilderRegistry::default(),
+            disk: Arc::new(HostDiskSpace),
             profiles: ProfileStore::new(vec![], tmp_path()),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
             bootstrap_script: "#!/bin/bash\n",

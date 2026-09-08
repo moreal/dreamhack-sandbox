@@ -161,7 +161,11 @@ pub async fn launch(
         )));
     }
 
-    let image = ImageRef(profile.image_name());
+    // Which image this profile launches from is a per-backend question:
+    // Tart names a local image, UTM names the UUID of the VM its build
+    // record published (spec.md §5 item 5). An unbuilt profile is refused
+    // here, before anything is created.
+    let image = crate::app::profile_build::launch_image(ctx, &profile).await?;
     if !vm.image_exists(&image).await? {
         return Err(WargameError::ImageMissing {
             profile: profile.name.clone(),
@@ -171,7 +175,7 @@ pub async fn launch(
 
     let required_bytes =
         (profile.resources.disk_gib as f64 * MIN_DISK_FRACTION * GIB as f64) as u64;
-    let free_bytes = crate::infra::disk_free_bytes(&ctx.dirs.root)?;
+    let free_bytes = ctx.disk.free_bytes(&ctx.dirs.root)?;
     if free_bytes < required_bytes {
         return Err(WargameError::InsufficientResources(format!(
             "profile {:?} needs at least {:.1} GiB free, only {:.1} GiB available at {}",
@@ -245,6 +249,7 @@ pub async fn launch(
         ctx,
         &req,
         &profile,
+        &image,
         &challenge,
         &mut session,
         &execution,
@@ -292,6 +297,8 @@ async fn run_launch(
     ctx: &AppContext,
     req: &LaunchRequest,
     profile: &Profile,
+    // The already-resolved image for this profile's backend.
+    image: &ImageRef,
     challenge: &Challenge,
     session: &mut Session,
     execution: &ResolvedBackend,
@@ -310,7 +317,7 @@ async fn run_launch(
             ctx.config.vm.vm_prefix(execution.backend),
             session.id
         ),
-        image: ImageRef(profile.image_name()),
+        image: image.clone(),
         resources: session.resources,
         execution: execution.clone(),
         network: session.network,
@@ -509,6 +516,7 @@ async fn provision_guest(
 mod tests {
     use super::*;
     use crate::app::profiles::ProfileStore;
+    use crate::app::BuilderRegistry;
     use crate::app::{BackendRegistry, TransportRegistry};
     use crate::domain::{
         GuestArch, GuestOs, GuestSpec, ImageSpec, ProvisionSpec, ToolsSpec, VmSettings,
@@ -516,7 +524,9 @@ mod tests {
     };
     use crate::infra::fs::AppDirs;
     use crate::infra::process::ProcessRunner;
+    use crate::infra::HostDiskSpace;
     use crate::testing::fake_transport::TransportCall;
+    use crate::testing::MemoryBuildRepo;
     use crate::testing::{
         FakeRunner, FakeTransport, FakeVmProvider, FakeWargameProvider, MemoryRepo,
         FIXTURE_ASSET_BYTES,
@@ -577,6 +587,9 @@ mod tests {
             backends: BackendRegistry::new(vec![vm.clone() as Arc<dyn VmProvider>]),
             transports: TransportRegistry::new(transport.clone()),
             repo: Arc::new(MemoryRepo::new()),
+            builds: Arc::new(MemoryBuildRepo::new()),
+            builders: BuilderRegistry::default(),
+            disk: Arc::new(HostDiskSpace),
             profiles: ProfileStore::new(vec![test_profile()], profiles_dir),
             runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
             bootstrap_script: "#!/bin/bash\necho hi\n",
