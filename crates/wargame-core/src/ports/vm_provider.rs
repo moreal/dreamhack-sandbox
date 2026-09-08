@@ -73,6 +73,20 @@ pub struct BackendStatus {
     pub isolated_network: Option<bool>,
 }
 
+/// One backend-specific `doctor` row (spec.md §3 FR-6's "필요한 backend,
+/// 실제 경로·버전, 자동화 권한 ... 검사"). Everything a backend can say about
+/// itself that does not fit [`BackendStatus`]'s single line -- where its
+/// binary was found, whether host automation is permitted -- comes back
+/// through [`VmProvider::diagnostics`] so `app/doctor.rs` never has to know
+/// which backend it is talking to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendCheck {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+    pub hint: Option<String>,
+}
+
 /// How the user actually gets a graphical view of the VM (MVP.md §26's
 /// `ConsoleDescriptor`, trimmed to what the local Tart backend can produce
 /// today).
@@ -101,5 +115,10 @@ pub trait VmProvider: Send + Sync {
     async fn status(&self, vm: &VmRef) -> Result<VmStatus>;
     /// All VMs this backend manages, for orphan detection (MVP.md §37/NFR-02).
     async fn list(&self) -> Result<Vec<VmRef>>;
+    /// Backend-specific `doctor` rows (binary path, host automation
+    /// permission, ...). Empty unless a backend has something to add.
+    async fn diagnostics(&self) -> Vec<BackendCheck> {
+        Vec::new()
+    }
     fn console(&self, vm: &VmRef) -> ConsoleDescriptor;
 }

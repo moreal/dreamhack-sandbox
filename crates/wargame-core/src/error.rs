@@ -67,6 +67,22 @@ pub enum WargameError {
     Config(String),
     #[error("credential store error: {0}")]
     CredentialStore(String),
+    /// macOS refused an Apple Event to `app` (TCC "Automation" grant
+    /// missing), e.g. AppleScript error -1743 (spec.md §6's "UTM
+    /// 미설치·자동화 권한 거부" row).
+    #[error("automation permission denied for {app}: {detail}")]
+    AutomationDenied { app: String, detail: String },
+    /// A backend process the app did not spawn is still holding a VM's
+    /// files after it was stopped (docs/utm-compatibility.md T12). We never
+    /// signal it -- the stop is reported incomplete and the user decides.
+    #[error("{detail}")]
+    OrphanProcess { pid: u32, detail: String },
+    /// The guest never reported an address before the boot timeout. The
+    /// message carries the elapsed time and what was being waited for, the
+    /// hint the log path and how to raise the timeout (spec.md §6's "긴
+    /// emulate 부팅" row).
+    #[error("{detail}")]
+    GuestAddressTimeout { detail: String, hint: String },
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -91,6 +107,17 @@ pub fn isolated_network_hint(softnet_path: Option<&std::path::Path>) -> String {
     )
 }
 
+/// The recovery steps for a denied macOS Automation (Apple Events) grant
+/// (docs/utm-compatibility.md §1): the grant is per *responsible app*, so
+/// the terminal or IDE that runs `wargame` is what has to be allowed, and
+/// it is toggled in System Settings, not by anything wargame may do on the
+/// user's behalf.
+pub fn automation_permission_hint(app: &str) -> String {
+    format!(
+        "Allow this terminal to control {app}: System Settings > Privacy & Security > Automation > (your terminal app) > {app}.\nThe grant belongs to the app that runs wargame, so Terminal, iTerm and an IDE each need it once. Then re-run: wargame doctor"
+    )
+}
+
 impl WargameError {
     /// A short, actionable next step to show under the error message, if any
     /// (MVP.md §23's "Try:" lines).
@@ -107,6 +134,11 @@ impl WargameError {
                 "wargame sessions   # then delete an old session to free space".to_string(),
             ),
             WargameError::BackendUnavailable { .. } => Some("wargame doctor".to_string()),
+            WargameError::AutomationDenied { app, .. } => Some(automation_permission_hint(app)),
+            WargameError::OrphanProcess { pid, .. } => Some(format!(
+                "A backend process wargame did not start is still holding this VM. Check it, then clear it yourself:\n  ps -o pid,ppid,command -p {pid}\n  kill -9 {pid}\nwargame never signals a process it did not spawn."
+            )),
+            WargameError::GuestAddressTimeout { hint, .. } => Some(hint.clone()),
             WargameError::ProfileNotFound(_) => Some("wargame profiles".to_string()),
             WargameError::SessionNotFound(_) => Some("wargame sessions".to_string()),
             WargameError::AmbiguousSession { .. } => {

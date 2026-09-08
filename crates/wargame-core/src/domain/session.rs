@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::challenge::{Challenge, ChallengeSummary};
+use super::compat::Backend;
 use super::profile::{ExecutionMode, GuestArch, GuestOs, Resources};
 use crate::error::{Result, WargameError};
 
@@ -359,6 +360,24 @@ impl Session {
     /// e.g. `"dh-out-of-bound-a1b2c3"`.
     pub fn new_id(provider_short: &str, slug: &str, rand6: &str) -> String {
         format!("{provider_short}-{slug}-{rand6}")
+    }
+
+    /// The backend that owns this session's VM.
+    ///
+    /// One source of truth: the VM ref's own backend, since that is what
+    /// the VM was actually created on, falling back to `vm_provider` for a
+    /// record written before [`VmRef`] carried one (spec.md §3 FR-5).
+    pub fn backend_name(&self) -> &str {
+        self.vm_ref
+            .as_ref()
+            .map(|vm| vm.backend.as_str())
+            .unwrap_or(self.vm_provider.as_str())
+    }
+
+    /// [`Session::backend_name`] parsed into a [`Backend`], for the lookups
+    /// that need the enum (boot timeouts, VM name prefixes).
+    pub fn backend(&self) -> Result<Backend> {
+        self.backend_name().parse()
     }
 
     /// The guest endpoint to talk to this session, once it has an address.

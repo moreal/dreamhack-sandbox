@@ -53,8 +53,10 @@ pub async fn open_gui(ctx: &AppContext, id: &str) -> Result<()> {
         vm.stop(&vm_ref).await?;
     }
 
-    let backend = session.vm_provider.parse()?;
-    let boot_timeout = ctx.config.vm.boot_timeout(backend, session.vm_mode);
+    let boot_timeout = ctx
+        .config
+        .vm
+        .boot_timeout(session.backend()?, session.vm_mode);
     let start_opts = StartOptions {
         network: session.network,
         headless: false,

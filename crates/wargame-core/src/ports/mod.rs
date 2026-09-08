@@ -13,8 +13,8 @@ pub use credential_store::CredentialStore;
 pub use guest_transport::{ExecResult, GuestEndpoint, GuestShell, GuestTransport};
 pub use session_repo::SessionRepository;
 pub use vm_provider::{
-    BackendStatus, ConsoleDescriptor, ImageRef, RuntimeInfo, StartOptions, VmProvider, VmSpec,
-    VmStatus,
+    BackendCheck, BackendStatus, ConsoleDescriptor, ImageRef, RuntimeInfo, StartOptions,
+    VmProvider, VmSpec, VmStatus,
 };
 pub use wargame_provider::{
     AssetSink, AuthState, DownloadResult, DownloadedFile, ProviderStatus, SearchPage, SearchQuery,

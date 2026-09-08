@@ -57,6 +57,10 @@ pub struct UtmConfig {
     /// An explicit `utmctl` path, tried first (FR-6's discovery order:
     /// config -> `PATH` -> `/Applications/UTM.app/Contents/MacOS/utmctl`).
     pub utmctl: Option<String>,
+    /// Display-name prefix for the VMs this app owns on UTM. Kept separate
+    /// from `[vm.tart].vm_prefix` so the two backends can be namespaced
+    /// independently.
+    pub vm_prefix: String,
     /// Boot timeout for `mode: emulate` guests. Full x86_64 emulation is
     /// orders of magnitude slower than virtualization, hence FR-5's 1800 s.
     pub boot_timeout_secs: u64,
@@ -68,6 +72,7 @@ impl Default for UtmConfig {
     fn default() -> Self {
         UtmConfig {
             utmctl: None,
+            vm_prefix: "wg-".to_string(),
             boot_timeout_secs: 1800,
             virtualize_boot_timeout_secs: 300,
         }
@@ -86,6 +91,16 @@ impl VmConfig {
     /// resolved backend and execution mode (spec.md §3 FR-5's "emulate 부팅
     /// 기본값은 1800초, virtualize는 기존 300초"). Kept in core so both
     /// adapters and every application service agree on one number.
+    /// The display-name prefix VMs of `backend` are created with. Every
+    /// caller that has to name a VM goes through this, so a UTM launch is
+    /// never named from `[vm.tart]`.
+    pub fn vm_prefix(&self, backend: Backend) -> &str {
+        match backend {
+            Backend::Tart => &self.tart.vm_prefix,
+            Backend::Utm => &self.utm.vm_prefix,
+        }
+    }
+
     pub fn boot_timeout(&self, backend: Backend, mode: ExecutionMode) -> Duration {
         let secs = match (backend, mode) {
             // Tart only ever virtualizes (see the support matrix).
@@ -208,6 +223,7 @@ keep_staging = false
     fn utm_section_defaults_and_overrides() {
         let cfg = Config::default();
         assert_eq!(cfg.vm.utm.utmctl, None);
+        assert_eq!(cfg.vm.utm.vm_prefix, "wg-");
         assert_eq!(cfg.vm.utm.boot_timeout_secs, 1800);
         assert_eq!(cfg.vm.utm.virtualize_boot_timeout_secs, 300);
 
@@ -223,6 +239,13 @@ keep_staging = false
         // Untouched fields keep their defaults.
         assert_eq!(cfg.vm.utm.virtualize_boot_timeout_secs, 300);
         assert_eq!(cfg.vm.tart.boot_timeout_secs, 300);
+    }
+
+    #[test]
+    fn vm_prefix_is_per_backend() {
+        let cfg: Config = toml::from_str("[vm.utm]\nvm_prefix = \"wgu-\"\n").unwrap();
+        assert_eq!(cfg.vm.vm_prefix(Backend::Tart), "wg-");
+        assert_eq!(cfg.vm.vm_prefix(Backend::Utm), "wgu-");
     }
 
     #[test]

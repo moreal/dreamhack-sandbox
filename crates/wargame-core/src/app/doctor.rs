@@ -4,6 +4,7 @@
 //! never returns `Err` — a failed check is just a `Check { ok: false, .. }`
 //! row for the CLI/TUI to render.
 
+use crate::domain::{GuestShell, NetworkMode};
 use crate::ports::ImageRef;
 
 use super::AppContext;
@@ -77,34 +78,10 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
             },
         });
 
-        checks.push(match &healthcheck {
-            Ok(status) => match status.isolated_network {
-                Some(true) => Check {
-                    name: "network:isolated".to_string(),
-                    ok: true,
-                    detail: status.detail.clone(),
-                    hint: None,
-                },
-                Some(false) => Check {
-                    name: "network:isolated".to_string(),
-                    ok: false,
-                    detail: status.detail.clone(),
-                    hint: Some(crate::error::isolated_network_hint(None)),
-                },
-                None => Check {
-                    name: "network:isolated".to_string(),
-                    ok: true,
-                    detail: "unknown".to_string(),
-                    hint: None,
-                },
-            },
-            Err(_) => Check {
-                name: "network:isolated".to_string(),
-                ok: true,
-                detail: "unknown".to_string(),
-                hint: None,
-            },
-        });
+        // One row per backend: with two backends wired, a single
+        // `network:isolated` row would silently describe whichever one ran
+        // last.
+        checks.push(isolated_network_check(vm.name(), healthcheck.as_ref().ok()));
     }
 
     checks.push(binary_check(ctx, "ssh", "ssh", Some("Install OpenSSH")));
@@ -224,6 +201,219 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
     checks
 }
 
+/// The `network:isolated:<backend>` row for one backend. `status` is `None`
+/// when the healthcheck itself failed -- the backend row already reports
+/// that, so this one stays neutral instead of double-reporting it.
+fn isolated_network_check(backend: &str, status: Option<&crate::ports::BackendStatus>) -> Check {
+    let name = format!("network:isolated:{backend}");
+    match status.map(|s| (s.isolated_network, s.detail.clone())) {
+        Some((Some(true), detail)) => Check {
+            name,
+            ok: true,
+            detail,
+            hint: None,
+        },
+        Some((Some(false), detail)) => Check {
+            name,
+            ok: false,
+            detail,
+            hint: Some(crate::error::isolated_network_hint(None)),
+        },
+        _ => Check {
+            name,
+            ok: true,
+            detail: "unknown".to_string(),
+            hint: None,
+        },
+    }
+}
+
+/// `doctor --profile <name>`: only the checks *this* profile needs
+/// (spec.md §3 FR-6). A macOS/Tart profile therefore never reports UTM as a
+/// problem, and a UTM profile reports the UTM app, the automation grant and
+/// the emulation mode it actually asked for.
+///
+/// Like [`doctor`], no check aborts the rest; the only `Err` is an unknown
+/// profile name.
+pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
+    let profile = match ctx.profiles.get(name) {
+        Ok(profile) => profile,
+        Err(e) => {
+            return vec![Check {
+                name: format!("profile:{name}"),
+                ok: false,
+                detail: e.to_string(),
+                hint: e.hint(),
+            }]
+        }
+    };
+
+    let mut checks = Vec::new();
+
+    // 1. Resolution. Pure data, so it answers even with nothing installed.
+    let resolved = match crate::app::backends::resolve_backend(&profile) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            checks.push(Check {
+                name: format!("profile:{name}"),
+                ok: false,
+                detail: e.to_string(),
+                hint: e.hint(),
+            });
+            return checks;
+        }
+    };
+    checks.push(Check {
+        name: format!("profile:{name}"),
+        ok: true,
+        detail: resolved.describe(),
+        hint: None,
+    });
+
+    // 2. Is that backend wired into this build at all?
+    let vm = match ctx.backends.get(resolved.backend.as_str()) {
+        Ok(vm) => vm,
+        Err(e) => {
+            checks.push(Check {
+                name: format!("vm-backend:{}", resolved.backend),
+                ok: false,
+                detail: e.to_string(),
+                hint: e.hint(),
+            });
+            return checks;
+        }
+    };
+
+    // 3. The backend binary and version, then whatever else the backend
+    //    itself wants to report (its binary path, the host automation
+    //    grant, ...).
+    let healthcheck = vm.healthcheck().await;
+    checks.push(match &healthcheck {
+        Ok(status) => Check {
+            name: format!("vm-backend:{}", vm.name()),
+            ok: status.available,
+            detail: status
+                .version
+                .clone()
+                .map(|v| format!("{v} ({})", status.detail))
+                .unwrap_or_else(|| status.detail.clone()),
+            hint: if status.available {
+                None
+            } else {
+                Some(format!("Install/start the {} VM backend", vm.name()))
+            },
+        },
+        Err(e) => Check {
+            name: format!("vm-backend:{}", vm.name()),
+            ok: false,
+            detail: e.to_string(),
+            hint: e.hint(),
+        },
+    });
+    for check in vm.diagnostics().await {
+        checks.push(Check {
+            name: check.name,
+            ok: check.ok,
+            detail: check.detail,
+            hint: check.hint,
+        });
+    }
+
+    // 4. Execution mode and network, against what the backend can do.
+    let capabilities = vm.capabilities();
+    let mode_ok = capabilities.supports_mode(resolved.mode);
+    checks.push(Check {
+        name: format!("mode:{}:{}", resolved.mode, vm.name()),
+        ok: mode_ok,
+        detail: if mode_ok {
+            format!("{} supports {}", vm.name(), resolved.mode)
+        } else {
+            format!("{} cannot run {} guests", vm.name(), resolved.mode)
+        },
+        hint: (!mode_ok).then(crate::domain::compat::supported_combinations_table),
+    });
+
+    let network = ctx.config.general.default_network;
+    let network_supported = capabilities.supports_network(network);
+    if !network_supported {
+        checks.push(Check {
+            name: format!("network:{network}:{}", vm.name()),
+            ok: false,
+            detail: format!("{} cannot configure {network} networking", vm.name()),
+            hint: Some("Launch with --network nat, or pick another profile".to_string()),
+        });
+    } else if network == NetworkMode::Isolated {
+        checks.push(isolated_network_check(vm.name(), healthcheck.as_ref().ok()));
+    } else {
+        checks.push(Check {
+            name: format!("network:{network}:{}", vm.name()),
+            ok: true,
+            detail: format!("{} supports {network}", vm.name()),
+            hint: None,
+        });
+    }
+
+    // 5. Is there an image to launch from?
+    let image = ImageRef(profile.image_name());
+    let image_ready = vm.image_exists(&image).await.unwrap_or(false);
+    checks.push(Check {
+        name: format!("profile-image:{name}"),
+        ok: image_ready,
+        detail: if image_ready {
+            format!("{} on {}", image.0, vm.name())
+        } else {
+            format!("{} is not ready on {}", image.0, vm.name())
+        },
+        hint: if image_ready {
+            None
+        } else {
+            Some(format!("wargame profile build {name}"))
+        },
+    });
+
+    // 6. Room for this profile's disk, not the flat 20 GiB floor.
+    checks.push(match crate::infra::disk_free_bytes(&ctx.dirs.root) {
+        Ok(free) => {
+            let free_gib = free as f64 / (1024.0 * 1024.0 * 1024.0);
+            let needed = profile.resources.disk_gib as f64;
+            Check {
+                name: format!("disk-space:{name}"),
+                ok: free_gib >= needed,
+                detail: format!(
+                    "{free_gib:.1} GiB free at {}, profile asks for {needed:.0} GiB",
+                    ctx.dirs.root.display()
+                ),
+                hint: (free_gib < needed).then(|| {
+                    "Free up disk space, or lower resources.disk_gib in the profile".to_string()
+                }),
+            }
+        }
+        Err(e) => Check {
+            name: format!("disk-space:{name}"),
+            ok: false,
+            detail: e.to_string(),
+            hint: None,
+        },
+    });
+
+    // 7. The tools that talk to *this* guest.
+    checks.push(binary_check(ctx, "ssh", "ssh", Some("Install OpenSSH")));
+    checks.push(binary_check(ctx, "scp", "scp", Some("Install OpenSSH")));
+    let shell = GuestShell::for_os(profile.guest.os);
+    let transport = ctx.transports.for_shell(shell);
+    checks.push(Check {
+        name: format!("guest-shell:{shell}"),
+        ok: transport.is_ok(),
+        detail: match &transport {
+            Ok(_) => format!("{shell} transport wired for this guest"),
+            Err(e) => e.to_string(),
+        },
+        hint: transport.err().and_then(|e| e.hint()),
+    });
+
+    checks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,7 +476,7 @@ mod tests {
         let checks = doctor(&ctx).await;
         let check = checks
             .iter()
-            .find(|c| c.name == "network:isolated")
+            .find(|c| c.name == "network:isolated:tart")
             .unwrap();
         assert!(check.ok);
         assert!(check.hint.is_none());
@@ -300,7 +490,7 @@ mod tests {
         let checks = doctor(&ctx).await;
         let check = checks
             .iter()
-            .find(|c| c.name == "network:isolated")
+            .find(|c| c.name == "network:isolated:tart")
             .unwrap();
         assert!(!check.ok);
         assert!(check
@@ -318,7 +508,7 @@ mod tests {
         let checks = doctor(&ctx).await;
         let check = checks
             .iter()
-            .find(|c| c.name == "network:isolated")
+            .find(|c| c.name == "network:isolated:tart")
             .unwrap();
         assert!(check.ok);
         assert_eq!(check.detail, "unknown");
@@ -364,5 +554,185 @@ mod tests {
             .find(|c| c.name == "profile-image:macos-minimal-arm64")
             .unwrap();
         assert!(!profile_check.ok);
+    }
+
+    /// Two wired backends must not collapse into one `network:isolated`
+    /// row: with a shared name the second backend's answer would silently
+    /// overwrite the first's in every reader that looks a row up by name.
+    #[tokio::test]
+    async fn doctor_names_the_isolated_network_row_per_backend() {
+        let tart = Arc::new(FakeVmProvider::new());
+        tart.set_isolated_network(Some(true));
+        let utm = Arc::new(FakeVmProvider::with_backend("utm"));
+        utm.set_isolated_network(Some(false));
+        let mut ctx = fixture();
+        ctx.backends = BackendRegistry::new(vec![
+            tart as Arc<dyn VmProvider>,
+            utm as Arc<dyn VmProvider>,
+        ]);
+
+        let checks = doctor(&ctx).await;
+        let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"network:isolated:tart"), "{names:?}");
+        assert!(names.contains(&"network:isolated:utm"), "{names:?}");
+        assert!(
+            checks
+                .iter()
+                .find(|c| c.name == "network:isolated:tart")
+                .unwrap()
+                .ok
+        );
+        assert!(
+            !checks
+                .iter()
+                .find(|c| c.name == "network:isolated:utm")
+                .unwrap()
+                .ok
+        );
+        // Every row name is unique, so a reader can look one up by name.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "duplicate rows in {names:?}");
+    }
+
+    fn utm_profile() -> crate::domain::Profile {
+        use crate::domain::{
+            BackendChoice, ExecutionMode, GuestArch, GuestOs, GuestSpec, ImageSpec, Profile,
+            Resources, VmSettings, WorkspaceSpec,
+        };
+        Profile {
+            name: "kali-x86_64".to_string(),
+            description: String::new(),
+            vm: VmSettings {
+                backend: BackendChoice::Utm,
+                mode: ExecutionMode::Emulate,
+            },
+            guest: GuestSpec {
+                os: GuestOs::Linux,
+                arch: GuestArch::X86_64,
+                distribution: Some("kali".to_string()),
+                user: "kali".to_string(),
+                password: None,
+            },
+            image: ImageSpec {
+                base: String::new(),
+            },
+            resources: Resources {
+                cpu: 4,
+                memory_mib: 8192,
+                disk_gib: 80,
+            },
+            provision: Default::default(),
+            tools: Default::default(),
+            workspace: WorkspaceSpec {
+                root: "/home/kali/wargame".to_string(),
+            },
+        }
+    }
+
+    /// A Tart/macOS profile must never be told to install UTM (spec.md §3
+    /// FR-6: "Tart macOS 실행에 UTM 설치를 요구하지 않는다").
+    #[tokio::test]
+    async fn doctor_profile_checks_only_the_backend_the_profile_resolves_to() {
+        use crate::domain::{
+            GuestArch, GuestOs, GuestSpec, ImageSpec, Profile, Resources, VmSettings, WorkspaceSpec,
+        };
+        let mut ctx = fixture();
+        ctx.profiles = ProfileStore::new(
+            vec![Profile {
+                name: "macos-minimal-arm64".to_string(),
+                description: String::new(),
+                vm: VmSettings::default(),
+                guest: GuestSpec {
+                    os: GuestOs::Macos,
+                    arch: GuestArch::Arm64,
+                    distribution: None,
+                    user: "admin".to_string(),
+                    password: None,
+                },
+                image: ImageSpec {
+                    base: "base".to_string(),
+                },
+                resources: Resources {
+                    cpu: 2,
+                    memory_mib: 4096,
+                    disk_gib: 20,
+                },
+                provision: Default::default(),
+                tools: Default::default(),
+                workspace: WorkspaceSpec {
+                    root: "/Users/admin/wargame".to_string(),
+                },
+            }],
+            tmp_path(),
+        );
+
+        let checks = doctor_profile(&ctx, "macos-minimal-arm64").await;
+        let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"vm-backend:tart"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains("utm")),
+            "a macOS/Tart profile must not check UTM: {names:?}"
+        );
+        assert!(names.contains(&"profile:macos-minimal-arm64"), "{names:?}");
+        assert!(
+            names.contains(&"disk-space:macos-minimal-arm64"),
+            "{names:?}"
+        );
+        assert!(names.contains(&"guest-shell:posix"), "{names:?}");
+    }
+
+    /// The UTM profile's rows come from the UTM backend, including whatever
+    /// backend-specific diagnostics it reports.
+    #[tokio::test]
+    async fn doctor_profile_reports_the_utm_backend_and_its_diagnostics() {
+        let utm = Arc::new(FakeVmProvider::with_backend("utm"));
+        utm.set_capabilities(crate::domain::ProviderCapabilities {
+            guest_os: vec![crate::domain::GuestOs::Linux],
+            guest_arch: vec![crate::domain::GuestArch::X86_64],
+            modes: vec![crate::domain::ExecutionMode::Emulate],
+            networks: vec![NetworkMode::Isolated, NetworkMode::Nat],
+            graphical_console: true,
+            ssh: true,
+            snapshots: false,
+            copy_in: true,
+            remote: false,
+        });
+        let mut ctx = fixture();
+        ctx.backends = BackendRegistry::new(vec![utm as Arc<dyn VmProvider>]);
+        ctx.profiles = ProfileStore::new(vec![utm_profile()], tmp_path());
+
+        let checks = doctor_profile(&ctx, "kali-x86_64").await;
+        let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"vm-backend:utm"), "{names:?}");
+        assert!(names.contains(&"mode:emulate:utm"), "{names:?}");
+        assert!(names.contains(&"network:isolated:utm"), "{names:?}");
+        assert!(names.contains(&"profile-image:kali-x86_64"), "{names:?}");
+        assert!(!names.contains(&"vm-backend:tart"), "{names:?}");
+    }
+
+    /// A profile whose backend this build has no adapter for is reported as
+    /// exactly that, not as a missing image or a failed healthcheck.
+    #[tokio::test]
+    async fn doctor_profile_names_an_unwired_backend() {
+        let mut ctx = fixture();
+        ctx.profiles = ProfileStore::new(vec![utm_profile()], tmp_path());
+        let checks = doctor_profile(&ctx, "kali-x86_64").await;
+        let backend_row = checks
+            .iter()
+            .find(|c| c.name == "vm-backend:utm")
+            .expect("the unwired backend is reported");
+        assert!(!backend_row.ok);
+        assert!(backend_row.detail.contains("utm"), "{backend_row:?}");
+    }
+
+    #[tokio::test]
+    async fn doctor_profile_reports_an_unknown_profile_instead_of_erroring() {
+        let ctx = fixture();
+        let checks = doctor_profile(&ctx, "nope").await;
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].ok);
+        assert_eq!(checks[0].name, "profile:nope");
     }
 }

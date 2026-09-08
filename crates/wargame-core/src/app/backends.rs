@@ -115,7 +115,14 @@ impl TransportRegistry {
 
     /// The transport that can speak `endpoint`'s shell.
     pub fn for_endpoint(&self, endpoint: &GuestEndpoint) -> Result<Arc<dyn GuestTransport>> {
-        match endpoint.shell {
+        self.for_shell(endpoint.shell)
+    }
+
+    /// The transport for a shell, with no address yet -- what `launch`
+    /// preflight uses to refuse a guest it could never talk to *before*
+    /// creating or starting anything (spec.md §3 FR-4).
+    pub fn for_shell(&self, shell: GuestShell) -> Result<Arc<dyn GuestTransport>> {
+        match shell {
             GuestShell::Posix => Ok(self.posix.clone()),
             GuestShell::PowerShell => self.powershell.clone().ok_or_else(|| {
                 WargameError::Other(
@@ -151,12 +158,7 @@ pub fn provider_for_profile(
 /// two sessions whose VMs share a name on different backends can never be
 /// confused (spec.md §3 FR-5).
 pub fn provider_for_session(ctx: &AppContext, session: &Session) -> Result<Arc<dyn VmProvider>> {
-    let backend = session
-        .vm_ref
-        .as_ref()
-        .map(|vm| vm.backend.as_str())
-        .unwrap_or(session.vm_provider.as_str());
-    ctx.backends.get(backend)
+    ctx.backends.get(session.backend_name())
 }
 
 /// The endpoint and transport for talking to `session`'s guest, built from

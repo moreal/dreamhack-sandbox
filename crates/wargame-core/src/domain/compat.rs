@@ -118,6 +118,22 @@ pub struct ResolvedBackend {
     pub distribution: Option<String>,
 }
 
+impl ResolvedBackend {
+    /// One line naming everything a resolution decided, in the same
+    /// vocabulary as [`supported_combinations_table`] so the two can be
+    /// compared by eye (spec.md §3 FR-1's "profiles 및 TUI 선택 화면에
+    /// OS/arch/backend/mode ... 표시").
+    pub fn describe(&self) -> String {
+        format!(
+            "backend {} / mode {} / {}/{}",
+            self.backend,
+            self.mode,
+            guest_label(self.os, self.distribution.as_deref()),
+            arch_label(self.arch),
+        )
+    }
+}
+
 impl Default for ResolvedBackend {
     /// The combination every pre-multi-OS profile and session means:
     /// Tart, macOS, arm64, virtualize.

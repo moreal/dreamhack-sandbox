@@ -9,8 +9,8 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
 
 use crate::domain::{
-    Challenge, ChallengeRef, GuestConnection, GuestEndpoint, KeepPolicy, NetworkMode, Profile,
-    ResolvedBackend, Resources, Session, SessionAsset, SessionState,
+    Challenge, ChallengeRef, GuestConnection, GuestEndpoint, GuestShell, KeepPolicy, NetworkMode,
+    Profile, ResolvedBackend, Resources, Session, SessionAsset, SessionState,
 };
 use crate::error::{Result, WargameError};
 use crate::ports::{
@@ -135,6 +135,12 @@ pub async fn launch(
             req.network,
         )));
     }
+
+    // A guest whose shell has no wired transport can never be provisioned,
+    // so refuse it here rather than after a VM has been created and booted
+    // (spec.md §3 FR-4; §6's "VM/세션 생성 전 실패").
+    ctx.transports
+        .for_shell(GuestShell::for_os(profile.guest.os))?;
 
     emit(
         &events,
@@ -297,7 +303,13 @@ async fn run_launch(
         .vm
         .boot_timeout(execution.backend, execution.mode);
     let vm_spec = VmSpec {
-        name: format!("{}{}", ctx.config.vm.tart.vm_prefix, session.id),
+        // The prefix belongs to the backend the profile resolved to, so a
+        // UTM VM is never named from `[vm.tart]` (spec.md §3 FR-5).
+        name: format!(
+            "{}{}",
+            ctx.config.vm.vm_prefix(execution.backend),
+            session.id
+        ),
         image: ImageRef(profile.image_name()),
         resources: session.resources,
         execution: execution.clone(),

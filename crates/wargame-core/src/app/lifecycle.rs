@@ -17,8 +17,10 @@ use super::AppContext;
 /// it was created with -- not from the profile, which may have changed
 /// (spec.md §3 FR-5).
 fn boot_timeout(ctx: &AppContext, session: &Session) -> Result<std::time::Duration> {
-    let backend = session.vm_provider.parse()?;
-    Ok(ctx.config.vm.boot_timeout(backend, session.vm_mode))
+    Ok(ctx
+        .config
+        .vm
+        .boot_timeout(session.backend()?, session.vm_mode))
 }
 
 pub async fn list_sessions(ctx: &AppContext) -> Result<Vec<Session>> {
@@ -103,8 +105,17 @@ pub async fn reconcile(ctx: &AppContext, mut session: Session) -> Result<Session
     // A backend this build has no adapter for is treated like one that
     // cannot answer: the record is left exactly as it is rather than
     // failing every `wargame sessions` that happens to include it.
-    let Ok(vm) = provider_for_session(ctx, &session) else {
-        return Ok(session);
+    let vm = match provider_for_session(ctx, &session) {
+        Ok(vm) => vm,
+        Err(e) => {
+            tracing::debug!(
+                session = %session.id,
+                backend = %session.backend_name(),
+                error = %e,
+                "no adapter for this session's backend; leaving the record untouched"
+            );
+            return Ok(session);
+        }
     };
     let vm_ref = vm_ref.clone();
     if vm.status(&vm_ref).await? != VmStatus::Stopped {
@@ -763,5 +774,76 @@ mod tests {
         let orphans = prune(&ctx, false).await.unwrap();
         assert_eq!(orphans, vec!["tart/wg-orphan".to_string()]);
         assert_eq!(vm.vm_names(), vec!["wg-tracked".to_string()]);
+    }
+
+    /// Ownership is `(backend, id)`, not the display name: with the same VM
+    /// name registered on two backends, only the one with no session record
+    /// is an orphan (spec.md §3 FR-5's "다른 백엔드의 같은 VM 이름을
+    /// 혼동하지 않는다").
+    #[tokio::test]
+    async fn prune_keys_orphans_on_backend_and_id_not_on_the_name() {
+        let Fixture { mut ctx, vm, .. } = fixture();
+        let utm = Arc::new(FakeVmProvider::with_backend("utm"));
+        ctx.backends = BackendRegistry::new(vec![
+            vm.clone() as Arc<dyn VmProvider>,
+            utm.clone() as Arc<dyn VmProvider>,
+        ]);
+        let spec = || {
+            VmSpec::new(
+                "wg-same-name".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
+                    cpu: 1,
+                    memory_mib: 1024,
+                    disk_gib: 10,
+                },
+            )
+        };
+        vm.create(&spec()).await.unwrap();
+        let utm_ref = utm.create(&spec()).await.unwrap();
+
+        // Only the UTM VM is recorded by a session.
+        let mut session = sample_session("tracked", SessionState::Ready, KeepPolicy::Discard);
+        session.vm_provider = "utm".to_string();
+        session.vm_ref = Some(utm_ref);
+        ctx.repo.save(&session).await.unwrap();
+
+        let orphans = prune(&ctx, false).await.unwrap();
+        assert_eq!(orphans, vec!["tart/wg-same-name".to_string()]);
+        assert!(vm.vm_names().is_empty());
+        assert_eq!(utm.vm_names(), vec!["wg-same-name".to_string()]);
+    }
+
+    /// A session's backend comes from the VM ref it actually created on,
+    /// even when the (older, coarser) `vm_provider` field disagrees.
+    #[tokio::test]
+    async fn session_operations_route_on_the_vm_refs_backend() {
+        let Fixture { mut ctx, vm, .. } = fixture();
+        let utm = Arc::new(FakeVmProvider::with_backend("utm"));
+        ctx.backends = BackendRegistry::new(vec![
+            vm.clone() as Arc<dyn VmProvider>,
+            utm.clone() as Arc<dyn VmProvider>,
+        ]);
+        let utm_ref = utm
+            .create(&VmSpec::new(
+                "wg-u".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
+                    cpu: 1,
+                    memory_mib: 1024,
+                    disk_gib: 10,
+                },
+            ))
+            .await
+            .unwrap();
+        let mut session = sample_session("s", SessionState::Ready, KeepPolicy::Discard);
+        session.vm_provider = "tart".to_string();
+        session.vm_ref = Some(utm_ref.clone());
+        assert_eq!(session.backend_name(), "utm");
+        ctx.repo.save(&session).await.unwrap();
+
+        delete(&ctx, "s", false).await.unwrap();
+        assert!(utm.vm_names().is_empty(), "the UTM VM should be deleted");
+        assert!(vm.calls().iter().all(|c| c != "delete"));
     }
 }
