@@ -113,7 +113,7 @@ fn extract_false_leaves_the_zip_untouched() {
 }
 
 #[test]
-fn extract_true_unpacks_and_blocks_zip_slip() {
+fn extract_true_unpacks_a_safe_zip() {
     if !(have("bash") && have("zip") && have("unzip")) {
         eprintln!("skipping: bash/zip/unzip not on PATH");
         return;
@@ -121,7 +121,35 @@ fn extract_true_unpacks_and_blocks_zip_slip() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("workspace");
     std::fs::create_dir_all(ws.join("incoming")).unwrap();
-    zip_with_slip(&ws.join("incoming"), "challenge.zip");
+    zip_simple(&ws.join("incoming"), "challenge.zip");
+
+    let out = run_bootstrap(&ws, true);
+    assert!(
+        out.status.success(),
+        "bootstrap.sh failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(ws
+        .join("incoming")
+        .join("extracted")
+        .join("challenge")
+        .join("hello.txt")
+        .is_file());
+}
+
+/// spec.md §7 AC-11: one unsafe entry refuses the *whole* archive. The
+/// original stays in `incoming/`, nothing is unpacked at all, and nothing
+/// lands outside the workspace.
+#[test]
+fn extract_true_refuses_a_zip_slip_archive_whole() {
+    if !(have("bash") && have("zip") && have("unzip")) {
+        eprintln!("skipping: bash/zip/unzip not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    std::fs::create_dir_all(ws.join("incoming")).unwrap();
+    let archive = zip_with_slip(&ws.join("incoming"), "challenge.zip");
 
     let out = run_bootstrap(&ws, true);
     assert!(
@@ -130,10 +158,15 @@ fn extract_true_unpacks_and_blocks_zip_slip() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let extracted_dir = ws.join("incoming").join("extracted").join("challenge");
+    assert!(archive.is_file(), "the original archive must be kept");
     assert!(
-        extracted_dir.join("hello.txt").is_file(),
-        "the legitimate entry must be extracted"
+        !ws.join("incoming").join("extracted").exists(),
+        "a refused archive must leave no partially unpacked tree"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("challenge.zip"),
+        "the refusal must name the archive: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
     // The zip-slip entry must never land outside the workspace tree: not

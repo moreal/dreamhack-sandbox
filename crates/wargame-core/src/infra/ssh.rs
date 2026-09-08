@@ -4,6 +4,14 @@
 //! no shell strings, and the same hardened options every time (host key
 //! checking off, since guests are disposable; short connect timeout; batch
 //! mode so a stuck credential prompt cannot hang the CLI).
+//!
+//! One transport serves every guest: the [`GuestEndpoint`]'s
+//! [`GuestShell`] decides how a command is phrased on the wire
+//! (spec.md §3 FR-4). A POSIX endpoint produces exactly the argv the
+//! pre-multi-OS transport produced — the macOS path `docs/verification.md`
+//! records as working against a real VM — and a PowerShell endpoint gets a
+//! base64 `-EncodedCommand` instead, so no POSIX quoting ever reaches a
+//! Windows guest.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
@@ -12,17 +20,53 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use crate::domain::session::DEFAULT_GUEST_PORT;
+use crate::domain::session::{GuestShell, DEFAULT_GUEST_PORT};
 use crate::error::{Result, WargameError};
-use crate::infra::process::{Cmd, ProcessRunner};
+use crate::infra::powershell::PowerShellCommand;
+use crate::infra::process::{Cmd, Output, ProcessRunner};
 use crate::ports::guest_transport::{ExecResult, GuestEndpoint, GuestTransport};
 
 const WAIT_READY_POLL: Duration = Duration::from_secs(3);
 
-/// The POSIX-guest SSH transport. The user, port and key come from the
-/// [`GuestEndpoint`] the caller passes -- the profile's `guest.user` at
+/// Which guest-side service a readiness probe found missing (spec.md §6's
+/// "SSH/guest agent 미준비: 필요한 서비스를 구분하고 단계·timeout 표시").
+///
+/// The guest *agent* is not in this list on purpose: [`GuestTransport::wait_ready`]
+/// only runs once an address is known, and on UTM that address comes from
+/// the QEMU guest agent itself, so by then the agent has answered. A guest
+/// that never reports an address fails earlier, with
+/// [`WargameError::GuestAddressTimeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestService {
+    /// Nothing accepted a TCP/SSH connection at all.
+    Ssh,
+    /// SSH answered but refused the key.
+    Authentication,
+    /// SSH authenticated, but the guest could not run the command — a
+    /// Windows guest whose default SSH shell is not PowerShell, say.
+    Shell,
+}
+
+impl GuestService {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GuestService::Ssh => "SSH",
+            GuestService::Authentication => "SSH authentication",
+            GuestService::Shell => "the guest shell",
+        }
+    }
+}
+
+impl std::fmt::Display for GuestService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The SSH transport. The user, port, key and shell come from the
+/// [`GuestEndpoint`] the caller passes -- the profile's `guest.user`/OS at
 /// launch, the session's saved connection afterwards -- so nothing here
-/// assumes one host-wide guest account (spec.md §3 FR-4).
+/// assumes one host-wide guest account or one guest OS (spec.md §3 FR-4).
 ///
 /// `default_key_path` is only the fallback for an endpoint that names no
 /// key of its own (the host's `$WARGAME_HOME/keys/id_ed25519`).
@@ -72,25 +116,142 @@ impl SshGuestTransport {
     fn target(&self, endpoint: &GuestEndpoint) -> String {
         format!("{}@{}", endpoint.user, endpoint.host)
     }
+
+    /// The remote command for `argv`, i.e. everything after `user@host`.
+    ///
+    /// POSIX: unchanged from the pre-multi-OS transport -- `--` and one
+    /// single-quoted command string for the guest's login shell.
+    /// PowerShell: `powershell -NoProfile -NonInteractive -EncodedCommand
+    /// <base64>`, so quoting, spaces, Korean text and newlines never pass
+    /// through a shell's word splitting at all.
+    fn remote_command(&self, endpoint: &GuestEndpoint, argv: &[String]) -> Vec<String> {
+        match endpoint.shell {
+            GuestShell::Posix => {
+                let joined = argv
+                    .iter()
+                    .map(|a| shell_quote(a))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                vec!["--".to_string(), joined]
+            }
+            GuestShell::PowerShell => PowerShellCommand::from_argv(argv).remote_argv(),
+        }
+    }
+
+    /// The command that answers "is the guest ready?" in its own shell.
+    fn readiness_probe(&self, endpoint: &GuestEndpoint) -> Vec<String> {
+        match endpoint.shell {
+            // Byte-identical to the pre-multi-OS probe.
+            GuestShell::Posix => vec!["true".to_string()],
+            GuestShell::PowerShell => PowerShellCommand::from_script("exit 0").remote_argv(),
+        }
+    }
+
+    /// Classifies one failed readiness probe. `ssh` reports every failure of
+    /// its own with status 255, so the distinction between "nothing is
+    /// listening" and "the key was refused" is in stderr; any other status
+    /// came from the guest, which means SSH itself worked and the *shell*
+    /// did not.
+    fn classify(outcome: &std::result::Result<Output, String>) -> (GuestService, String) {
+        match outcome {
+            Err(error) => (GuestService::Ssh, error.clone()),
+            Ok(out) => {
+                let stderr = out.stderr.trim().to_string();
+                let lowered = stderr.to_ascii_lowercase();
+                if out.status == 255 {
+                    if lowered.contains("permission denied")
+                        || lowered.contains("authentication")
+                        || lowered.contains("publickey")
+                    {
+                        (GuestService::Authentication, stderr)
+                    } else {
+                        (GuestService::Ssh, stderr)
+                    }
+                } else {
+                    let detail = if stderr.is_empty() {
+                        format!("the probe exited with status {}", out.status)
+                    } else {
+                        stderr
+                    };
+                    (GuestService::Shell, detail)
+                }
+            }
+        }
+    }
+
+    fn not_ready(
+        endpoint: &GuestEndpoint,
+        service: GuestService,
+        detail: &str,
+        elapsed: Duration,
+        timeout: Duration,
+    ) -> WargameError {
+        let detail = format!(
+            "{} is not ready on {endpoint} after {:.1} s (timeout {} s): {}",
+            service,
+            elapsed.as_secs_f64(),
+            timeout.as_secs(),
+            if detail.is_empty() {
+                "the guest gave no reason".to_string()
+            } else {
+                detail.to_string()
+            },
+        );
+        let prepare = match (service, endpoint.shell) {
+            (GuestService::Authentication, _) => format!(
+                "Append the host's public key ($WARGAME_HOME/keys/id_ed25519.pub) to {}'s authorized_keys in the guest.",
+                endpoint.user
+            ),
+            (_, GuestShell::PowerShell) =>
+                "In the guest: install OpenSSH Server (Settings > Optional features), start the sshd service, make PowerShell its default SSH shell (`New-ItemProperty -Path 'HKLM:\\SOFTWARE\\OpenSSH' -Name DefaultShell -Value 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'`), and install the UTM guest tools so the address stays discoverable.".to_string(),
+            (_, GuestShell::Posix) => format!(
+                "In the guest: make sure the SSH server is running, the user {:?} exists, and (on UTM) `qemu-guest-agent` is installed so the address stays discoverable.",
+                endpoint.user
+            ),
+        };
+        WargameError::GuestNotReady {
+            service: service.as_str().to_string(),
+            detail,
+            hint: format!(
+                "{prepare}\nOpen a console with `wargame gui <session>` (or `wargame profile console <profile>`) to fix it, then retry.\nRaise the wait with `[vm.utm] boot_timeout_secs` (emulate) / `virtualize_boot_timeout_secs`, or `[vm.tart] boot_timeout_secs`, in $WARGAME_HOME/config.toml."
+            ),
+        }
+    }
 }
 
 #[async_trait]
 impl GuestTransport for SshGuestTransport {
     async fn wait_ready(&self, endpoint: &GuestEndpoint, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let probe = self.readiness_probe(endpoint);
         loop {
             let mut args = self.base_args(endpoint, "-p");
             args.push(self.target(endpoint));
-            args.push("true".to_string());
+            args.extend(probe.iter().cloned());
             let cmd = Cmd::new("ssh", args);
-            if let Ok(out) = self.runner.run(&cmd).await {
+            let outcome = self
+                .runner
+                .run(&cmd)
+                .await
+                .map_err(|e: WargameError| e.to_string());
+            if let Ok(out) = &outcome {
                 if out.status == 0 {
                     return Ok(());
                 }
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(WargameError::GuestBootTimeout(timeout));
+                // A missing service is never success: report which one, how
+                // long we waited and the timeout that was used.
+                let (service, detail) = Self::classify(&outcome);
+                return Err(Self::not_ready(
+                    endpoint,
+                    service,
+                    &detail,
+                    now - started,
+                    timeout,
+                ));
             }
             tokio::time::sleep((deadline - now).min(WAIT_READY_POLL)).await;
         }
@@ -99,13 +260,7 @@ impl GuestTransport for SshGuestTransport {
     async fn exec(&self, endpoint: &GuestEndpoint, argv: &[String]) -> Result<ExecResult> {
         let mut args = self.base_args(endpoint, "-p");
         args.push(self.target(endpoint));
-        args.push("--".to_string());
-        let remote_command = argv
-            .iter()
-            .map(|a| shell_quote(a))
-            .collect::<Vec<_>>()
-            .join(" ");
-        args.push(remote_command);
+        args.extend(self.remote_command(endpoint, argv));
 
         let cmd = Cmd::new("ssh", args);
         let out = self.runner.run(&cmd).await?;
@@ -118,6 +273,14 @@ impl GuestTransport for SshGuestTransport {
 
     async fn copy_in(&self, endpoint: &GuestEndpoint, src: &Path, dest: &str) -> Result<()> {
         // `scp` spells the port `-P`, not `-p` (which means "preserve times").
+        //
+        // `dest` is passed exactly as the guest will see it, with no quoting
+        // of its own: modern `scp` speaks the SFTP protocol (the default
+        // since OpenSSH 9.0; `-O` would opt back into the legacy protocol,
+        // and is deliberately never passed), so the remote path is
+        // transferred as data and no guest shell ever re-parses it. That is
+        // what lets a Windows destination keep its drive letter,
+        // backslashes, spaces, quotes and Korean characters.
         let mut args = self.base_args(endpoint, "-P");
         args.push("-r".to_string());
         args.push(src.display().to_string());
@@ -138,6 +301,13 @@ impl GuestTransport for SshGuestTransport {
             cmd.arg(arg);
         }
         cmd.arg(self.target(endpoint));
+        // A Windows guest's default SSH shell may well be `cmd.exe`; `wargame
+        // ssh` into a Windows session must still land in PowerShell
+        // (spec.md §3 FR-4).
+        if endpoint.shell == GuestShell::PowerShell {
+            cmd.arg("powershell");
+            cmd.arg("-NoLogo");
+        }
         cmd
     }
 }
@@ -145,8 +315,9 @@ impl GuestTransport for SshGuestTransport {
 /// POSIX single-quote escaping: wraps `s` in single quotes, replacing any
 /// embedded `'` with `'\''` (close quote, escaped literal quote, reopen
 /// quote). Only correct for [`crate::domain::GuestShell::Posix`] endpoints;
-/// a PowerShell guest needs its own transport (spec.md §3 FR-4), which
-/// [`crate::app::backends::TransportRegistry`] selects instead of this one.
+/// a PowerShell guest is quoted by [`crate::infra::powershell::quote`]
+/// instead (spec.md §3 FR-4: "Unix shell quoting을 Windows에 재사용하지
+/// 않는다").
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -293,6 +464,7 @@ mod tests {
             .wait_ready(&endpoint("admin"), Duration::from_millis(1))
             .await
             .unwrap_err();
-        assert!(matches!(err, WargameError::GuestBootTimeout(_)));
+        assert!(matches!(err, WargameError::GuestNotReady { .. }));
+        assert!(err.to_string().contains("SSH"), "{err}");
     }
 }

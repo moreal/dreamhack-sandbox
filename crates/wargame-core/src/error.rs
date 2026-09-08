@@ -46,6 +46,16 @@ pub enum WargameError {
     VmCreationFailed(String),
     #[error("guest boot timed out after {0:?}")]
     GuestBootTimeout(std::time::Duration),
+    /// A guest whose address is known, but whose SSH, key authentication or
+    /// shell never answered. `service` names which one is missing, so a
+    /// half-installed guest is never reported as ready (spec.md §6's
+    /// "SSH/guest agent 미준비: 필요한 서비스를 구분하고 단계·timeout 표시").
+    #[error("{detail}")]
+    GuestNotReady {
+        service: String,
+        detail: String,
+        hint: String,
+    },
     #[error("guest bootstrap failed: {0}")]
     GuestBootstrapFailed(String),
     #[error("copy into guest failed: {0}")]
@@ -156,6 +166,7 @@ impl WargameError {
                 "A backend process wargame did not start is still holding this VM. Check it, then clear it yourself:\n  ps -o pid,ppid,command -p {pid}\n  kill -9 {pid}\nwargame never signals a process it did not spawn."
             )),
             WargameError::GuestAddressTimeout { hint, .. } => Some(hint.clone()),
+            WargameError::GuestNotReady { hint, .. } => Some(hint.clone()),
             WargameError::ProfileNotFound(_) => Some("wargame profiles".to_string()),
             WargameError::SessionNotFound(_) => Some("wargame sessions".to_string()),
             WargameError::AmbiguousSession { .. } => {
