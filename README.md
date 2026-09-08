@@ -154,7 +154,8 @@ ISO and its licence.
 Windows guests are driven through PowerShell rather than a POSIX shell:
 `profile build` copies `profiles/scripts/windows/*.ps1` into the guest and
 runs each one with `powershell -File`, a script that exits 3010 makes the
-build wait for the reboot and carry on, `tools.verify` runs the same way,
+build wait for the reboot and carry on (even though `ssh` itself can only
+report the low byte of an exit code), `tools.verify` runs the same way,
 and `wargame ssh <session>` lands you in PowerShell. Commands cross the wire
 as `-EncodedCommand` (UTF-16LE + base64), so Windows paths, spaces, quotes
 and Korean characters survive intact; files go over `scp`'s SFTP protocol

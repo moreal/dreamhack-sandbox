@@ -340,6 +340,28 @@ impl GuestTransport for RebootingTransport {
         })
     }
 
+    async fn exec_script(
+        &self,
+        _endpoint: &GuestEndpoint,
+        script: &str,
+    ) -> Result<wargame_core::ports::ExecResult> {
+        self.execs.lock().unwrap().push(vec![script.to_string()]);
+        if script.contains("wargame-ready") {
+            let mut down = self.down_for.lock().unwrap();
+            if *down > 0 {
+                *down -= 1;
+                return Err(WargameError::NetworkUnavailable(
+                    "ssh: connect to host 10.0.0.9 port 22: Connection refused".to_string(),
+                ));
+            }
+        }
+        Ok(wargame_core::ports::ExecResult {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
     async fn copy_in(&self, _endpoint: &GuestEndpoint, _src: &Path, _dest: &str) -> Result<()> {
         Ok(())
     }
@@ -1189,29 +1211,52 @@ async fn a_windows_build_provisions_through_powershell() {
         .expect("a Windows profile provisions");
     assert_eq!(record.phase, BuildPhase::Ready);
 
-    let argvs: Vec<Vec<String>> = f
-        .utm
-        .transport
-        .calls()
-        .into_iter()
-        .filter_map(|call| match call {
+    let mut argvs: Vec<Vec<String>> = Vec::new();
+    let mut scripts: Vec<String> = Vec::new();
+    for call in f.utm.transport.calls() {
+        match call {
             TransportCall::Exec { endpoint, argv } => {
                 assert_eq!(
                     endpoint.shell,
                     GuestShell::PowerShell,
                     "a Windows guest is reached as a PowerShell endpoint"
                 );
-                Some(argv)
+                argvs.push(argv);
             }
-            _ => None,
-        })
-        .collect();
+            TransportCall::ExecScript { endpoint, script } => {
+                assert_eq!(endpoint.shell, GuestShell::PowerShell);
+                scripts.push(script);
+            }
+            TransportCall::WaitReady { .. } | TransportCall::CopyIn { .. } => {}
+        }
+    }
 
     let flat: Vec<String> = argvs.iter().flatten().cloned().collect();
+    // Cmdlets arrive as trusted scripts, with their parameter names bare and
+    // only their data quoted -- PowerShell binds a parameter from nothing
+    // else.
     assert!(
-        flat.iter().any(|a| a == "New-Item"),
-        "the workspace is made with New-Item, not mkdir: {argvs:?}"
+        scripts
+            .iter()
+            .any(|s| s == "New-Item -ItemType Directory -Force -Path 'wg-provision' | Out-Null"),
+        "the provisioning directory is made with New-Item, not mkdir: {scripts:?}"
     );
+    assert!(
+        scripts
+            .iter()
+            .any(|s| s.starts_with("Remove-Item -Recurse -Force")),
+        "the cleanup uses Remove-Item, not rm: {scripts:?}"
+    );
+    assert!(
+        scripts.iter().any(|s| s.starts_with("Write-VolumeCache")),
+        "the flush uses Write-VolumeCache, not sync: {scripts:?}"
+    );
+    for script in &scripts {
+        assert!(
+            !script.contains("'-"),
+            "a quoted parameter name would bind positionally: {script:?}"
+        );
+    }
     assert!(
         !flat
             .iter()
@@ -1379,6 +1424,89 @@ async fn a_script_that_asks_for_a_reboot_waits_for_the_guest_and_continues() {
             .any(|argv| argv == &["python3".to_string(), "--version".to_string()]),
         "{execs:?}"
     );
+}
+
+/// The Windows half of the same requirement, end to end through the *real*
+/// transport: the guest's provisioning script exits 3010, `ssh` can only
+/// exit with the low byte of that (194), and the build must still see 3010,
+/// wait for the guest and carry on.
+#[tokio::test]
+async fn a_windows_script_that_asks_for_a_reboot_survives_sshs_8_bit_exit_status() {
+    use wargame_core::infra::{powershell, SshGuestTransport};
+
+    let f = fixture();
+    let runner = Arc::new(FakeRunner::new());
+    let rebooted = Arc::new(Mutex::new(false));
+    let probes = Arc::new(Mutex::new(0usize));
+    let seen = probes.clone();
+    let done = rebooted.clone();
+    runner.set_responder(move |cmd| {
+        // The remote command is always the last argv element: base64 of the
+        // wrapper script the transport built.
+        let script = cmd
+            .args
+            .last()
+            .and_then(|last| powershell::decode_command(last))
+            .unwrap_or_default();
+
+        if script.contains("common.ps1") {
+            // The installer asks for a reboot. powershell.exe exits 3010,
+            // which `ssh` truncates to 194 -- so the wrapper reports the
+            // true code on its marker line and exits 255 instead.
+            return Ok(wargame_core::infra::Output {
+                status: 255,
+                stdout: String::new(),
+                stderr: format!(
+                    "a component needs a restart\n{}3010\n",
+                    powershell::EXIT_CODE_MARKER
+                ),
+            });
+        }
+        if script.contains("wargame-ready") {
+            // The "is the guest still up?" probe: down once, then back.
+            let mut count = seen.lock().unwrap();
+            *count += 1;
+            if !*done.lock().unwrap() {
+                *done.lock().unwrap() = true;
+                return Ok(wargame_core::infra::Output {
+                    status: 255,
+                    stdout: String::new(),
+                    stderr: "ssh: connect to host 10.0.0.9 port 22: Connection refused".to_string(),
+                });
+            }
+        }
+        Ok(wargame_core::infra::Output {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    });
+    let transport = Arc::new(SshGuestTransport::new(
+        runner.clone(),
+        PathBuf::from("/keys/id_ed25519"),
+    ));
+    f.utm.set_transport(transport as Arc<dyn GuestTransport>);
+    profile_build::create(&f.ctx, "windows-x86_64", iso_source(&f.iso))
+        .await
+        .unwrap();
+
+    let mut messages = Vec::new();
+    let record = profile_build::build(&f.ctx, "windows-x86_64", &mut |m| messages.push(m))
+        .await
+        .expect("a reboot-required script is not a build failure");
+
+    assert_eq!(record.phase, BuildPhase::Ready);
+    let printed = messages.join("\n");
+    assert!(
+        printed.contains("reboot"),
+        "the build must report the reboot it waited for: {printed}"
+    );
+    assert!(
+        *probes.lock().unwrap() > 0,
+        "the build must probe the guest while it is down"
+    );
+    // Nothing downstream ever saw the marker line.
+    assert!(!printed.contains(powershell::EXIT_CODE_MARKER), "{printed}");
 }
 
 /// A backend whose image id is stable across builds -- Tart's image *is*

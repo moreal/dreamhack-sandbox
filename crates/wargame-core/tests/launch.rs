@@ -200,6 +200,10 @@ async fn a_posix_launch_bootstraps_the_way_it_always_did() {
     assert!(bootstrap[1].ends_with("/.wg/bootstrap.sh"), "{bootstrap:?}");
     assert_eq!(bootstrap[2], "/Users/admin/wargame/hello-fixture");
     assert_eq!(bootstrap[3], "--extract=true");
+    assert_eq!(
+        bootstrap[4], "--require-digests",
+        "a missing digest list must fail the guest, not be skipped"
+    );
 
     assert!(
         copies
@@ -295,7 +299,13 @@ async fn a_windows_launch_provisions_with_powershell_and_windows_paths() {
 
     let (execs, copies) = transport_calls(&transport);
     let flat: Vec<String> = execs.iter().flatten().cloned().collect();
-    assert!(flat.iter().any(|a| a == "New-Item"), "{execs:?}");
+    // The workspace is made with a cmdlet, which reaches the guest as a
+    // trusted script: parameter names bare, only the path quoted.
+    assert!(
+        flat.iter()
+            .any(|a| a == r"New-Item -ItemType Directory -Force -Path 'C:\wargame\.wg' | Out-Null"),
+        "{execs:?}"
+    );
     assert!(
         !flat.iter().any(|a| a == "mkdir" || a == "bash"),
         "no POSIX command may reach a Windows guest: {execs:?}"
@@ -320,6 +330,10 @@ async fn a_windows_launch_provisions_with_powershell_and_windows_paths() {
     assert!(
         !bootstrap.iter().any(|a| a.contains('/')),
         "Windows guest paths never use POSIX separators: {bootstrap:?}"
+    );
+    assert!(
+        bootstrap.contains(&"-RequireDigests".to_string()),
+        "a missing digest list must fail the guest, not be skipped: {bootstrap:?}"
     );
 
     assert!(
@@ -348,6 +362,7 @@ fn transport_calls(transport: &Arc<FakeTransport>) -> (Vec<Vec<String>>, Vec<(St
             TransportCall::CopyIn { src, dest, .. } => {
                 copies.push((src.display().to_string(), dest))
             }
+            TransportCall::ExecScript { script, .. } => execs.push(vec![script]),
             TransportCall::WaitReady { .. } => {}
         }
     }

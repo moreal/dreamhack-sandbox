@@ -19,14 +19,15 @@
 # System.IO.Compression, and tar.exe (bsdtar, shipped since Windows 10
 # 1803). A missing tool is reported, never assumed.
 #
-# Usage: bootstrap.ps1 -Workspace <dir> -Extract <true|false>
+# Usage: bootstrap.ps1 -Workspace <dir> -Extract <true|false> [-RequireDigests]
 #        bootstrap.ps1 -CheckEntry <archive-entry-name>
 
 [CmdletBinding()]
 param(
     [string] $Workspace,
     [string] $Extract = 'false',
-    [string] $CheckEntry
+    [string] $CheckEntry,
+    [switch] $RequireDigests
 )
 
 $ErrorActionPreference = 'Stop'
@@ -111,7 +112,7 @@ if ($PSBoundParameters.ContainsKey('CheckEntry')) {
 }
 
 if ([string]::IsNullOrEmpty($Workspace)) {
-    [Console]::Error.WriteLine('usage: bootstrap.ps1 -Workspace <dir> -Extract <true|false>')
+    [Console]::Error.WriteLine('usage: bootstrap.ps1 -Workspace <dir> -Extract <true|false> [-RequireDigests]')
     [Console]::Error.WriteLine('       bootstrap.ps1 -CheckEntry <archive-entry-name>')
     exit 2
 }
@@ -136,6 +137,14 @@ foreach ($dir in @($incoming, $work, $notes, $output)) {
 # ("<64 hex>  <filename>") while staging, so nothing here has to parse JSON.
 
 $digestFile = Join-Path $incoming '.wargame-sha256'
+# -RequireDigests is what the host passes: it always stages this file, so its
+# absence means the transfer did not land and verification must not be
+# silently skipped (spec.md §3 FR-4).
+if ($RequireDigests -and -not (Test-Path -LiteralPath $digestFile)) {
+    [Console]::Error.WriteLine("the host's digest list is missing at ${digestFile}; the transfer did not complete, so nothing was verified or extracted")
+    exit 1
+}
+
 if (Test-Path -LiteralPath $digestFile) {
     $failures = 0
     foreach ($line in [System.IO.File]::ReadAllLines($digestFile)) {

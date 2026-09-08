@@ -22,7 +22,7 @@ use async_trait::async_trait;
 
 use crate::domain::session::{GuestShell, DEFAULT_GUEST_PORT};
 use crate::error::{Result, WargameError};
-use crate::infra::powershell::PowerShellCommand;
+use crate::infra::powershell::{self, PowerShellCommand};
 use crate::infra::process::{Cmd, Output, ProcessRunner};
 use crate::ports::guest_transport::{ExecResult, GuestEndpoint, GuestTransport};
 
@@ -136,6 +136,34 @@ impl SshGuestTransport {
             }
             GuestShell::PowerShell => PowerShellCommand::from_argv(argv).remote_argv(),
         }
+    }
+
+    /// Runs an already-phrased remote command and restores the guest's true
+    /// exit code.
+    ///
+    /// The local `ssh` process can only exit with the low byte of the remote
+    /// status, so a Windows script's 3010 ("reboot required") would arrive as
+    /// 194. The PowerShell wrapper prints out-of-range codes on a marker line
+    /// and exits 255; here that line is turned back into the real status and
+    /// removed from stderr, so no caller -- or log -- ever sees either the
+    /// truncation or the marker.
+    async fn run_remote(
+        &self,
+        endpoint: &GuestEndpoint,
+        remote: Vec<String>,
+    ) -> Result<ExecResult> {
+        let mut args = self.base_args(endpoint, "-p");
+        args.push(self.target(endpoint));
+        args.extend(remote);
+
+        let cmd = Cmd::new("ssh", args);
+        let out = self.runner.run(&cmd).await?;
+        let (status, stderr) = restore_exit_code(out.status, out.stderr);
+        Ok(ExecResult {
+            status,
+            stdout: out.stdout,
+            stderr,
+        })
     }
 
     /// The command that answers "is the guest ready?" in its own shell.
@@ -258,17 +286,22 @@ impl GuestTransport for SshGuestTransport {
     }
 
     async fn exec(&self, endpoint: &GuestEndpoint, argv: &[String]) -> Result<ExecResult> {
-        let mut args = self.base_args(endpoint, "-p");
-        args.push(self.target(endpoint));
-        args.extend(self.remote_command(endpoint, argv));
+        let remote = self.remote_command(endpoint, argv);
+        self.run_remote(endpoint, remote).await
+    }
 
-        let cmd = Cmd::new("ssh", args);
-        let out = self.runner.run(&cmd).await?;
-        Ok(ExecResult {
-            status: out.status,
-            stdout: out.stdout,
-            stderr: out.stderr,
-        })
+    async fn exec_script(&self, endpoint: &GuestEndpoint, script: &str) -> Result<ExecResult> {
+        let remote = match endpoint.shell {
+            // A POSIX guest never needs this path (`GuestOps` gives it argv),
+            // but the port has to work for every endpoint: hand the script to
+            // the guest's own `bash -c`, quoted like any other argument.
+            GuestShell::Posix => self.remote_command(
+                endpoint,
+                &["bash".to_string(), "-c".to_string(), script.to_string()],
+            ),
+            GuestShell::PowerShell => PowerShellCommand::from_script(script).remote_argv(),
+        };
+        self.run_remote(endpoint, remote).await
     }
 
     async fn copy_in(&self, endpoint: &GuestEndpoint, src: &Path, dest: &str) -> Result<()> {
@@ -320,6 +353,22 @@ impl GuestTransport for SshGuestTransport {
 /// 않는다").
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Puts back an exit code that could not survive `ssh`'s 8-bit exit status,
+/// and removes the marker line that carried it.
+///
+/// Only `ssh`'s own 255 is examined, and only when the wrapper's marker is
+/// actually present, so a genuine 255 (or a genuine 194) is never
+/// reinterpreted.
+fn restore_exit_code(status: i32, stderr: String) -> (i32, String) {
+    if status != 255 {
+        return (status, stderr);
+    }
+    match powershell::take_exit_code_marker(&stderr) {
+        Some((code, cleaned)) => (code, cleaned),
+        None => (status, stderr),
+    }
 }
 
 #[cfg(test)]

@@ -1075,8 +1075,8 @@ async fn provision(req: &BuildRequest<'_>, link: &GuestLink, progress: Progress<
     // does not already exist, create `wg-provision` *as* a copy of
     // `scripts` -- so make the destination first and copy into it with a
     // trailing separator.
-    for argv in ops.mkdir_p(&[PROVISION_DIR.to_string()]) {
-        link.transport.exec(&link.endpoint, &argv).await?;
+    for command in ops.mkdir_p(&[PROVISION_DIR.to_string()]) {
+        command.run(link.transport.as_ref(), &link.endpoint).await?;
     }
     link.transport
         .copy_in(
@@ -1088,11 +1088,11 @@ async fn provision(req: &BuildRequest<'_>, link: &GuestLink, progress: Progress<
 
     for script in &profile.provision.scripts {
         progress(format!("provisioning: {script}"));
-        let argv = ops.run_script(&ops.join(PROVISION_DIR, script));
-        let out = link.transport.exec(&link.endpoint, &argv).await?;
+        let command = ops.run_script(&ops.join(PROVISION_DIR, script));
+        let out = command.run(link.transport.as_ref(), &link.endpoint).await?;
         log_exec(
             &log_path,
-            &argv.join(" "),
+            &command.describe(),
             out.status,
             &out.stdout,
             &out.stderr,
@@ -1126,7 +1126,7 @@ async fn wait_for_reboot(
     let probe = GuestOps::for_endpoint(&link.endpoint).probe();
     let deadline = tokio::time::Instant::now() + REBOOT_DROP_TIMEOUT;
     loop {
-        match link.transport.exec(&link.endpoint, &probe).await {
+        match probe.run(link.transport.as_ref(), &link.endpoint).await {
             Err(_) => break,
             Ok(out) if out.status != 0 => break,
             Ok(_) => {}
@@ -1206,15 +1206,19 @@ async fn verify(
 async fn flush_guest(link: &GuestLink, progress: Progress<'_>) {
     let ops = GuestOps::for_endpoint(&link.endpoint);
     progress("cleaning up provisioning files".to_string());
-    if let Err(e) = link
-        .transport
-        .exec(&link.endpoint, &ops.remove_tree(PROVISION_DIR))
+    if let Err(e) = ops
+        .remove_tree(PROVISION_DIR)
+        .run(link.transport.as_ref(), &link.endpoint)
         .await
     {
         tracing::warn!(error = %e, "could not remove {PROVISION_DIR} from the guest");
     }
     progress("flushing guest filesystem and shutting down".to_string());
-    match link.transport.exec(&link.endpoint, &ops.flush()).await {
+    match ops
+        .flush()
+        .run(link.transport.as_ref(), &link.endpoint)
+        .await
+    {
         Ok(out) if out.status != 0 => {
             tracing::warn!(
                 status = out.status,

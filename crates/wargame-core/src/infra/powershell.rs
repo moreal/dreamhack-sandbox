@@ -53,21 +53,71 @@ pub fn decode_command(encoded: &str) -> Option<String> {
     String::from_utf16(&units).ok()
 }
 
-/// A command to run in a Windows guest, built from argv-like data.
+/// The marker the wrapper prints when the guest command's exit code cannot
+/// survive the trip home.
 ///
-/// The generated script calls the argv through the call operator (`&`) with
-/// every element as a literal, and ends with `exit $LASTEXITCODE` so the
-/// guest command's own exit code reaches the host -- which is what lets
-/// [`crate::app::profile_build::REBOOT_REQUIRED_EXIT_CODE`] (3010) be
-/// recognised rather than swallowed by `powershell.exe`'s own status.
+/// A local `ssh` process exits with the *low byte* of the remote status
+/// (`exit(3)` takes an `int` but the waiting parent only sees 8 bits), so a
+/// Windows installer's 3010 "reboot required" would reach the host as
+/// `3010 & 0xFF` = 194. Rather than guess which 194 means what, the wrapper
+/// prints the true code on its own stderr line and exits 255; the transport
+/// puts the real value back and removes the line, so nothing downstream --
+/// logs included -- ever sees the marker.
+pub const EXIT_CODE_MARKER: &str = "wargame-exit-code:";
+
+/// Reads an [`EXIT_CODE_MARKER`] line out of `stderr`, returning the true
+/// exit code and `stderr` without that line. Only the *last* marker counts,
+/// so a command that printed one itself cannot displace the wrapper's.
+pub fn take_exit_code_marker(stderr: &str) -> Option<(i32, String)> {
+    let index = stderr
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with(EXIT_CODE_MARKER))
+        .map(|(index, _)| index)
+        .last()?;
+    let mut kept: Vec<&str> = Vec::new();
+    let mut code = None;
+    for (position, line) in stderr.lines().enumerate() {
+        if position == index {
+            code = Some(
+                line.trim_start()[EXIT_CODE_MARKER.len()..]
+                    .trim()
+                    .parse()
+                    .ok()?,
+            );
+            continue;
+        }
+        kept.push(line);
+    }
+    let mut cleaned = kept.join("\n");
+    if !cleaned.is_empty() && stderr.ends_with('\n') {
+        cleaned.push('\n');
+    }
+    code.map(|code| (code, cleaned))
+}
+
+/// A command to run in a Windows guest.
+///
+/// The generated script ends with the guest command's own exit code, so a
+/// Windows installer's [`crate::app::profile_build::REBOOT_REQUIRED_EXIT_CODE`]
+/// (3010) is recognised rather than swallowed by `powershell.exe`'s own
+/// status or truncated to a byte on the way home (see [`EXIT_CODE_MARKER`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PowerShellCommand {
     script: String,
 }
 
 impl PowerShellCommand {
-    /// Wraps `argv` -- `argv[0]` is the command, the rest are its arguments.
-    /// An empty argv produces a script that succeeds and does nothing.
+    /// Wraps `argv` -- `argv[0]` is the command, the rest are its arguments,
+    /// every one of them a quoted literal. An empty argv produces a script
+    /// that succeeds and does nothing.
+    ///
+    /// **Only for native commands** (`powershell.exe`, `tar.exe`, …), whose
+    /// arguments are plain strings. A *cmdlet* binds a parameter only from a
+    /// bare `-Name` token: quoted, `'-Force'` is a positional value, so
+    /// `& 'New-Item' '-ItemType' 'Directory'` would bind `-Path '-ItemType'`
+    /// and then fail. Cmdlets go through [`PowerShellCommand::from_script`]
+    /// with a template this crate owns.
     pub fn from_argv(argv: &[String]) -> Self {
         if argv.is_empty() {
             return PowerShellCommand {
@@ -75,29 +125,44 @@ impl PowerShellCommand {
             };
         }
         let call = argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ");
-        PowerShellCommand::from_script(format!("& {call}"))
+        // `Continue` -- the default -- rather than `Stop`, because in Windows
+        // PowerShell 5.1 a native command that writes to stderr while its
+        // streams are redirected raises `NativeCommandError` under `Stop`.
+        // That would be caught below and reported as exit 1, masking the
+        // command's real status (3010 included) for the very ordinary reason
+        // that an installer printed a warning.
+        PowerShellCommand::wrap(format!("& {call}"), "Continue")
     }
 
-    /// Wraps a trusted script body in the same preamble/epilogue. The body
-    /// must be a template this crate owns; any *data* in it belongs in
-    /// [`quote`]d literals.
+    /// Wraps a trusted script body. The body must be a template this crate
+    /// owns, with every piece of *data* in it passed through [`quote`] --
+    /// which is what lets a cmdlet's parameter names stay bare while its
+    /// arguments stay literal.
     pub fn from_script(body: impl AsRef<str>) -> Self {
-        // `$ErrorActionPreference = 'Stop'` turns a cmdlet's non-terminating
-        // error into a terminating one so it cannot be mistaken for success;
-        // a *native* command's non-zero exit is not an error in PowerShell,
-        // so it still arrives through `$LASTEXITCODE`.
+        // `Stop` turns a cmdlet's non-terminating error into a terminating
+        // one, so a failed `New-Item` cannot be mistaken for success. Safe
+        // here because these templates call cmdlets, never native commands.
+        PowerShellCommand::wrap(body.as_ref().to_string(), "Stop")
+    }
+
+    fn wrap(body: String, error_action: &str) -> Self {
         let script = format!(
-            "$ErrorActionPreference = 'Stop'\n\
+            "$ErrorActionPreference = '{error_action}'\n\
              $ProgressPreference = 'SilentlyContinue'\n\
              $global:LASTEXITCODE = 0\n\
              try {{\n\
-             {}\n\
+             {body}\n\
              }} catch {{\n\
              [Console]::Error.WriteLine($_.Exception.Message)\n\
              exit 1\n\
              }}\n\
-             exit $LASTEXITCODE\n",
-            body.as_ref()
+             $wgExit = $LASTEXITCODE\n\
+             if ($null -eq $wgExit) {{ $wgExit = 0 }}\n\
+             if ($wgExit -lt 0 -or $wgExit -gt 255) {{\n\
+             [Console]::Error.WriteLine('{EXIT_CODE_MARKER}' + $wgExit)\n\
+             exit 255\n\
+             }}\n\
+             exit $wgExit\n"
         );
         PowerShellCommand { script }
     }
@@ -253,6 +318,43 @@ mod tests {
     }
 
     #[test]
+    fn a_cmdlet_template_keeps_stop_semantics() {
+        let command = PowerShellCommand::from_script("New-Item -Path 'x'");
+        assert!(command
+            .script()
+            .starts_with("$ErrorActionPreference = 'Stop'"));
+        assert!(command.script().contains("New-Item -Path 'x'"));
+    }
+
+    #[test]
+    fn an_out_of_range_exit_code_is_reported_on_a_marker_line() {
+        let script = PowerShellCommand::from_argv(&["setup.exe".to_string()])
+            .script()
+            .to_string();
+        assert!(
+            script.contains("if ($wgExit -lt 0 -or $wgExit -gt 255)"),
+            "{script}"
+        );
+        assert!(script.contains(EXIT_CODE_MARKER), "{script}");
+
+        assert_eq!(
+            take_exit_code_marker(&format!("warned\n{EXIT_CODE_MARKER}3010\n")),
+            Some((3010, "warned\n".to_string()))
+        );
+        // Only the last marker counts, so a command that printed one of its
+        // own cannot displace the wrapper's.
+        assert_eq!(
+            take_exit_code_marker(&format!("{EXIT_CODE_MARKER}7\n{EXIT_CODE_MARKER}3010\n")),
+            Some((3010, format!("{EXIT_CODE_MARKER}7\n")))
+        );
+        assert_eq!(take_exit_code_marker("nothing here\n"), None);
+        assert_eq!(
+            take_exit_code_marker(&format!("{EXIT_CODE_MARKER}nope\n")),
+            None
+        );
+    }
+
+    #[test]
     fn an_empty_argv_is_a_no_op() {
         let command = PowerShellCommand::from_argv(&[]);
         assert_eq!(command.script(), "exit 0\n");
@@ -268,6 +370,11 @@ mod tests {
         assert!(command
             .script()
             .contains(r"& 'New-Item' '-Path' 'C:\wargame\it''s here'"));
-        assert!(command.script().ends_with("exit $LASTEXITCODE\n"));
+        assert!(command.script().ends_with("exit $wgExit\n"));
+        // A native command runs under `Continue`, so an installer that
+        // writes a warning to stderr cannot be turned into exit 1.
+        assert!(command
+            .script()
+            .starts_with("$ErrorActionPreference = 'Continue'"));
     }
 }

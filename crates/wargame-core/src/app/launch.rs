@@ -451,12 +451,12 @@ async fn provision_guest(
     let bootstrap_dir = ops.join(&workspace_root, ".wg");
     let incoming_dir = ops.join(&workspace, "incoming");
 
-    for argv in ops.mkdir_p(&[bootstrap_dir.clone(), incoming_dir.clone()]) {
-        let mkdir = transport.exec(endpoint, &argv).await?;
+    for command in ops.mkdir_p(&[bootstrap_dir.clone(), incoming_dir.clone()]) {
+        let mkdir = command.run(transport, endpoint).await?;
         if mkdir.status != 0 {
             return Err(WargameError::CopyFailed(format!(
-                "creating {} on the guest failed: {}",
-                argv.last().map(String::as_str).unwrap_or_default(),
+                "creating the guest workspace failed ({}): {}",
+                command.describe(),
                 mkdir.stderr
             )));
         }
@@ -509,12 +509,16 @@ async fn provision_guest(
         .copy_in(endpoint, &metadata_path, &ops.dir_dest(&incoming_dir))
         .await?;
 
-    let argv = ops.run_bootstrap(
+    // `require_digests`: the host has just staged `.wargame-sha256`, so the
+    // guest must refuse to carry on if it is not there rather than quietly
+    // skipping verification (spec.md §3 FR-4).
+    let bootstrap = ops.run_bootstrap(
         &ops.join(&bootstrap_dir, bootstrap_name),
         &workspace,
         req.extract,
+        true,
     );
-    let out = transport.exec(endpoint, &argv).await?;
+    let out = bootstrap.run(transport, endpoint).await?;
     if out.status != 0 {
         return Err(WargameError::GuestBootstrapFailed(format!(
             "bootstrap exited with status {}: {}",

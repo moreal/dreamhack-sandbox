@@ -12,7 +12,7 @@ pub mod process;
 pub mod ssh;
 
 pub use fs::{disk_free_bytes, AppDirs, HostDiskSpace};
-pub use guest_ops::GuestOps;
+pub use guest_ops::{GuestCommand, GuestOps};
 pub use json_build_repo::JsonBuildRepository;
 pub use json_repo::JsonSessionRepository;
 pub use keychain::{FileStore, KeychainStore};

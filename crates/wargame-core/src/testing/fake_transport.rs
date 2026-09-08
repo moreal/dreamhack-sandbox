@@ -23,6 +23,12 @@ pub enum TransportCall {
         endpoint: GuestEndpoint,
         argv: Vec<String>,
     },
+    /// A trusted, shell-specific script (`GuestTransport::exec_script`) --
+    /// what a PowerShell cmdlet invocation reaches the guest as.
+    ExecScript {
+        endpoint: GuestEndpoint,
+        script: String,
+    },
     CopyIn {
         endpoint: GuestEndpoint,
         src: PathBuf,
@@ -37,12 +43,16 @@ pub enum TransportCall {
 /// simple defaults.
 pub type ExecResponder = dyn Fn(&[String]) -> ExecResult + Send + Sync;
 
+/// The [`ExecResponder`] equivalent for `exec_script`.
+pub type ScriptResponder = dyn Fn(&str) -> ExecResult + Send + Sync;
+
 pub struct FakeTransport {
     pub ready: Mutex<bool>,
     calls: Mutex<Vec<TransportCall>>,
     fail_on: Mutex<Option<&'static str>>,
     exec_status: Mutex<i32>,
     exec_responder: Mutex<Option<Box<ExecResponder>>>,
+    script_responder: Mutex<Option<Box<ScriptResponder>>>,
 }
 
 impl FakeTransport {
@@ -53,6 +63,7 @@ impl FakeTransport {
             fail_on: Mutex::new(None),
             exec_status: Mutex::new(0),
             exec_responder: Mutex::new(None),
+            script_responder: Mutex::new(None),
         }
     }
 
@@ -81,6 +92,14 @@ impl FakeTransport {
         F: Fn(&[String]) -> ExecResult + Send + Sync + 'static,
     {
         *self.exec_responder.lock().unwrap() = Some(Box::new(responder));
+    }
+
+    /// Installs a per-script responder for `exec_script`.
+    pub fn set_script_responder<F>(&self, responder: F)
+    where
+        F: Fn(&str) -> ExecResult + Send + Sync + 'static,
+    {
+        *self.script_responder.lock().unwrap() = Some(Box::new(responder));
     }
 
     fn should_fail(&self, step: &str) -> bool {
@@ -122,6 +141,26 @@ impl GuestTransport for FakeTransport {
         }
         if let Some(responder) = self.exec_responder.lock().unwrap().as_ref() {
             return Ok(responder(argv));
+        }
+        Ok(ExecResult {
+            status: *self.exec_status.lock().unwrap(),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    async fn exec_script(&self, endpoint: &GuestEndpoint, script: &str) -> Result<ExecResult> {
+        self.calls.lock().unwrap().push(TransportCall::ExecScript {
+            endpoint: endpoint.clone(),
+            script: script.to_string(),
+        });
+        if self.should_fail("exec") {
+            return Err(WargameError::GuestBootstrapFailed(
+                "fake exec failure".to_string(),
+            ));
+        }
+        if let Some(responder) = self.script_responder.lock().unwrap().as_ref() {
+            return Ok(responder(script));
         }
         Ok(ExecResult {
             status: *self.exec_status.lock().unwrap(),

@@ -21,13 +21,13 @@
 # anything optional (unzip, python3) is probed before use and its absence is
 # reported rather than assumed.
 #
-# Usage: bootstrap.sh <workspace-dir> --extract=<true|false>
+# Usage: bootstrap.sh <workspace-dir> --extract=<true|false> [--require-digests]
 #        bootstrap.sh --check-entry <archive-entry-name>
 
 set -euo pipefail
 
 usage() {
-  echo "usage: $(basename "$0") <workspace-dir> --extract=<true|false>" >&2
+  echo "usage: $(basename "$0") <workspace-dir> --extract=<true|false> [--require-digests]" >&2
   echo "       $(basename "$0") --check-entry <archive-entry-name>" >&2
   exit 2
 }
@@ -151,10 +151,12 @@ WORKSPACE="$1"
 shift
 
 EXTRACT=""
+REQUIRE_DIGESTS="false"
 for arg in "$@"; do
   case "$arg" in
     --extract=true) EXTRACT="true" ;;
     --extract=false) EXTRACT="false" ;;
+    --require-digests) REQUIRE_DIGESTS="true" ;;
     *)
       echo "unrecognized argument: $arg" >&2
       usage
@@ -187,6 +189,14 @@ sha256_of() {
     openssl) openssl dgst -sha256 "$1" | sed 's/.*= *//' ;;
   esac
 }
+
+# `--require-digests` is what the host passes: it always stages this file, so
+# its absence means the transfer did not land and verification must not be
+# silently skipped (spec.md §3 FR-4).
+if [ "$REQUIRE_DIGESTS" = "true" ] && [ ! -f "$DIGESTS" ]; then
+  echo "the host's digest list is missing at $DIGESTS; the transfer did not complete, so nothing was verified or extracted" >&2
+  exit 1
+fi
 
 if [ -f "$DIGESTS" ] && [ -s "$DIGESTS" ]; then
   SHA256_TOOL=""

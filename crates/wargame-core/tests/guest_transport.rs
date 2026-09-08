@@ -27,7 +27,7 @@ use wargame_core::domain::{GuestEndpoint, GuestShell};
 use wargame_core::error::WargameError;
 use wargame_core::infra::powershell::{self, PowerShellCommand};
 use wargame_core::infra::process::Output;
-use wargame_core::infra::{GuestOps, SshGuestTransport};
+use wargame_core::infra::{GuestCommand, GuestOps, SshGuestTransport};
 use wargame_core::ports::GuestTransport;
 use wargame_core::testing::FakeRunner;
 
@@ -122,7 +122,7 @@ fn the_builder_calls_argv_and_propagates_the_exit_code() {
         "script did not quote argv as PowerShell literals:\n{script}"
     );
     assert!(
-        script.contains("exit $LASTEXITCODE"),
+        script.contains("$wgExit = $LASTEXITCODE") && script.contains("exit $wgExit"),
         "the guest command's exit code must reach the host:\n{script}"
     );
     assert_eq!(
@@ -404,35 +404,44 @@ async fn the_readiness_probe_speaks_the_guests_shell() {
 // 3. GuestOps -- the single place the OS decides a command's shape
 // ---------------------------------------------------------------------------
 
+fn argv_of(command: &GuestCommand) -> Vec<String> {
+    command
+        .as_argv()
+        .unwrap_or_else(|| panic!("expected argv, got {command:?}"))
+        .to_vec()
+}
+
+fn script_of(command: &GuestCommand) -> String {
+    match command {
+        GuestCommand::Script(script) => script.clone(),
+        other => panic!("expected a script, got {other:?}"),
+    }
+}
+
 #[test]
 fn posix_guest_ops_produce_the_commands_the_mvp_already_ran() {
     let ops = GuestOps::new(GuestShell::Posix);
+    let mkdir = ops.mkdir_p(&["/a".to_string(), "/b".to_string()]);
+    assert_eq!(mkdir.len(), 1);
+    assert_eq!(argv_of(&mkdir[0]), ["mkdir", "-p", "/a", "/b"]);
     assert_eq!(
-        ops.mkdir_p(&["/a".to_string(), "/b".to_string()]),
-        vec![vec![
-            "mkdir".to_string(),
-            "-p".to_string(),
-            "/a".to_string(),
-            "/b".to_string()
-        ]]
-    );
-    assert_eq!(
-        ops.remove_tree("wg-provision"),
+        argv_of(&ops.remove_tree("wg-provision")),
         ["rm", "-rf", "wg-provision"]
     );
-    assert_eq!(ops.flush(), ["sync"]);
-    assert_eq!(ops.probe(), ["true"]);
+    assert_eq!(argv_of(&ops.flush()), ["sync"]);
+    assert_eq!(argv_of(&ops.probe()), ["true"]);
     assert_eq!(
-        ops.run_script("wg-provision/scripts/macos/common.sh"),
+        argv_of(&ops.run_script("wg-provision/scripts/macos/common.sh")),
         ["bash", "wg-provision/scripts/macos/common.sh"]
     );
     assert_eq!(ops.bootstrap_name(), "bootstrap.sh");
     assert_eq!(
-        ops.run_bootstrap(
+        argv_of(&ops.run_bootstrap(
             "/Users/admin/wargame/.wg/bootstrap.sh",
             "/Users/admin/wargame/s",
-            true
-        ),
+            true,
+            false
+        )),
         [
             "bash",
             "/Users/admin/wargame/.wg/bootstrap.sh",
@@ -454,6 +463,10 @@ fn posix_guest_ops_produce_the_commands_the_mvp_already_ran() {
 fn powershell_guest_ops_use_windows_commands_and_separators() {
     let ops = GuestOps::new(GuestShell::PowerShell);
 
+    // A cmdlet binds a parameter only from a bare `-Name` token, so these
+    // arrive as a trusted template with the parameter names unquoted and
+    // only the data quoted -- never as argv of quoted strings, which
+    // PowerShell would bind positionally.
     let mkdir = ops.mkdir_p(&[
         r"C:\wargame\.wg".to_string(),
         r"C:\wargame\s\incoming".to_string(),
@@ -463,23 +476,38 @@ fn powershell_guest_ops_use_windows_commands_and_separators() {
         2,
         "New-Item takes one -Path per call: {mkdir:?}"
     );
-    assert!(mkdir[0].iter().any(|a| a == "New-Item"), "{mkdir:?}");
-    assert!(mkdir[0].iter().any(|a| a == r"C:\wargame\.wg"), "{mkdir:?}");
-    assert!(!mkdir[0].iter().any(|a| a == "mkdir"), "{mkdir:?}");
+    assert_eq!(
+        script_of(&mkdir[0]),
+        r"New-Item -ItemType Directory -Force -Path 'C:\wargame\.wg' | Out-Null"
+    );
 
-    assert!(ops.remove_tree(r"wg-provision")[0].starts_with("Remove-Item"));
-    assert!(!ops.flush().is_empty());
-    assert!(!ops.probe().contains(&"true".to_string()));
+    assert_eq!(
+        script_of(&ops.remove_tree("wg-provision")),
+        "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath 'wg-provision'"
+    );
+    assert_eq!(script_of(&ops.flush()), "Write-VolumeCache -DriveLetter C");
+    assert!(!script_of(&ops.probe()).contains("true"));
     assert_eq!(ops.bootstrap_name(), "bootstrap.ps1");
 
-    let run = ops.run_script(r"wg-provision\scripts\windows\common.ps1");
+    // `powershell.exe` is a *native* command, so its arguments are ordinary
+    // literals and argv is the right shape.
+    let run = argv_of(&ops.run_script(r"wg-provision\scripts\windows\common.ps1"));
     assert_eq!(run[0], "powershell");
     assert!(run.iter().any(|a| a == "-File"), "{run:?}");
     assert!(run.iter().any(|a| a == "-ExecutionPolicy"), "{run:?}");
 
-    let bootstrap = ops.run_bootstrap(r"C:\wargame\.wg\bootstrap.ps1", r"C:\wargame\s", false);
+    let bootstrap = argv_of(&ops.run_bootstrap(
+        r"C:\wargame\.wg\bootstrap.ps1",
+        r"C:\wargame\s",
+        false,
+        true,
+    ));
     assert!(bootstrap.iter().any(|a| a == "-Workspace"), "{bootstrap:?}");
     assert!(bootstrap.iter().any(|a| a == "false"), "{bootstrap:?}");
+    assert!(
+        bootstrap.iter().any(|a| a == "-RequireDigests"),
+        "{bootstrap:?}"
+    );
     assert!(
         !bootstrap.iter().any(|a| a.starts_with("--extract")),
         "POSIX flag syntax must not be reused: {bootstrap:?}"
@@ -499,6 +527,130 @@ fn powershell_guest_ops_use_windows_commands_and_separators() {
         GuestOps::new(GuestShell::Posix).trim_root("/home/kali/wargame/"),
         "/home/kali/wargame"
     );
+}
+
+/// A cmdlet script reaches the guest as a script, with its parameter names
+/// bare and only its data quoted. PowerShell binds a parameter *only* from
+/// an unquoted `-Name` token, so `& 'New-Item' '-Force'` would pass
+/// `-Force` as a positional value and misbind everything after it.
+#[tokio::test]
+async fn cmdlet_parameter_names_reach_the_guest_unquoted() {
+    let runner = Arc::new(FakeRunner::new());
+    let transport = transport(&runner);
+    let ops = GuestOps::new(GuestShell::PowerShell);
+
+    ops.mkdir_p(&[r"C:\wargame\it's here".to_string()])[0]
+        .run(&transport, &windows_endpoint())
+        .await
+        .unwrap();
+
+    let call = runner.calls().remove(0);
+    let script = powershell::decode_command(call.args.last().unwrap()).expect("base64");
+    assert!(
+        script.contains(r"New-Item -ItemType Directory -Force -Path 'C:\wargame\it''s here'"),
+        "parameter names must be bare and only the data quoted:\n{script}"
+    );
+    for parameter in ["'-ItemType'", "'-Force'", "'-Path'", "'-Recurse'"] {
+        assert!(
+            !script.contains(parameter),
+            "a quoted {parameter} would bind positionally:\n{script}"
+        );
+    }
+    // The wrapper around a cmdlet template keeps `Stop`, so a failed
+    // New-Item cannot be mistaken for success.
+    assert!(
+        script.contains("$ErrorActionPreference = 'Stop'"),
+        "{script}"
+    );
+}
+
+/// A native command keeps the argv path, and its wrapper must *not* use
+/// `Stop`: in Windows PowerShell 5.1 a native command that writes to stderr
+/// with redirected streams raises NativeCommandError under `Stop`, which
+/// would be caught and reported as exit 1 -- masking the real exit code.
+#[tokio::test]
+async fn a_native_commands_stderr_cannot_mask_its_exit_code() {
+    let runner = Arc::new(FakeRunner::new());
+    let transport = transport(&runner);
+
+    transport
+        .exec(
+            &windows_endpoint(),
+            &[
+                "powershell".to_string(),
+                "-File".to_string(),
+                "a.ps1".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let call = runner.calls().remove(0);
+    let script = powershell::decode_command(call.args.last().unwrap()).expect("base64");
+    assert!(
+        script.contains("$ErrorActionPreference = 'Continue'"),
+        "a native command must not run under 'Stop':\n{script}"
+    );
+}
+
+/// `ssh` can only exit with the low byte of the remote status, so 3010
+/// would arrive as 194. The wrapper reports an out-of-range code on a marker
+/// line and the transport puts it back -- and takes the line out of stderr.
+#[tokio::test]
+async fn an_out_of_range_guest_exit_code_survives_ssh() {
+    let runner = Arc::new(FakeRunner::new());
+    runner.set_responder(|_| {
+        Ok(Output {
+            status: 255,
+            stdout: String::new(),
+            stderr: format!(
+                "installer said reboot\n{}3010\n",
+                powershell::EXIT_CODE_MARKER
+            ),
+        })
+    });
+    let marked = transport(&runner);
+
+    let out = marked
+        .exec(&windows_endpoint(), &["powershell".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        out.status, 3010,
+        "3010 must not arrive as 3010 & 0xFF = 194"
+    );
+    assert!(
+        !out.stderr.contains(powershell::EXIT_CODE_MARKER),
+        "the marker must never reach a log or a user: {:?}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("installer said reboot"),
+        "{:?}",
+        out.stderr
+    );
+
+    // The wrapper is what emits it.
+    let script =
+        powershell::decode_command(runner.calls().remove(0).args.last().unwrap()).expect("base64");
+    assert!(script.contains(powershell::EXIT_CODE_MARKER), "{script}");
+    assert!(script.contains("-gt 255"), "{script}");
+
+    // A genuine 255 with no marker stays 255.
+    let runner = Arc::new(FakeRunner::new());
+    runner.set_responder(|_| {
+        Ok(Output {
+            status: 255,
+            stdout: String::new(),
+            stderr: "ssh: connect to host 10.0.0.9 port 22: Connection refused\n".to_string(),
+        })
+    });
+    let plain = transport(&runner);
+    let out = plain
+        .exec(&windows_endpoint(), &["powershell".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(out.status, 255);
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +810,50 @@ fn both_bootstrap_scripts_create_the_same_workspace_tree() {
         assert!(ws.join(dir).is_dir(), "missing {dir}/");
     }
     assert!(ws.join("notes/README.md").is_file());
+}
+
+/// A digest list the host staged but the guest never received must fail the
+/// bootstrap, not quietly downgrade to no verification at all.
+#[test]
+fn a_missing_digest_list_is_an_error_when_the_host_staged_one() {
+    if !have("bash") {
+        eprintln!("skipping: bash not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    std::fs::create_dir_all(ws.join("incoming")).unwrap();
+    std::fs::write(ws.join("incoming/challenge.bin"), b"hi\n").unwrap();
+
+    // Without the flag (a manual run) an absent list is simply nothing to
+    // check.
+    let out = run_bootstrap_sh(&ws, false);
+    assert!(out.status.success());
+
+    let out = std::process::Command::new(bash())
+        .arg(guest_dir().join("bootstrap.sh"))
+        .arg(&ws)
+        .arg("--extract=true")
+        .arg("--require-digests")
+        .output()
+        .expect("failed to spawn bash");
+    assert!(
+        !out.status.success(),
+        "a digest list the host staged must be present"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(".wargame-sha256"), "{stderr}");
+    assert!(
+        !ws.join("incoming/extracted").exists(),
+        "nothing may be extracted when verification could not run"
+    );
+
+    // The PowerShell half declares the same switch.
+    let ps1 = std::fs::read_to_string(guest_dir().join("bootstrap.ps1")).unwrap();
+    assert!(
+        ps1.contains("$RequireDigests"),
+        "bootstrap.ps1 needs the switch"
+    );
 }
 
 /// FR-4: "게스트 파일 해시는 호스트 staging 해시와 같아야 한다" -- the guest

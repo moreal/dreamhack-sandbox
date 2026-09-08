@@ -27,6 +27,16 @@ pub trait GuestTransport: Send + Sync {
     /// (`GuestBootTimeout`).
     async fn wait_ready(&self, endpoint: &GuestEndpoint, timeout: Duration) -> Result<()>;
     async fn exec(&self, endpoint: &GuestEndpoint, argv: &[String]) -> Result<ExecResult>;
+    /// Runs a trusted script written in the endpoint's own shell language.
+    ///
+    /// For what argv cannot express: a PowerShell cmdlet binds a parameter
+    /// only from a bare `-Name` token, so `New-Item -ItemType Directory
+    /// -Force -Path <p>` has to reach the guest as a script with its
+    /// parameter names written out and only `<p>` quoted. `script` is always
+    /// a template this crate owns -- never anything a challenge, a server or
+    /// a profile supplied -- and every piece of data in it is already quoted
+    /// for that shell (`crate::infra::GuestOps` is what builds them).
+    async fn exec_script(&self, endpoint: &GuestEndpoint, script: &str) -> Result<ExecResult>;
     /// Copies `src` (host path) into `dest` (a guest path) recursively.
     async fn copy_in(&self, endpoint: &GuestEndpoint, src: &Path, dest: &str) -> Result<()>;
     /// Builds (but does not spawn) an interactive shell command for

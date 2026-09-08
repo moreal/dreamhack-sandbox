@@ -163,7 +163,7 @@ pub async fn stop(ctx: &AppContext, id: &str) -> Result<Session> {
     match transport_for_session(ctx, &session) {
         Ok((endpoint, transport)) => {
             let flush = crate::infra::GuestOps::for_endpoint(&endpoint).flush();
-            if let Err(err) = transport.exec(&endpoint, &flush).await {
+            if let Err(err) = flush.run(transport.as_ref(), &endpoint).await {
                 tracing::debug!(session = %id, error = %err, "sync before stop failed; stopping anyway");
             }
         }
