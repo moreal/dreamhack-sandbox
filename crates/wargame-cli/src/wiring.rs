@@ -28,6 +28,7 @@ use wargame_core::testing::{FakeTransport, FakeVmProvider};
 
 use wargame_dreamhack::{DreamhackConfig, DreamhackProvider};
 use wargame_tart::{BuildOptions, ProfileImageBuilder, TartConfig, TartProvider, TransportFactory};
+use wargame_utm::{UtmConfig, UtmProvider};
 
 use crate::fixture_provider::FixtureProvider;
 use crate::profiles_builtin;
@@ -158,12 +159,15 @@ pub fn build_credential_store(
 
 /// Builds the backend registry and the guest transports (spec.md §5 item 1).
 ///
-/// `$WARGAME_VM=fake` -> one in-memory fake registered under the `tart`
-/// name, with every built-in profile's image pre-registered so `wargame
+/// `$WARGAME_VM=fake` -> in-memory fakes registered under **both** backend
+/// names, with every built-in profile's image pre-registered so `wargame
 /// launch` needs no prior `profile build`; anything else -> the real Tart
-/// backend. The `utm` slot is filled once the UTM adapter exists; until
-/// then a UTM profile fails with "no \"utm\" backend is wired into this
-/// build" rather than being quietly run on Tart.
+/// and UTM backends.
+///
+/// Registering UTM costs nothing on a host without it: `UtmProvider` only
+/// looks for `utmctl` when it is asked to do something, so a missing UTM
+/// degrades the `utm` slot alone and every Tart/macOS path is untouched
+/// (spec.md §3 FR-6: "Tart macOS 실행에 UTM 설치를 요구하지 않는다").
 ///
 /// The SSH transport carries no guest user: it comes from
 /// `profile.guest.user` at launch and from the session's saved connection
@@ -175,25 +179,51 @@ fn build_vm_backends(
     builtin_profiles: &[wargame_core::domain::Profile],
 ) -> (BackendRegistry, TransportRegistry) {
     if std::env::var("WARGAME_VM").as_deref() == Ok("fake") {
-        let fake_vm = Arc::new(FakeVmProvider::new());
+        let fake_tart = Arc::new(FakeVmProvider::new());
+        let fake_utm = Arc::new(FakeVmProvider::with_backend("utm"));
+        fake_utm.set_capabilities(utm_capabilities());
         for profile in builtin_profiles {
-            fake_vm.add_image(profile.image_name());
+            fake_tart.add_image(profile.image_name());
+            fake_utm.add_image(profile.image_name());
         }
         return (
-            BackendRegistry::new(vec![fake_vm as Arc<dyn VmProvider>]),
+            BackendRegistry::new(vec![
+                fake_tart as Arc<dyn VmProvider>,
+                fake_utm as Arc<dyn VmProvider>,
+            ]),
             TransportRegistry::new(Arc::new(FakeTransport::new()) as Arc<dyn GuestTransport>),
         );
     }
 
     let tart = Arc::new(TartProvider::new(runner.clone(), tart_config(config)));
+    let utm = Arc::new(UtmProvider::new(runner.clone(), utm_config(config)));
     let transport = Arc::new(SshGuestTransport::new(
         runner.clone(),
         dirs.keys_dir().join("id_ed25519"),
     ));
     (
-        BackendRegistry::new(vec![tart as Arc<dyn VmProvider>]),
+        BackendRegistry::new(vec![
+            tart as Arc<dyn VmProvider>,
+            utm as Arc<dyn VmProvider>,
+        ]),
         TransportRegistry::new(transport as Arc<dyn GuestTransport>),
     )
+}
+
+/// What the real UTM backend reports, mirrored onto the fake so
+/// `WARGAME_VM=fake` can exercise a UTM profile end to end.
+fn utm_capabilities() -> wargame_core::domain::ProviderCapabilities {
+    UtmProvider::new(Arc::new(RealRunner), UtmConfig::default()).capabilities()
+}
+
+fn utm_config(config: &Config) -> UtmConfig {
+    UtmConfig {
+        utmctl: config.vm.utm.utmctl.clone(),
+        vm_prefix: config.vm.utm.vm_prefix.clone(),
+        boot_timeout: Duration::from_secs(config.vm.utm.boot_timeout_secs),
+        virtualize_boot_timeout: Duration::from_secs(config.vm.utm.virtualize_boot_timeout_secs),
+        ..UtmConfig::default()
+    }
 }
 
 fn tart_config(config: &Config) -> TartConfig {
@@ -293,8 +323,9 @@ mod tests {
         std::env::set_var("WARGAME_VM", "fake");
         let ctx = build_context(false, None, Some(tmp_home())).unwrap();
         assert_eq!(ctx.wargame.name(), "fixture");
-        assert_eq!(ctx.backends.names(), vec!["tart"]);
+        assert_eq!(ctx.backends.names(), vec!["tart", "utm"]);
         assert_eq!(ctx.backends.get("tart").unwrap().name(), "tart");
+        assert_eq!(ctx.backends.get("utm").unwrap().name(), "utm");
         assert_eq!(ctx.profiles.list().len(), 2);
         std::env::remove_var("WARGAME_PROVIDER");
         std::env::remove_var("WARGAME_VM");

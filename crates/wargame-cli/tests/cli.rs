@@ -173,6 +173,48 @@ fn doctor_json_is_an_array_and_exits_zero_even_without_tart() {
     );
 }
 
+/// `doctor --profile` checks only what one profile needs: a macOS/Tart
+/// profile must not be told about UTM (spec.md §3 FR-6).
+#[test]
+fn doctor_profile_reports_only_the_profiles_own_backend() {
+    let home = tempfile::tempdir().unwrap();
+    let out = fixture_fake_cmd(home.path())
+        .args(["doctor", "--profile", "macos-re-arm64", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let checks: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    let names: Vec<String> = checks
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        names.contains(&"profile:macos-re-arm64".to_string()),
+        "{names:?}"
+    );
+    assert!(names.contains(&"vm-backend:tart".to_string()), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.contains("utm")),
+        "a Tart profile must not require UTM: {names:?}"
+    );
+}
+
+#[test]
+fn doctor_profile_names_an_unknown_profile() {
+    let home = tempfile::tempdir().unwrap();
+    let out = fixture_fake_cmd(home.path())
+        .args(["doctor", "--profile", "does-not-exist", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let checks: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    let rows = checks.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["ok"], serde_json::Value::Bool(false));
+}
+
 #[test]
 fn launch_nat_without_yes_or_tty_is_refused() {
     let home = tempfile::tempdir().unwrap();

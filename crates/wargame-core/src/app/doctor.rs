@@ -295,7 +295,6 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
             detail: status
                 .version
                 .clone()
-                .map(|v| format!("{v} ({})", status.detail))
                 .unwrap_or_else(|| status.detail.clone()),
             hint: if status.available {
                 None

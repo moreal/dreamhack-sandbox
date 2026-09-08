@@ -13,8 +13,8 @@ use std::time::Instant;
 use clap::{CommandFactory, Parser};
 
 use wargame_core::app::{
-    delete, doctor, inspect, keep, launch, list_sessions, open, open_gui, prune, resolve_session,
-    resume, search, ssh_command, stop, AppContext, LaunchEvent, LaunchRequest,
+    delete, doctor, doctor_profile, inspect, keep, launch, list_sessions, open, open_gui, prune,
+    resolve_session, resume, search, ssh_command, stop, AppContext, LaunchEvent, LaunchRequest,
 };
 use wargame_core::domain::{ChallengeRef, KeepPolicy, NetworkMode, SessionState};
 use wargame_core::error::{Result, WargameError};
@@ -301,8 +301,11 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
             Ok(0)
         }
 
-        Command::Doctor { json } => {
-            let checks = doctor(ctx).await;
+        Command::Doctor { json, profile } => {
+            let checks = match &profile {
+                Some(name) => doctor_profile(ctx, name).await,
+                None => doctor(ctx).await,
+            };
             output::print_checks(&checks, json);
             Ok(0)
         }

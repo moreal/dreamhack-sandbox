@@ -2195,6 +2195,7 @@ dependencies = [
  "wargame-core",
  "wargame-dreamhack",
  "wargame-tart",
+ "wargame-utm",
 ]
 
 [[package]]

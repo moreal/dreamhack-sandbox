@@ -182,6 +182,10 @@ pub enum Command {
         /// Print the checks as JSON.
         #[arg(long)]
         json: bool,
+        /// Check only what one profile needs (its backend, mode, network,
+        /// image and guest tooling) instead of every wired backend.
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
     },
     /// List available profiles.
     Profiles {
