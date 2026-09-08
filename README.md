@@ -83,12 +83,20 @@ Your Dreamhack session cookie is stored in the macOS Keychain (service
 
 ```sh
 $ wargame profiles
-NAME                  DESCRIPTION
-macos-minimal-arm64   macOS minimal: shell utilities, Git, Python/uv
-macos-re-arm64        macOS reversing: Ghidra, LLVM, Python/uv
+name                  guest           backend/mode     image
+macos-minimal-arm64   macos/arm64     auto/virtualize  ready
+macos-re-arm64        macos/arm64     auto/virtualize  ready
+kali-arm64            kali/arm64      utm/virtualize   not created
+kali-x86_64           kali/x86_64     utm/emulate      not created
+windows-x86_64        windows/x86_64  utm/emulate      not created
 
 $ wargame profile build macos-re-arm64
 ```
+
+The `image` column is the profile's build state: `ready` (there is an image
+to launch from), `not built`/`not created`, `rebuild needed` (the profile or
+one of its scripts changed since the image was built), or the phase a
+half-finished build stopped at.
 
 `profile build` clones the (large, one-time-downloaded) vanilla Tart base
 image, boots it, generates a per-install ed25519 key under
@@ -100,6 +108,50 @@ written to `$WARGAME_HOME/profiles/scripts/`), runs the profile's
 Tart image (`wargame-profile-<name>`). This step is slow (tens of minutes)
 and is the only place a guest password is ever used — every VM launched
 afterwards authenticates with the key alone.
+
+### Kali and Windows profiles (UTM)
+
+macOS guests come from a ready-made Tart base image. Kali and Windows do
+not: there is no base image to clone, so the first OS installation is done
+by hand, once, in a UTM window — after which every launch clones the image
+that install produced.
+
+```sh
+$ wargame profile init kali-arm64 --name kali-custom     # your own copy, with its own scripts/
+$ wargame profile create kali-custom --iso ~/isos/kali-arm64-installer.iso
+$ wargame profile console kali-custom                    # install the OS in the window that opens
+$ wargame profile build kali-custom                      # provision + verify + publish the image
+$ wargame launch dreamhack:15 --profile kali-custom
+```
+
+`profile init` copies a template under your own name and gives it its own
+`profiles/scripts/<name>/` directory, so your edits are never overwritten
+when a new binary re-seeds the built-in scripts. `profile create` makes one
+long-lived *installation VM* (a blank disk plus the installer ISO, or
+`--from-vm <utm-uuid>` to clone an already-installed VM, which is only ever
+copied) and prints its UUID plus what to prepare in the guest: your user
+account, an SSH server, the QEMU guest agent, and this host's public key in
+`~/.ssh/authorized_keys`. Re-running it with the same source re-prints that
+guidance and creates nothing; pointing it at a *different* source is an
+error rather than a silent second VM. `--sha256 <hex>` is checked against
+the ISO before anything is created.
+
+`profile build` then boots that VM on NAT, waits for the guest agent and
+SSH (30 minutes by default for an emulated x86_64 guest —
+`[vm.utm].boot_timeout_secs`), runs the profile's scripts and `tools.verify`
+commands, shuts the guest down cleanly, and publishes the image as a stopped
+copy. Only that last step marks the profile ready: a guest that is still
+being installed stays in `awaiting-install`, and a failed build keeps the
+previous image launchable. The installation VM is never deleted — it is what
+the next rebuild starts from — and neither it nor the published image is
+touched by `wargame prune`.
+
+Windows 11 additionally needs TPM 2.0 and Secure Boot, which UTM 4.7.5
+cannot set from a script; `profile create` prints the one-time manual step
+(UTM ▸ Settings ▸ QEMU) for a `windows-*` profile. Windows *provisioning*
+(PowerShell in the guest) is not implemented yet and `profile build` says
+so rather than half-provisioning a guest. You supply the Windows ISO and its
+licence.
 
 ```sh
 $ wargame search out_of_bound
@@ -376,17 +428,20 @@ crates/
   wargame-core/       domain types, ports (traits), application services,
                        security helpers, infra adapters, test fakes
   wargame-dreamhack/   Dreamhack provider (implements WargameProvider)
-  wargame-tart/        Tart VM backend (implements VmProvider) + profile
-                       image builder
+  wargame-tart/        Tart VM backend (implements VmProvider) + the Tart
+                       half of the profile image build
+  wargame-utm/         UTM/QEMU VM backend (Kali, Windows) + the UTM half of
+                       the profile image build
   wargame-cli/         CLI (clap) + TUI (ratatui) composition root
 profiles/              built-in profile YAMLs + their provisioning scripts
 guest/                 bootstrap.sh, run inside the guest only
 scripts/e2e-smoke.sh   manual real-VM smoke test (see Testing)
 ```
 
-`wargame-dreamhack` and `wargame-tart` each depend only on `wargame-core` —
-never on each other — so a challenge-source change can never leak into the
-VM backend or vice versa.
+`wargame-dreamhack`, `wargame-tart` and `wargame-utm` each depend only on
+`wargame-core` — never on each other — so a challenge-source change can
+never leak into a VM backend, and the two backends cannot leak into each
+other.
 
 See `MVP.md` for the product spec and `DESIGN.md` for the full technical
 design this implements.
