@@ -23,10 +23,33 @@ fn boot_timeout(ctx: &AppContext, session: &Session) -> Result<std::time::Durati
         .boot_timeout(session.backend()?, session.vm_mode))
 }
 
-pub async fn list_sessions(ctx: &AppContext) -> Result<Vec<Session>> {
+/// One row of [`list_sessions`]: the session as it should be shown, plus
+/// whatever stopped its backend from being asked.
+///
+/// The note exists so a backend problem is never silently swallowed *and*
+/// never fails the whole list: an uninstalled UTM or a denied Automation
+/// grant would otherwise hide every Tart session too (spec.md §6 row 1's
+/// "UTM 미설치·자동화 권한 거부 -> 원인·복구 절차, Tart 작업은 계속 가능").
+/// It serializes flattened, so `sessions --json` keeps the session's own
+/// shape and merely gains the key.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionListing {
+    #[serde(flatten)]
+    pub session: Session,
+    /// Why this row may be out of date: the backend could not be asked for
+    /// the VM's real status. `None` when it answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconcile_error: Option<String>,
+}
+
+pub async fn list_sessions(ctx: &AppContext) -> Result<Vec<SessionListing>> {
     let mut sessions = Vec::new();
     for session in ctx.repo.list().await? {
-        sessions.push(reconcile(ctx, session).await?);
+        let (session, reconcile_error) = reconcile_reporting(ctx, session).await?;
+        sessions.push(SessionListing {
+            session,
+            reconcile_error,
+        });
     }
     Ok(sessions)
 }
@@ -95,12 +118,28 @@ pub async fn inspect(ctx: &AppContext, id: &str) -> Result<Session> {
 /// the record is moved to `Stopped` and saved. A `Missing` VM is a
 /// different problem (delete/prune territory) and is left alone, as is a
 /// backend that cannot answer.
-pub async fn reconcile(ctx: &AppContext, mut session: Session) -> Result<Session> {
+pub async fn reconcile(ctx: &AppContext, session: Session) -> Result<Session> {
+    Ok(reconcile_reporting(ctx, session).await?.0)
+}
+
+/// [`reconcile`], also saying why the backend could not be asked.
+///
+/// A backend that cannot answer -- UTM is not installed, the Automation
+/// grant was denied -- is not a reason to fail the caller: the record is
+/// returned exactly as it stands, together with the error, so a list can
+/// show the problem on that row and keep every other session visible. The
+/// error is never dropped: callers that *act* on the session (`stop`,
+/// `resume`, `delete`) reach the backend again straight afterwards and
+/// surface its real failure there.
+async fn reconcile_reporting(
+    ctx: &AppContext,
+    mut session: Session,
+) -> Result<(Session, Option<String>)> {
     if !session.state.is_up() {
-        return Ok(session);
+        return Ok((session, None));
     }
     let Some(vm_ref) = &session.vm_ref else {
-        return Ok(session);
+        return Ok((session, None));
     };
     // A backend this build has no adapter for is treated like one that
     // cannot answer: the record is left exactly as it is rather than
@@ -114,12 +153,27 @@ pub async fn reconcile(ctx: &AppContext, mut session: Session) -> Result<Session
                 error = %e,
                 "no adapter for this session's backend; leaving the record untouched"
             );
-            return Ok(session);
+            return Ok((session, Some(e.to_string())));
         }
     };
     let vm_ref = vm_ref.clone();
-    if vm.status(&vm_ref).await? != VmStatus::Stopped {
-        return Ok(session);
+    let status = match vm.status(&vm_ref).await {
+        Ok(status) => status,
+        Err(e) => {
+            // The backend itself is unreachable. Failing here would take
+            // every other session down with it, so the record is left as it
+            // is and the reason travels with the row instead.
+            tracing::warn!(
+                session = %session.id,
+                backend = %session.backend_name(),
+                error = %e,
+                "backend could not report this VM's status; leaving the record untouched"
+            );
+            return Ok((session, Some(e.to_string())));
+        }
+    };
+    if status != VmStatus::Stopped {
+        return Ok((session, None));
     }
     tracing::info!(
         session = %session.id,
@@ -132,7 +186,7 @@ pub async fn reconcile(ctx: &AppContext, mut session: Session) -> Result<Session
     session.transition(SessionState::Stopped)?;
     session.runner_pid = None;
     ctx.repo.save(&session).await?;
-    Ok(session)
+    Ok((session, None))
 }
 
 /// Stops a `Ready` or `Running` session's VM.
@@ -290,6 +344,24 @@ pub struct UnmanagedVm {
     pub name: String,
 }
 
+/// One backend `prune` could not sweep at all.
+///
+/// A host that never installed UTM answers every `utm` call with
+/// [`crate::error::WargameError::BackendUnavailable`], and a denied
+/// Automation grant behaves the same way. That must not fail the whole
+/// sweep -- the Tart VMs are still there to clean up -- and it must not be
+/// hidden either, or the user is told "no orphaned VMs" about a backend
+/// nobody looked at (spec.md §6 row 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedBackend {
+    /// The backend that could not be asked (`"utm"`, `"tart"`).
+    pub backend: String,
+    /// Its own error message, verbatim.
+    pub error: String,
+    /// The error's next step, when it has one.
+    pub hint: Option<String>,
+}
+
 /// What one [`prune`] pass found. Every VM is named `<backend>/<name>`,
 /// because a name alone is not unique across backends.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -305,6 +377,9 @@ pub struct PruneReport {
     /// home's VMs, or the user's own. Reported so they are not a mystery,
     /// never touched (spec.md §3 FR-5).
     pub unmanaged: Vec<UnmanagedVm>,
+    /// Backends that could not be swept, with the reason. Their VMs were
+    /// neither examined nor touched.
+    pub skipped: Vec<SkippedBackend>,
 }
 
 impl PruneReport {
@@ -314,9 +389,13 @@ impl PruneReport {
         self.unmanaged.iter().map(|u| u.vm.as_str()).collect()
     }
 
-    /// Whether there is nothing at all to report.
+    /// Whether there is nothing at all to report. A skipped backend counts:
+    /// "no orphaned VMs found" would claim a sweep that never ran.
     pub fn is_empty(&self) -> bool {
-        self.orphans.is_empty() && self.running.is_empty() && self.unmanaged.is_empty()
+        self.orphans.is_empty()
+            && self.running.is_empty()
+            && self.unmanaged.is_empty()
+            && self.skipped.is_empty()
     }
 }
 
@@ -381,7 +460,29 @@ pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<PruneReport> {
 
     let mut report = PruneReport::default();
     for vm in ctx.backends.all() {
-        for vm_ref in vm.list().await? {
+        // One backend being unreachable is not a reason to abandon the
+        // others: it is recorded and the sweep goes on (spec.md §6 row 1,
+        // "Tart 작업은 계속 가능").
+        let mut skip = |error: WargameError| {
+            tracing::warn!(
+                backend = %vm.name(),
+                error = %error,
+                "backend could not be swept; leaving its VMs alone"
+            );
+            report.skipped.push(SkippedBackend {
+                backend: vm.name().to_string(),
+                hint: error.hint(),
+                error: error.to_string(),
+            });
+        };
+        let listed = match vm.list().await {
+            Ok(listed) => listed,
+            Err(e) => {
+                skip(e);
+                continue;
+            }
+        };
+        for vm_ref in listed {
             let label = format!("{}/{}", vm_ref.backend, vm_ref.name);
             if build_owned.contains(&(vm_ref.backend.clone(), vm_ref.id.clone())) {
                 continue;
@@ -401,7 +502,17 @@ pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<PruneReport> {
             if session.keep == KeepPolicy::Keep || !is_leftover(session.state) {
                 continue;
             }
-            match vm.status(&vm_ref).await? {
+            // A backend that stops answering mid-sweep is the same problem
+            // as one that never answered: report it and move to the next
+            // backend rather than failing the whole prune.
+            let status = match vm.status(&vm_ref).await {
+                Ok(status) => status,
+                Err(e) => {
+                    skip(e);
+                    break;
+                }
+            };
+            match status {
                 VmStatus::Running => report.running.push(RunningLeftover {
                     vm: label,
                     session: session.id.clone(),
@@ -411,7 +522,10 @@ pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<PruneReport> {
                 VmStatus::Missing => {}
                 VmStatus::Stopped => {
                     if !dry_run {
-                        vm.delete(&vm_ref).await?;
+                        if let Err(e) = vm.delete(&vm_ref).await {
+                            skip(e);
+                            break;
+                        }
                         settle_record(ctx, session).await?;
                     }
                     report.orphans.push(label);
@@ -709,7 +823,8 @@ mod tests {
         drifted_session(&f, "s").await;
 
         let listed = list_sessions(&f.ctx).await.unwrap();
-        assert_eq!(listed[0].state, SessionState::Stopped);
+        assert_eq!(listed[0].session.state, SessionState::Stopped);
+        assert_eq!(listed[0].reconcile_error, None);
         assert_eq!(
             inspect(&f.ctx, "s").await.unwrap().state,
             SessionState::Stopped
@@ -996,6 +1111,144 @@ mod tests {
             "the Tart VM no record owns must survive"
         );
         assert!(utm.vm_names().is_empty());
+    }
+
+    /// A macOS-only host has no UTM, so every `utm` call fails before it
+    /// reaches the app. `prune` must still sweep Tart and report the
+    /// backend it could not ask, rather than exiting non-zero for every
+    /// user who never installed UTM (spec.md §6 row 1: "UTM 미설치·자동화
+    /// 권한 거부 -> 원인·복구 절차, Tart 작업은 계속 가능").
+    #[tokio::test]
+    async fn prune_skips_a_backend_it_cannot_list_and_still_sweeps_the_others() {
+        let Fixture { mut ctx, vm, .. } = fixture();
+        let utm = Arc::new(FakeVmProvider::with_backend("utm"));
+        utm.set_fail_on("list");
+        utm.set_fail_on("status");
+        ctx.backends = BackendRegistry::new(vec![
+            vm.clone() as Arc<dyn VmProvider>,
+            utm.clone() as Arc<dyn VmProvider>,
+        ]);
+        let leftover_ref = vm
+            .create(&VmSpec::new(
+                "wg-leftover".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
+                    cpu: 1,
+                    memory_mib: 1024,
+                    disk_gib: 10,
+                },
+            ))
+            .await
+            .unwrap();
+        let mut leftover = sample_session("leftover", SessionState::Deleting, KeepPolicy::Discard);
+        leftover.vm_ref = Some(leftover_ref);
+        ctx.repo.save(&leftover).await.unwrap();
+
+        let report = prune(&ctx, false).await.unwrap();
+
+        assert_eq!(report.orphans, vec!["tart/wg-leftover".to_string()]);
+        assert!(vm.vm_names().is_empty(), "the Tart leftover must be gone");
+        let skipped = &report.skipped;
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].backend, "utm");
+        assert!(
+            skipped[0].error.contains("utm"),
+            "the skip must carry the backend's own error: {skipped:?}"
+        );
+        assert_eq!(skipped[0].hint.as_deref(), Some("wargame doctor"));
+        assert!(!report.is_empty(), "a skipped backend is worth reporting");
+    }
+
+    /// A `prune` that found nothing but could not ask one backend is not an
+    /// empty report: saying "no orphaned VMs found" would claim a sweep
+    /// that never happened.
+    #[tokio::test]
+    async fn a_prune_report_with_only_a_skip_is_not_empty() {
+        let Fixture { mut ctx, .. } = fixture();
+        let utm = Arc::new(FakeVmProvider::with_backend("utm"));
+        utm.set_fail_on("list");
+        ctx.backends = BackendRegistry::new(vec![utm as Arc<dyn VmProvider>]);
+
+        let report = prune(&ctx, true).await.unwrap();
+        assert!(report.orphans.is_empty());
+        assert!(!report.is_empty());
+        assert_eq!(report.skipped.len(), 1);
+    }
+
+    /// One unreachable backend must not make `wargame sessions` fail
+    /// wholesale: the Tart sessions still list, the UTM row keeps its
+    /// recorded state, and the backend problem is attached to that row
+    /// instead of being swallowed (spec.md §6 row 1).
+    #[tokio::test]
+    async fn list_sessions_survives_a_backend_that_cannot_answer_and_says_so() {
+        let Fixture { mut ctx, vm, .. } = fixture();
+        let utm = Arc::new(FakeVmProvider::with_backend("utm"));
+        utm.set_fail_on("status");
+        ctx.backends = BackendRegistry::new(vec![
+            vm.clone() as Arc<dyn VmProvider>,
+            utm.clone() as Arc<dyn VmProvider>,
+        ]);
+        let mut on_utm = sample_session("utm-one", SessionState::Ready, KeepPolicy::Discard);
+        on_utm.vm_provider = "utm".to_string();
+        on_utm.vm_ref = Some(crate::domain::VmRef::new("utm", "wg-utm-one"));
+        ctx.repo.save(&on_utm).await.unwrap();
+        let mut on_tart = sample_session("tart-one", SessionState::Ready, KeepPolicy::Discard);
+        on_tart.vm_ref = Some(crate::domain::VmRef::new("tart", "wg-tart-one"));
+        ctx.repo.save(&on_tart).await.unwrap();
+
+        let listed = list_sessions(&ctx).await.unwrap();
+
+        assert_eq!(listed.len(), 2, "both sessions must still be visible");
+        let utm_row = listed.iter().find(|l| l.session.id == "utm-one").unwrap();
+        assert_eq!(
+            utm_row.session.state,
+            SessionState::Ready,
+            "an unanswerable backend leaves the record untouched"
+        );
+        assert!(
+            utm_row
+                .reconcile_error
+                .as_deref()
+                .is_some_and(|e| e.contains("utm")),
+            "the backend problem must reach the row: {utm_row:?}"
+        );
+        let tart_row = listed.iter().find(|l| l.session.id == "tart-one").unwrap();
+        assert_eq!(tart_row.reconcile_error, None);
+    }
+
+    /// `inspect` follows the same rule -- it must not fail wholesale --
+    /// while an *explicit* `stop`/`resume`/`delete` on that session still
+    /// returns the backend's real error rather than pretending to work.
+    #[tokio::test]
+    async fn explicit_operations_still_fail_on_an_unreachable_backend() {
+        let Fixture { mut ctx, .. } = fixture();
+        let utm = Arc::new(FakeVmProvider::with_backend("utm"));
+        for step in ["status", "stop", "start", "delete"] {
+            utm.set_fail_on(step);
+        }
+        ctx.backends = BackendRegistry::new(vec![utm as Arc<dyn VmProvider>]);
+        let mut session = sample_session("utm-one", SessionState::Ready, KeepPolicy::Discard);
+        session.vm_provider = "utm".to_string();
+        session.vm_ref = Some(crate::domain::VmRef::new("utm", "wg-utm-one"));
+        ctx.repo.save(&session).await.unwrap();
+
+        assert_eq!(
+            inspect(&ctx, "utm-one").await.unwrap().state,
+            SessionState::Ready,
+            "inspect must not fail on a backend that cannot answer"
+        );
+        let stop_err = stop(&ctx, "utm-one").await.unwrap_err().to_string();
+        assert!(stop_err.contains("fake stop failure"), "{stop_err}");
+        let delete_err = delete(&ctx, "utm-one", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(delete_err.contains("fake delete failure"), "{delete_err}");
+        let mut stopped = ctx.repo.load("utm-one").await.unwrap();
+        stopped.state = SessionState::Stopped;
+        ctx.repo.save(&stopped).await.unwrap();
+        let resume_err = resume(&ctx, "utm-one").await.unwrap_err().to_string();
+        assert!(resume_err.contains("fake start failure"), "{resume_err}");
     }
 
     /// A session's backend comes from the VM ref it actually created on,

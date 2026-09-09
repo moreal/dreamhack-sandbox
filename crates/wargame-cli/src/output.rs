@@ -5,7 +5,7 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, Table};
 use serde::Serialize;
 use time::OffsetDateTime;
 
-use wargame_core::app::{Check, CheckStatus, ProfileOverview};
+use wargame_core::app::{Check, CheckStatus, ProfileOverview, SessionListing};
 use wargame_core::domain::{Challenge, KeepPolicy, Profile, Session};
 use wargame_core::ports::SearchPage;
 
@@ -113,7 +113,15 @@ fn keep_marker(keep: KeepPolicy) -> &'static str {
     }
 }
 
-pub fn print_sessions(sessions: &[Session], json: bool) {
+/// `sessions`: one row per local session record, reconciled against its
+/// backend where that backend could be asked.
+///
+/// A backend that could not be asked -- UTM is not installed, the
+/// Automation grant was denied -- never removes rows and never fails the
+/// command: the affected rows are marked and the reason is printed
+/// underneath, so a macOS-only host still sees all of its Tart sessions
+/// (spec.md §6 row 1).
+pub fn print_sessions(sessions: &[SessionListing], json: bool) {
     if json {
         print_json(&sessions);
         return;
@@ -131,9 +139,13 @@ pub fn print_sessions(sessions: &[Session], json: bool) {
     table.set_header(vec![
         "id", "title", "state", "backend", "network", "profile", "keep", "age",
     ]);
-    for s in sessions {
+    for listing in sessions {
+        let s = &listing.session;
         table.add_row(vec![
-            s.id.clone(),
+            match listing.reconcile_error {
+                Some(_) => format!("! {}", s.id),
+                None => s.id.clone(),
+            },
             s.display_name.clone(),
             s.state.to_string(),
             s.backend_name().to_string(),
@@ -144,10 +156,25 @@ pub fn print_sessions(sessions: &[Session], json: bool) {
         ]);
     }
     println!("{table}");
-    let up = sessions.iter().filter(|s| s.state.is_up()).count();
+    for listing in sessions {
+        if let Some(error) = &listing.reconcile_error {
+            println!(
+                "! {} ({}): {error}",
+                listing.session.id,
+                listing.session.backend_name()
+            );
+            println!(
+                "  The state above is the last one recorded; this backend could not confirm it."
+            );
+        }
+    }
+    let up = sessions
+        .iter()
+        .filter(|listing| listing.session.state.is_up())
+        .count();
     let failed = sessions
         .iter()
-        .filter(|s| s.state == wargame_core::domain::SessionState::Failed)
+        .filter(|listing| listing.session.state == wargame_core::domain::SessionState::Failed)
         .count();
     let mut summary = format!("{} session(s), {up} up", sessions.len());
     if failed > 0 {

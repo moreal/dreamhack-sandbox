@@ -1,7 +1,7 @@
 //! Sessions screen (MVP.md §7.3, DESIGN.md §7's `tui/sessions.rs`): a table
 //! of local sessions with stop/resume/keep/delete/ssh/gui (delete asks `y/N`).
 
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
@@ -20,6 +20,23 @@ fn state_style(state: SessionState) -> Style {
     }
 }
 
+/// One line per session whose backend could not be asked, so an
+/// uninstalled UTM (or a denied Automation grant) is visible as a *stale
+/// row*, not as an empty list or a silently wrong state (spec.md §6 row 1).
+fn backend_notes(app: &App) -> Vec<String> {
+    app.sessions
+        .iter()
+        .filter_map(|l| {
+            let error = l.reconcile_error.as_deref()?;
+            Some(format!(
+                "! {} ({}): {error} — the state shown is the last one recorded",
+                l.session.id,
+                l.session.backend_name()
+            ))
+        })
+        .collect()
+}
+
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let title = if app.pending_delete.is_some() {
         "Sessions — delete this session? [y/N]"
@@ -27,6 +44,23 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         "Sessions"
     };
     let block = Block::default().borders(Borders::ALL).title(title);
+
+    // The notes take the bottom of the pane, never the whole of it: the
+    // table is what the user came for.
+    let notes = backend_notes(app);
+    let (area, notes_area) = if notes.is_empty() || area.height < 4 {
+        (area, None)
+    } else {
+        let lines = (notes.len() as u16).min(area.height / 3).max(1);
+        let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(lines)]).split(area);
+        (parts[0], Some(parts[1]))
+    };
+    if let Some(notes_area) = notes_area {
+        frame.render_widget(
+            Paragraph::new(notes.join("\n")).style(Style::default().fg(Color::Yellow)),
+            notes_area,
+        );
+    }
 
     if app.sessions.is_empty() {
         let empty =
@@ -49,9 +83,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let rows: Vec<Row> = app
         .sessions
         .iter()
-        .map(|s| {
+        .map(|listing| {
+            let s = &listing.session;
             Row::new(vec![
-                Cell::from(s.id.clone()),
+                // A row whose backend could not be asked is marked here and
+                // explained underneath, rather than reading as confirmed.
+                Cell::from(match listing.reconcile_error {
+                    Some(_) => format!("! {}", s.id),
+                    None => s.id.clone(),
+                }),
                 Cell::from(s.display_name.clone()),
                 Cell::from(s.state.to_string()).style(state_style(s.state)),
                 Cell::from(s.backend_name().to_string()),
@@ -91,6 +131,7 @@ mod tests {
     use crate::tui::widgets::buffer_text;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use wargame_core::app::SessionListing;
     use wargame_core::domain::{NetworkMode, Session};
 
     /// A session record as the pre-multi-OS build wrote it: no
@@ -148,6 +189,18 @@ mod tests {
     }
 
     fn render(sessions: Vec<Session>) -> String {
+        render_listings(
+            sessions
+                .into_iter()
+                .map(|session| SessionListing {
+                    session,
+                    reconcile_error: None,
+                })
+                .collect(),
+        )
+    }
+
+    fn render_listings(sessions: Vec<SessionListing>) -> String {
         let mut app = App::new("macos-re-arm64".to_string(), NetworkMode::Isolated, vec![]);
         app.sessions = sessions;
         let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
@@ -182,6 +235,26 @@ mod tests {
             "a missing id falls back to the name"
         );
         assert!(render(vec![session]).contains("stopped"));
+    }
+
+    /// One backend being unreachable must not blank the table: every
+    /// session is still listed, the affected row is marked, and the reason
+    /// is on screen (spec.md §6 row 1: "Tart 작업은 계속 가능").
+    #[test]
+    fn a_session_whose_backend_could_not_be_asked_is_marked_and_explained() {
+        let rendered = render_listings(vec![
+            SessionListing {
+                session: utm_session(),
+                reconcile_error: Some("VM backend utm unavailable: utmctl not found".to_string()),
+            },
+            SessionListing {
+                session: legacy_session(),
+                reconcile_error: None,
+            },
+        ]);
+        assert!(rendered.contains("dh-legacy-000001"), "{rendered}");
+        assert!(rendered.contains("! dh-kali-000002"), "{rendered}");
+        assert!(rendered.contains("utmctl not found"), "{rendered}");
     }
 
     #[test]

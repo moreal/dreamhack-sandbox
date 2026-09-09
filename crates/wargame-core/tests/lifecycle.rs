@@ -583,7 +583,7 @@ async fn stop_resume_and_delete_act_only_on_the_sessions_own_backend() {
 
     let listed = list_sessions(&ctx).await.unwrap();
     assert_eq!(listed.len(), 2);
-    let mut backends: Vec<&str> = listed.iter().map(|s| s.backend_name()).collect();
+    let mut backends: Vec<&str> = listed.iter().map(|s| s.session.backend_name()).collect();
     backends.sort_unstable();
     assert_eq!(backends, vec!["tart", "utm"]);
 

@@ -762,5 +762,15 @@ async fn a_session_whose_backend_is_not_wired_reports_it_by_name() {
     // command.
     let listed = list_sessions(&ctx).await.unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].state, SessionState::Running);
+    assert_eq!(listed[0].session.state, SessionState::Running);
+    // ... and the row says why it may be out of date, instead of quietly
+    // showing a state nobody could confirm.
+    assert!(
+        listed[0]
+            .reconcile_error
+            .as_deref()
+            .is_some_and(|e| e.contains("utm")),
+        "{:?}",
+        listed[0].reconcile_error
+    );
 }

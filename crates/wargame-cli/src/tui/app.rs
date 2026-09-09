@@ -6,7 +6,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use wargame_core::app::{LaunchEvent, LaunchRequest};
+use wargame_core::app::{LaunchEvent, LaunchRequest, SessionListing};
 use wargame_core::domain::{
     Challenge, ChallengeRef, KeepPolicy, NetworkMode, Session, SessionState,
 };
@@ -34,7 +34,7 @@ pub enum Msg {
     SearchResults(SearchPage),
     Challenge(Challenge),
     Launch(LaunchEvent),
-    Sessions(Vec<Session>),
+    Sessions(Vec<SessionListing>),
     Error(String),
 }
 
@@ -64,7 +64,9 @@ pub struct App {
     pub search: SearchState,
     pub problem: Option<ProblemState>,
     pub launch: Option<LaunchState>,
-    pub sessions: Vec<Session>,
+    /// The session rows, each carrying whatever stopped its backend from
+    /// being asked -- a UTM that is not installed must not blank the list.
+    pub sessions: Vec<SessionListing>,
     pub status: String,
     /// Selection cursor for the Sessions screen's list.
     pub sessions_selected: usize,
@@ -501,7 +503,9 @@ impl App {
     }
 
     fn selected_session(&self) -> Option<&Session> {
-        self.sessions.get(self.sessions_selected)
+        self.sessions
+            .get(self.sessions_selected)
+            .map(|l| &l.session)
     }
 }
 
@@ -591,6 +595,14 @@ mod tests {
             guest_ip: None,
             connection: GuestConnection::default(),
             workspace_root: "/Users/admin/wargame".to_string(),
+        }
+    }
+
+    /// A row as `list_sessions` hands it over when its backend answered.
+    fn listing(session: Session) -> SessionListing {
+        SessionListing {
+            session,
+            reconcile_error: None,
         }
     }
 
@@ -746,7 +758,10 @@ mod tests {
         let mut a = app();
         let mut stopped = sample_session("dh-stopped");
         stopped.state = SessionState::Stopped;
-        a.update(Msg::Sessions(vec![sample_session("dh-ready"), stopped]));
+        a.update(Msg::Sessions(vec![
+            listing(sample_session("dh-ready")),
+            listing(stopped),
+        ]));
         a.screen = Screen::Sessions;
 
         // Ready: Enter -> ssh, x -> stop, r -> explains.
@@ -799,7 +814,7 @@ mod tests {
     #[test]
     fn sessions_screen_delete_requires_confirmation() {
         let mut a = app();
-        a.update(Msg::Sessions(vec![sample_session("dh-a-1")]));
+        a.update(Msg::Sessions(vec![listing(sample_session("dh-a-1"))]));
         a.screen = Screen::Sessions;
 
         let effects = a.update(key(KeyCode::Char('d')));

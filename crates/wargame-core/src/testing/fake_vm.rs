@@ -1,7 +1,7 @@
 //! An in-memory [`VmProvider`] for exercising the launch/lifecycle
 //! application services without Tart.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -29,7 +29,7 @@ pub struct FakeVmProvider {
     name: String,
     images: Mutex<Vec<String>>,
     vms: Mutex<BTreeMap<String, VmEntry>>,
-    fail_on: Mutex<Option<&'static str>>,
+    fail_on: Mutex<BTreeSet<&'static str>>,
     calls: Mutex<Vec<String>>,
     specs: Mutex<Vec<VmSpec>>,
     wait_ip_timeouts: Mutex<Vec<Duration>>,
@@ -57,7 +57,7 @@ impl FakeVmProvider {
             name: name.into(),
             images: Mutex::new(Vec::new()),
             vms: Mutex::new(BTreeMap::new()),
-            fail_on: Mutex::new(None),
+            fail_on: Mutex::new(BTreeSet::new()),
             calls: Mutex::new(Vec::new()),
             specs: Mutex::new(Vec::new()),
             wait_ip_timeouts: Mutex::new(Vec::new()),
@@ -106,10 +106,13 @@ impl FakeVmProvider {
         *self.isolated_network.lock().unwrap() = value;
     }
 
-    /// Steps: `"healthcheck"`, `"create"`, `"start"`, `"wait_ip"`,
-    /// `"stop"`, `"delete"`.
+    /// Steps: `"healthcheck"`, `"image_exists"`, `"create"`, `"start"`,
+    /// `"wait_ip"`, `"stop"`, `"delete"`, `"status"`, `"list"`.
+    ///
+    /// Additive: call it once per step to model a backend that is wholly
+    /// unreachable -- an uninstalled UTM answers nothing, not one thing.
     pub fn set_fail_on(&self, step: &'static str) {
-        *self.fail_on.lock().unwrap() = Some(step);
+        self.fail_on.lock().unwrap().insert(step);
     }
 
     /// Registers a VM this fake did not create, so a test can act on one
@@ -149,11 +152,18 @@ impl FakeVmProvider {
     }
 
     fn should_fail(&self, step: &str) -> bool {
-        self.fail_on
-            .lock()
-            .unwrap()
-            .map(|s| s == step)
-            .unwrap_or(false)
+        self.fail_on.lock().unwrap().contains(step)
+    }
+
+    /// What an absent backend answers with: the same
+    /// [`WargameError::BackendUnavailable`] a missing `utmctl` produces, so
+    /// a caller can be checked for surviving a whole backend being gone
+    /// (spec.md §6's "UTM 미설치·자동화 권한 거부").
+    fn unavailable(&self, step: &str) -> WargameError {
+        WargameError::BackendUnavailable {
+            backend: self.name.clone(),
+            reason: format!("fake {step} failure"),
+        }
     }
 
     fn record(&self, call: &str) {
@@ -300,6 +310,9 @@ impl VmProvider for FakeVmProvider {
 
     async fn status(&self, vm: &VmRef) -> Result<VmStatus> {
         self.record("status");
+        if self.should_fail("status") {
+            return Err(self.unavailable("status"));
+        }
         Ok(self
             .vms
             .lock()
@@ -311,6 +324,9 @@ impl VmProvider for FakeVmProvider {
 
     async fn list(&self) -> Result<Vec<VmRef>> {
         self.record("list");
+        if self.should_fail("list") {
+            return Err(self.unavailable("list"));
+        }
         Ok(self
             .vms
             .lock()
@@ -393,6 +409,24 @@ mod tests {
         let vm = FakeVmProvider::new();
         vm.set_fail_on("create");
         assert!(vm.create(&spec()).await.is_err());
+    }
+
+    /// A backend that is not installed answers nothing at all: `list` and
+    /// `status` fail the same way a missing `utmctl` does, and the steps
+    /// accumulate rather than replacing one another.
+    #[tokio::test]
+    async fn set_fail_on_list_and_status_models_an_absent_backend() {
+        let vm = FakeVmProvider::with_backend("utm");
+        vm.set_fail_on("list");
+        vm.set_fail_on("status");
+        assert!(matches!(
+            vm.list().await,
+            Err(WargameError::BackendUnavailable { backend, .. }) if backend == "utm"
+        ));
+        assert!(matches!(
+            vm.status(&VmRef::new("utm", "wg-x")).await,
+            Err(WargameError::BackendUnavailable { .. })
+        ));
     }
 
     #[tokio::test]

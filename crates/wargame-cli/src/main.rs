@@ -16,7 +16,7 @@ use wargame_core::app::{
     build_profile_image, create_profile_vm, delete, doctor, doctor_profile, init_profile, inspect,
     keep, launch, list_sessions, open, open_gui, open_profile_console, profile_overviews,
     profile_vm, prune, resolve_session, resume, search, ssh_command, stop, AppContext,
-    CreateSource, LaunchEvent, LaunchRequest, UnmanagedVm,
+    CreateSource, LaunchEvent, LaunchRequest, SkippedBackend, UnmanagedVm,
 };
 use wargame_core::domain::{ChallengeRef, KeepPolicy, NetworkMode, SessionState};
 use wargame_core::error::{Result, WargameError};
@@ -315,6 +315,13 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
                     println!("  {} — {}", vm.vm, manual_removal_hint(vm));
                 }
             }
+            // A backend that could not be asked is the one thing `prune`
+            // must never pass over in silence: its VMs were not examined,
+            // so "no orphaned VMs" would be a claim about a sweep that
+            // never ran (spec.md §6 row 1).
+            for skipped in &report.skipped {
+                print!("{}", skipped_backend_note(skipped));
+            }
             if !report.orphans.is_empty() {
                 if dry_run {
                     println!(
@@ -354,6 +361,24 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
 
         Command::Completions { .. } => unreachable!("handled before the context is built"),
     }
+}
+
+/// The lines `prune` prints for a backend it could not sweep at all.
+///
+/// A host that never installed UTM (or denied its Automation grant) still
+/// gets its Tart VMs swept; this says which backend was left out, why, and
+/// what to run about it, so the rest of the report is not read as complete
+/// (spec.md §6 row 1: "UTM 미설치·자동화 권한 거부 -> 원인·복구 절차, Tart
+/// 작업은 계속 가능").
+fn skipped_backend_note(skipped: &SkippedBackend) -> String {
+    let mut note = format!(
+        "{} could not be asked, so its VMs were not examined: {}\n",
+        skipped.backend, skipped.error
+    );
+    if let Some(hint) = &skipped.hint {
+        note.push_str(&format!("  Try: {}\n", hint.replace('\n', "\n       ")));
+    }
+    note
 }
 
 /// What to run to remove a VM `wargame` will not touch, on the backend it
@@ -724,6 +749,29 @@ mod tests {
             backend: backend.to_string(),
             name: name.to_string(),
         }
+    }
+
+    /// A backend `prune` could not sweep is named, with its own error and
+    /// the next step, so the report is never read as a complete sweep
+    /// (spec.md §6 row 1).
+    #[test]
+    fn a_backend_that_could_not_be_swept_is_named_with_its_reason() {
+        let note = skipped_backend_note(&SkippedBackend {
+            backend: "utm".to_string(),
+            error: "VM backend utm unavailable: utmctl not found".to_string(),
+            hint: Some("wargame doctor".to_string()),
+        });
+        assert!(note.starts_with("utm could not be asked"), "{note}");
+        assert!(note.contains("utmctl not found"), "{note}");
+        assert!(note.contains("Try: wargame doctor"), "{note}");
+        assert!(note.ends_with('\n'), "{note:?}");
+
+        let no_hint = skipped_backend_note(&SkippedBackend {
+            backend: "tart".to_string(),
+            error: "boom".to_string(),
+            hint: None,
+        });
+        assert!(!no_hint.contains("Try:"), "{no_hint}");
     }
 
     /// `prune` never deletes a VM no record here owns, so the row that says
