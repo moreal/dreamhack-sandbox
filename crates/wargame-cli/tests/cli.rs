@@ -51,6 +51,23 @@ fn help_lists_every_command() {
     }
 }
 
+/// `prune` covers every wired backend, not just Tart, and says what it
+/// decides ownership from (spec.md §3 FR-5).
+#[test]
+fn prune_help_does_not_promise_a_tart_only_sweep() {
+    let out = Command::new(bin())
+        .args(["prune", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let stdout = stdout_of(&out);
+    assert!(
+        !stdout.contains("Tart"),
+        "prune --help still says Tart:\n{stdout}"
+    );
+    assert!(stdout.contains("records"), "{stdout}");
+}
+
 #[test]
 fn no_subcommand_without_a_tty_declines_the_tui_and_exits_2() {
     // `Command::output()` pipes stdin/stdout, so this exercises Task 8's

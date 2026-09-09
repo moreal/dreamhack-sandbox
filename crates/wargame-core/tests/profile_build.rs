@@ -1359,8 +1359,11 @@ async fn prune_never_deletes_a_vm_a_build_record_owns() {
         .await
         .unwrap();
 
-    let pruned = wargame_core::app::prune(&f.ctx, true).await.unwrap();
-    assert_eq!(pruned, vec!["utm/wg-orphan".to_string()]);
+    let report = wargame_core::app::prune(&f.ctx, true).await.unwrap();
+    // The installer VM is owned by a record, so it is never even a
+    // candidate; the VM nobody here claims is reported, not deleted.
+    assert!(report.orphans.is_empty(), "{report:?}");
+    assert_eq!(report.unmanaged, vec!["utm/wg-orphan".to_string()]);
 }
 
 // --- the Tart path stays what it was --------------------------------------

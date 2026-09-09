@@ -177,17 +177,113 @@ async fn stop_then_resume_round_trips_through_the_fake_vm() {
     assert!(resumed.guest_ip.is_some());
 }
 
+/// Ownership is what a record says, not what a name starts with (spec.md §3
+/// FR-5: "앱 기록의 UUID와 소유권을 대조한다"). The VM a session record owns
+/// after an interrupted `delete` is the one thing `prune` may remove.
 #[tokio::test]
-async fn prune_finds_an_orphan_vm_but_leaves_a_tracked_one_alone() {
+async fn prune_deletes_a_leftover_vm_this_home_owns() {
+    let (ctx, vm) = context();
+    let vm_ref = vm
+        .create(&VmSpec::new(
+            "wg-half-deleted".to_string(),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
+        .await
+        .unwrap();
+    // A `delete` that died between "the VM is going" and "the record is
+    // gone" leaves exactly this behind.
+    let mut s = session("half-deleted", SessionState::Deleting, KeepPolicy::Discard);
+    s.vm_ref = Some(vm_ref);
+    ctx.repo.save(&s).await.unwrap();
+
+    let dry = prune(&ctx, true).await.unwrap();
+    assert_eq!(dry.orphans, vec!["tart/wg-half-deleted".to_string()]);
+    assert!(dry.unmanaged.is_empty(), "{dry:?}");
+    assert_eq!(vm.vm_names().len(), 1, "a dry run must not delete");
+
+    let report = prune(&ctx, false).await.unwrap();
+    assert_eq!(report.orphans, vec!["tart/wg-half-deleted".to_string()]);
+    assert!(vm.vm_names().is_empty());
+}
+
+/// spec.md §3 FR-5: "이름 prefix만으로 외부 VM을 삭제하지 않는다". A VM that
+/// merely carries the configured prefix -- another `WARGAME_HOME`'s build
+/// VM, say -- is somebody else's. `prune` reports it so it is not a
+/// mystery, and never offers to delete it.
+#[tokio::test]
+async fn prune_never_deletes_a_prefix_matching_vm_no_record_here_owns() {
     let (ctx, vm) = context();
     vm.create(&VmSpec::new(
-        "wg-orphan".to_string(),
+        "wg-build-kali-other-home".to_string(),
         ImageRef("img".to_string()),
         small_resources(),
     ))
     .await
     .unwrap();
-    let tracked_ref = vm
+
+    for dry_run in [true, false] {
+        let report = prune(&ctx, dry_run).await.unwrap();
+        assert!(report.orphans.is_empty(), "{report:?}");
+        assert_eq!(
+            report.unmanaged,
+            vec!["tart/wg-build-kali-other-home".to_string()]
+        );
+    }
+    assert_eq!(
+        vm.vm_names(),
+        vec!["wg-build-kali-other-home".to_string()],
+        "a VM this home does not own must survive `prune`"
+    );
+    assert!(
+        !vm.calls().iter().any(|c| c == "delete"),
+        "the backend must never even be asked to delete it: {:?}",
+        vm.calls()
+    );
+}
+
+/// `prune` never stops a VM, so a leftover that is still running is
+/// reported with the session to delete instead -- never deleted from under
+/// a live guest.
+#[tokio::test]
+async fn prune_reports_but_never_deletes_a_running_leftover() {
+    let (ctx, vm) = context();
+    let vm_ref = vm
+        .create(&VmSpec::new(
+            "wg-still-up".to_string(),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
+        .await
+        .unwrap();
+    vm.start(
+        &vm_ref,
+        &StartOptions {
+            network: NetworkMode::Isolated,
+            headless: true,
+            log_path: "/dev/null".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut s = session("still-up", SessionState::Failed, KeepPolicy::Discard);
+    s.vm_ref = Some(vm_ref);
+    ctx.repo.save(&s).await.unwrap();
+
+    let report = prune(&ctx, false).await.unwrap();
+    assert!(report.orphans.is_empty(), "{report:?}");
+    assert_eq!(report.running.len(), 1, "{report:?}");
+    assert_eq!(report.running[0].vm, "tart/wg-still-up");
+    assert_eq!(report.running[0].session, "still-up");
+    assert_eq!(vm.vm_names(), vec!["wg-still-up".to_string()]);
+}
+
+/// A session that is still alive owns its VM: `prune` says nothing about it
+/// and touches nothing.
+#[tokio::test]
+async fn prune_leaves_a_live_sessions_vm_alone() {
+    let (ctx, vm) = context();
+    let vm_ref = vm
         .create(&VmSpec::new(
             "wg-tracked".to_string(),
             ImageRef("img".to_string()),
@@ -196,16 +292,56 @@ async fn prune_finds_an_orphan_vm_but_leaves_a_tracked_one_alone() {
         .await
         .unwrap();
     let mut tracked = session("tracked", SessionState::Ready, KeepPolicy::Discard);
-    tracked.vm_ref = Some(tracked_ref);
+    tracked.vm_ref = Some(vm_ref);
     ctx.repo.save(&tracked).await.unwrap();
 
-    let dry_run = prune(&ctx, true).await.unwrap();
-    assert_eq!(dry_run, vec!["tart/wg-orphan".to_string()]);
-    assert_eq!(vm.vm_names().len(), 2, "dry run must not delete");
-
-    let orphans = prune(&ctx, false).await.unwrap();
-    assert_eq!(orphans, vec!["tart/wg-orphan".to_string()]);
+    let report = prune(&ctx, false).await.unwrap();
+    assert!(report.is_empty(), "{report:?}");
     assert_eq!(vm.vm_names(), vec!["wg-tracked".to_string()]);
+}
+
+/// A kept session survives `prune` even when it failed (NFR-07).
+#[tokio::test]
+async fn prune_leaves_a_kept_sessions_leftover_alone() {
+    let (ctx, vm) = context();
+    let vm_ref = vm
+        .create(&VmSpec::new(
+            "wg-kept".to_string(),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
+        .await
+        .unwrap();
+    let mut s = session("kept", SessionState::Failed, KeepPolicy::Keep);
+    s.vm_ref = Some(vm_ref);
+    ctx.repo.save(&s).await.unwrap();
+
+    let report = prune(&ctx, false).await.unwrap();
+    assert!(report.is_empty(), "{report:?}");
+    assert_eq!(vm.vm_names(), vec!["wg-kept".to_string()]);
+}
+
+/// A launch that died between creating the VM and writing its ref down left
+/// no `vm_ref` -- but the VM carries this home's prefix *and* a session id
+/// this home has a record for, which is ownership by record, not by prefix.
+#[tokio::test]
+async fn prune_owns_a_vm_named_after_one_of_this_homes_sessions() {
+    let (ctx, vm) = context();
+    vm.create(&VmSpec::new(
+        "wg-crashed".to_string(),
+        ImageRef("img".to_string()),
+        small_resources(),
+    ))
+    .await
+    .unwrap();
+    // The record knows the session, but never learned the VM's ref.
+    let s = session("crashed", SessionState::Failed, KeepPolicy::Discard);
+    assert!(s.vm_ref.is_none());
+    ctx.repo.save(&s).await.unwrap();
+
+    let report = prune(&ctx, false).await.unwrap();
+    assert_eq!(report.orphans, vec!["tart/wg-crashed".to_string()]);
+    assert!(vm.vm_names().is_empty());
 }
 
 // --- mixed backends and pre-multi-OS records (spec.md §7 AC-08) -----------
@@ -321,34 +457,38 @@ async fn stop_resume_and_delete_act_only_on_the_sessions_own_backend() {
     assert_eq!(list_sessions(&ctx).await.unwrap().len(), 1);
 }
 
-/// `prune` asks each wired backend for its own VMs and only deletes the ones
-/// no session claims -- on that backend (spec.md §3 FR-5: "다른 백엔드의 같은
-/// VM 이름을 혼동하지 않는다").
+/// `prune` asks each wired backend for its own VMs and keys ownership on
+/// `(backend, stable id)`: the same VM *name* on the other backend is a
+/// different VM (spec.md §3 FR-5: "다른 백엔드의 같은 VM 이름을 혼동하지
+/// 않는다").
 #[tokio::test]
-async fn prune_keeps_tracked_vms_on_both_backends_and_names_the_backend() {
+async fn prune_keys_ownership_per_backend_when_both_have_the_same_vm_name() {
     let (ctx, tart, utm) = mixed_context();
-    session_on(&ctx, &tart, "mac-1", SessionState::Ready).await;
-    session_on(&ctx, &utm, "kali-1", SessionState::Ready).await;
-    // The same VM *name* on both backends: only the untracked one goes.
-    for provider in [&tart, &utm] {
-        provider
-            .create(&VmSpec::new(
-                "wg-orphan".to_string(),
-                ImageRef("img".to_string()),
-                small_resources(),
-            ))
-            .await
-            .unwrap();
-    }
+    // The UTM VM belongs to a live session; the identically named Tart one
+    // is what an interrupted `delete` left behind.
+    let live = session_on(&ctx, &utm, "shared-name", SessionState::Ready).await;
+    assert_eq!(live.vm_ref.as_ref().unwrap().name, "wg-shared-name");
+    let leftover_ref = tart
+        .create(&VmSpec::new(
+            "wg-shared-name".to_string(),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
+        .await
+        .unwrap();
+    let mut leftover = session("leftover", SessionState::Deleting, KeepPolicy::Discard);
+    leftover.vm_ref = Some(leftover_ref);
+    ctx.repo.save(&leftover).await.unwrap();
 
-    let mut orphans = prune(&ctx, false).await.unwrap();
-    orphans.sort();
+    let report = prune(&ctx, false).await.unwrap();
+    assert_eq!(report.orphans, vec!["tart/wg-shared-name".to_string()]);
+    assert!(report.unmanaged.is_empty(), "{report:?}");
+    assert!(tart.vm_names().is_empty());
     assert_eq!(
-        orphans,
-        vec!["tart/wg-orphan".to_string(), "utm/wg-orphan".to_string()]
+        utm.vm_names(),
+        vec!["wg-shared-name".to_string()],
+        "the UTM VM with a live session must survive prune"
     );
-    assert_eq!(tart.vm_names(), vec!["wg-mac-1".to_string()]);
-    assert_eq!(utm.vm_names(), vec!["wg-kali-1".to_string()]);
 }
 
 /// spec.md §3 FR-5: "과거 세션의 누락값은 기존 Tart/arm64/virtualize/admin

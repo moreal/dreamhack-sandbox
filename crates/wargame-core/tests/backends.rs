@@ -557,16 +557,18 @@ async fn two_backends_with_the_same_vm_name_are_not_confused() {
     );
 }
 
+/// spec.md §3 FR-5: "이름 prefix만으로 외부 VM을 삭제하지 않는다".
 #[tokio::test]
-async fn prune_keeps_identically_named_vms_on_other_backends() {
+async fn prune_never_touches_an_identically_named_vm_on_another_backend() {
     let Fixture { ctx, tart, utm, .. } = fixture(vec![]);
     make_vm(&tart, "wg-shared-name").await;
     make_vm(&utm, "wg-shared-name").await;
 
-    // Only the UTM VM has a session record; the Tart one is a real orphan.
-    // Ownership is keyed by `(backend, provider id)`, and both fakes mint a
-    // Tart-style id (the VM name), so this is the hardest case: identical
-    // names *and* identical ids on two different backends.
+    // Only the UTM VM has a session record. Ownership is keyed by
+    // `(backend, provider id)`, and both fakes mint a Tart-style id (the VM
+    // name), so this is the hardest case: identical names *and* identical
+    // ids on two different backends. The Tart VM belongs to no record here,
+    // so it is reported and left alone rather than deleted.
     ctx.repo
         .save(&session(
             "s-utm",
@@ -578,16 +580,19 @@ async fn prune_keeps_identically_named_vms_on_other_backends() {
         .await
         .unwrap();
 
-    let orphans = prune(&ctx, true).await.unwrap();
-    assert_eq!(orphans.len(), 1, "exactly one orphan: {orphans:?}");
-    assert!(orphans[0].contains("tart"), "{orphans:?}");
+    let report = prune(&ctx, true).await.unwrap();
+    assert!(report.orphans.is_empty(), "{report:?}");
+    assert_eq!(report.unmanaged, vec!["tart/wg-shared-name".to_string()]);
 
     prune(&ctx, false).await.unwrap();
     assert!(
         utm.vm_names().contains(&"wg-shared-name".to_string()),
         "the UTM VM with a live session must survive prune"
     );
-    assert!(tart.vm_names().is_empty(), "the Tart orphan is deleted");
+    assert!(
+        tart.vm_names().contains(&"wg-shared-name".to_string()),
+        "the Tart VM no record owns must survive prune"
+    );
 }
 
 #[tokio::test]

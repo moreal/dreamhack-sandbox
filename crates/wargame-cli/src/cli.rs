@@ -10,7 +10,7 @@ use wargame_core::domain::NetworkMode;
 
 const AFTER_HELP: &str = "\
 Quick start:
-  wargame doctor                       check the host (Tart, ssh, disk, auth)
+  wargame doctor                       check the host (VM backends, ssh, disk, auth)
   wargame auth login                   store a Dreamhack session in the Keychain
   wargame profile build                build the default profile's VM image (once)
   wargame search rev                   find a challenge
@@ -47,9 +47,9 @@ pub struct Cli {
 /// complete them (`wargame-core` does not depend on clap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum NetworkArg {
-    /// Host-only vmnet: SSH from this Mac works, no LAN or internet (needs Softnet sudo).
+    /// Host-only vmnet: SSH from this Mac works, no LAN or internet (Tart needs a Softnet sudo rule).
     Isolated,
-    /// Tart's shared networking: outbound internet access. Asks for confirmation.
+    /// Shared networking: outbound internet access. Asks for confirmation.
     Nat,
 }
 
@@ -171,7 +171,12 @@ pub enum Command {
         #[arg(long, short = 'f')]
         force: bool,
     },
-    /// Delete Tart VMs with no corresponding session record.
+    /// Delete the VMs this wargame home left behind, on every backend.
+    ///
+    /// What gets deleted is decided by this home's own records, never by a
+    /// VM's name: a VM that merely starts with the same prefix -- another
+    /// $WARGAME_HOME's, or one you made yourself -- is reported and left
+    /// alone. A running VM is never deleted either.
     Prune {
         /// Only list what would be deleted.
         #[arg(long = "dry-run")]

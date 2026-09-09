@@ -16,7 +16,7 @@ pub use compat::{
 };
 pub use profile::{
     BackendChoice, ExecutionMode, GuestArch, GuestOs, GuestSpec, ImageSpec, Profile, ProvisionSpec,
-    Resources, ToolsSpec, VmSettings, WorkspaceSpec,
+    Resources, ToolsSpec, VmSettings, WorkspaceSpec, PROFILE_IMAGE_PREFIX,
 };
 pub use session::{
     GuestConnection, GuestEndpoint, GuestShell, KeepPolicy, NetworkMode, Session, SessionAsset,

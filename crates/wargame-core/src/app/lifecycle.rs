@@ -4,7 +4,7 @@
 //! [`crate::ports::SessionRepository`], so it runs the same way against a
 //! real Tart backend or `crate::testing`'s fakes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::domain::{KeepPolicy, Session, SessionState};
 use crate::error::{Result, WargameError};
@@ -256,39 +256,135 @@ pub async fn keep(ctx: &AppContext, id: &str, keep: bool) -> Result<Session> {
     Ok(session)
 }
 
-/// Deletes (or, if `dry_run`, just reports) VMs the backend manages that
-/// have no corresponding session record (MVP.md §37 / NFR-02). Returns the
-/// names of every orphan found.
-pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<Vec<String>> {
+/// One leftover VM `prune` found running. Never deleted: `prune` does not
+/// stop guests, so the user is told which session to deal with instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningLeftover {
+    /// `<backend>/<name>`.
+    pub vm: String,
+    /// The id of the session record that owns it.
+    pub session: String,
+}
+
+/// What one [`prune`] pass found. Every VM is named `<backend>/<name>`,
+/// because a name alone is not unique across backends.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Leftover VMs this home owns and `prune` deleted -- or, on a dry run,
+    /// would delete.
+    pub orphans: Vec<String>,
+    /// Leftovers this home owns that are still running, and so were left
+    /// alone.
+    pub running: Vec<RunningLeftover>,
+    /// VMs that only *look* like ours: they carry the configured name
+    /// prefix, but no record in this `WARGAME_HOME` owns them -- another
+    /// home's VMs, or the user's own. Reported so they are not a mystery,
+    /// never touched (spec.md §3 FR-5).
+    pub unmanaged: Vec<String>,
+}
+
+impl PruneReport {
+    /// Whether there is nothing at all to report.
+    pub fn is_empty(&self) -> bool {
+        self.orphans.is_empty() && self.running.is_empty() && self.unmanaged.is_empty()
+    }
+}
+
+/// Whether a session record still justifies its VM's existence.
+///
+/// `Deleting`/`Deleted` mean a delete did not finish; `Failed` means the
+/// session will never run again. Every other state -- including a merely
+/// `Stopped` session the user will `resume` -- is live, and its VM is not a
+/// leftover.
+fn is_leftover(state: SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::Failed | SessionState::Deleting | SessionState::Deleted
+    )
+}
+
+/// Cleans up the VMs *this* `WARGAME_HOME` left behind (MVP.md §37 /
+/// NFR-02).
+///
+/// Ownership is decided by this home's records, never by a name prefix
+/// (spec.md §3 FR-5: "앱 기록의 UUID와 소유권을 대조한다. 이름 prefix만으로
+/// 외부 VM을 삭제하지 않는다"). A VM is a deletion candidate only when a
+/// session record here owns it -- by the stable `(backend, id)` it wrote
+/// down, or by the `<prefix><session id>` name a launch that died before
+/// saving that ref would have used -- *and* that record no longer justifies
+/// it ([`is_leftover`]). Everything else is left alone: VMs a build record
+/// owns, VMs of live or kept sessions, and prefix-matching VMs no record
+/// here knows about, which are reported as unmanaged instead of silently
+/// hidden.
+///
+/// A running VM is never deleted, even when owned.
+pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<PruneReport> {
     let sessions = ctx.repo.list().await?;
-    // Ownership is `(backend, stable id)`: an identically named VM on
-    // another backend is a different VM and must not be mistaken for this
-    // one's orphan (spec.md §3 FR-5).
-    let mut known: HashSet<(String, String)> = sessions
-        .iter()
-        .filter_map(|s| s.vm_ref.as_ref().map(|v| (v.backend.clone(), v.id.clone())))
-        .collect();
+    // Two record-derived keys point at the same sessions: the stable
+    // `(backend, id)` a launch wrote down, and the `(backend, name)` it
+    // would have written down. An identically named VM on another backend is
+    // a different VM, so the backend is part of both keys (FR-5).
+    let mut by_id: HashMap<(&str, &str), &Session> = HashMap::new();
+    let mut by_name: HashMap<(String, String), &Session> = HashMap::new();
+    for session in &sessions {
+        if let Some(vm) = &session.vm_ref {
+            by_id.insert((vm.backend.as_str(), vm.id.as_str()), session);
+        }
+        if let Ok(backend) = session.backend() {
+            by_name.insert(
+                (
+                    backend.as_str().to_string(),
+                    format!("{}{}", ctx.config.vm.vm_prefix(backend), session.id),
+                ),
+                session,
+            );
+        }
+    }
     // Build records own VMs that no session ever will: the installation VM
     // a profile is created with and the image VMs it publishes. They carry
     // the build prefix rather than the session prefix, but ownership is
     // decided by the record, not by a name (spec.md §3 FR-5).
+    let mut build_owned: HashSet<(String, String)> = HashSet::new();
     for record in ctx.builds.list().await? {
-        known.extend(record.owned_vm_ids());
+        build_owned.extend(record.owned_vm_ids());
     }
 
-    let mut orphans = Vec::new();
+    let mut report = PruneReport::default();
     for vm in ctx.backends.all() {
         for vm_ref in vm.list().await? {
-            if known.contains(&(vm_ref.backend.clone(), vm_ref.id.clone())) {
+            let label = format!("{}/{}", vm_ref.backend, vm_ref.name);
+            if build_owned.contains(&(vm_ref.backend.clone(), vm_ref.id.clone())) {
                 continue;
             }
-            orphans.push(format!("{}/{}", vm_ref.backend, vm_ref.name));
-            if !dry_run {
-                vm.delete(&vm_ref).await?;
+            let owner = by_id
+                .get(&(vm_ref.backend.as_str(), vm_ref.id.as_str()))
+                .or_else(|| by_name.get(&(vm_ref.backend.clone(), vm_ref.name.clone())))
+                .copied();
+            let Some(session) = owner else {
+                report.unmanaged.push(label);
+                continue;
+            };
+            if session.keep == KeepPolicy::Keep || !is_leftover(session.state) {
+                continue;
+            }
+            match vm.status(&vm_ref).await? {
+                VmStatus::Running => report.running.push(RunningLeftover {
+                    vm: label,
+                    session: session.id.clone(),
+                }),
+                // Already gone between `list` and now: nothing to do, and
+                // nothing worth telling the user about.
+                VmStatus::Missing => {}
+                VmStatus::Stopped => {
+                    if !dry_run {
+                        vm.delete(&vm_ref).await?;
+                    }
+                    report.orphans.push(label);
+                }
             }
         }
     }
-    Ok(orphans)
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -748,54 +844,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_finds_and_deletes_orphan_vms() {
+    async fn prune_deletes_the_leftover_it_owns_and_ignores_the_rest() {
         let Fixture { ctx, vm, .. } = fixture();
-        // A VM with no session record at all.
+        let resources = Resources {
+            cpu: 1,
+            memory_mib: 1024,
+            disk_gib: 10,
+        };
+        // A prefix-matching VM no record here owns: somebody else's.
         vm.create(&VmSpec::new(
-            "wg-orphan".to_string(),
+            "wg-not-ours".to_string(),
             ImageRef("img".to_string()),
-            Resources {
-                cpu: 1,
-                memory_mib: 1024,
-                disk_gib: 10,
-            },
+            resources,
         ))
         .await
         .unwrap();
-        // A VM that *is* tracked by a session.
+        // A VM a live session owns.
         let tracked_ref = vm
             .create(&VmSpec::new(
                 "wg-tracked".to_string(),
                 ImageRef("img".to_string()),
-                Resources {
-                    cpu: 1,
-                    memory_mib: 1024,
-                    disk_gib: 10,
-                },
+                resources,
             ))
             .await
             .unwrap();
-        let mut session = sample_session("tracked", SessionState::Ready, KeepPolicy::Discard);
-        session.vm_ref = Some(tracked_ref);
-        ctx.repo.save(&session).await.unwrap();
+        let mut tracked = sample_session("tracked", SessionState::Ready, KeepPolicy::Discard);
+        tracked.vm_ref = Some(tracked_ref);
+        ctx.repo.save(&tracked).await.unwrap();
+        // A VM whose session record says its delete never finished.
+        let leftover_ref = vm
+            .create(&VmSpec::new(
+                "wg-leftover".to_string(),
+                ImageRef("img".to_string()),
+                resources,
+            ))
+            .await
+            .unwrap();
+        let mut leftover = sample_session("leftover", SessionState::Deleting, KeepPolicy::Discard);
+        leftover.vm_ref = Some(leftover_ref);
+        ctx.repo.save(&leftover).await.unwrap();
 
-        // Orphans are reported `<backend>/<name>`: a name alone is not
-        // unique across backends.
+        // VMs are reported `<backend>/<name>`: a name alone is not unique
+        // across backends.
         let dry = prune(&ctx, true).await.unwrap();
-        assert_eq!(dry, vec!["tart/wg-orphan".to_string()]);
-        assert_eq!(vm.vm_names().len(), 2, "dry run must not delete anything");
+        assert_eq!(dry.orphans, vec!["tart/wg-leftover".to_string()]);
+        assert_eq!(dry.unmanaged, vec!["tart/wg-not-ours".to_string()]);
+        assert_eq!(vm.vm_names().len(), 3, "dry run must not delete anything");
 
-        let orphans = prune(&ctx, false).await.unwrap();
-        assert_eq!(orphans, vec!["tart/wg-orphan".to_string()]);
-        assert_eq!(vm.vm_names(), vec!["wg-tracked".to_string()]);
+        let report = prune(&ctx, false).await.unwrap();
+        assert_eq!(report.orphans, vec!["tart/wg-leftover".to_string()]);
+        assert_eq!(
+            vm.vm_names(),
+            vec!["wg-not-ours".to_string(), "wg-tracked".to_string()]
+        );
     }
 
     /// Ownership is `(backend, id)`, not the display name: with the same VM
-    /// name registered on two backends, only the one with no session record
-    /// is an orphan (spec.md §3 FR-5's "다른 백엔드의 같은 VM 이름을
-    /// 혼동하지 않는다").
+    /// name registered on two backends, only the one a record here owns can
+    /// be deleted (spec.md §3 FR-5's "다른 백엔드의 같은 VM 이름을 혼동하지
+    /// 않는다").
     #[tokio::test]
-    async fn prune_keys_orphans_on_backend_and_id_not_on_the_name() {
+    async fn prune_keys_ownership_on_backend_and_id_not_on_the_name() {
         let Fixture { mut ctx, vm, .. } = fixture();
         let utm = Arc::new(FakeVmProvider::with_backend("utm"));
         ctx.backends = BackendRegistry::new(vec![
@@ -816,16 +925,22 @@ mod tests {
         vm.create(&spec()).await.unwrap();
         let utm_ref = utm.create(&spec()).await.unwrap();
 
-        // Only the UTM VM is recorded by a session.
-        let mut session = sample_session("tracked", SessionState::Ready, KeepPolicy::Discard);
+        // Only the UTM VM is claimed by a record, and that record's delete
+        // never finished.
+        let mut session = sample_session("leftover", SessionState::Deleting, KeepPolicy::Discard);
         session.vm_provider = "utm".to_string();
         session.vm_ref = Some(utm_ref);
         ctx.repo.save(&session).await.unwrap();
 
-        let orphans = prune(&ctx, false).await.unwrap();
-        assert_eq!(orphans, vec!["tart/wg-same-name".to_string()]);
-        assert!(vm.vm_names().is_empty());
-        assert_eq!(utm.vm_names(), vec!["wg-same-name".to_string()]);
+        let report = prune(&ctx, false).await.unwrap();
+        assert_eq!(report.orphans, vec!["utm/wg-same-name".to_string()]);
+        assert_eq!(report.unmanaged, vec!["tart/wg-same-name".to_string()]);
+        assert_eq!(
+            vm.vm_names(),
+            vec!["wg-same-name".to_string()],
+            "the Tart VM no record owns must survive"
+        );
+        assert!(utm.vm_names().is_empty());
     }
 
     /// A session's backend comes from the VM ref it actually created on,

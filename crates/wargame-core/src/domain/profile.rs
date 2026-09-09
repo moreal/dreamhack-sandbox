@@ -207,6 +207,12 @@ struct RawResources {
 const EXPECTED_API_VERSION: &str = "wargame.vm/v1";
 const EXPECTED_KIND: &str = "Profile";
 
+/// The namespace every image a build publishes lives in
+/// ([`Profile::image_name`]). Kept next to the name it builds so the
+/// backends that have to recognise "an image this app made" -- rather than
+/// a VM the user made -- agree with it (spec.md §3 FR-5).
+pub const PROFILE_IMAGE_PREFIX: &str = "wargame-profile-";
+
 impl Profile {
     /// Parses a profile YAML document (DESIGN.md §6 schema).
     pub fn from_yaml(s: &str) -> Result<Profile> {
@@ -252,7 +258,7 @@ impl Profile {
 
     /// The local Tart image name that a built profile is stored under.
     pub fn image_name(&self) -> String {
-        format!("wargame-profile-{}", self.name)
+        format!("{PROFILE_IMAGE_PREFIX}{}", self.name)
     }
 }
 

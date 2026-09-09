@@ -27,7 +27,10 @@ pub use backends::{
 pub use console::{open_gui, ssh_command};
 pub use doctor::{doctor, doctor_profile, Check};
 pub use launch::{launch, LaunchEvent, LaunchRequest};
-pub use lifecycle::{delete, inspect, keep, list_sessions, prune, resolve_session, resume, stop};
+pub use lifecycle::{
+    delete, inspect, keep, list_sessions, prune, resolve_session, resume, stop, PruneReport,
+    RunningLeftover,
+};
 pub use profile_build::{
     build as build_profile_image, console as open_profile_console, create as create_profile_vm,
     image_status, init as init_profile, launch_image, BuilderRegistry, CreateOutcome, CreateSource,

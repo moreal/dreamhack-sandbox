@@ -13,6 +13,7 @@ use async_trait::async_trait;
 
 use wargame_core::domain::{
     ExecutionMode, GuestArch, GuestOs, NetworkMode, ProviderCapabilities, VmRef,
+    PROFILE_IMAGE_PREFIX,
 };
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::process::{Cmd, ProcessRunner};
@@ -64,6 +65,16 @@ pub struct TartConfig {
     pub stop_timeout_secs: u64,
 }
 
+impl TartConfig {
+    /// Whether `name` is inside one of this app's own namespaces: the
+    /// session VMs it launches (`vm_prefix`) and the images its builds
+    /// publish ([`Profile::image_name`]). Everything else is the user's --
+    /// spec.md §3 FR-5's `kindle-vm` -- and is never stopped or deleted.
+    fn owns_name(&self, name: &str) -> bool {
+        name.starts_with(&self.vm_prefix) || name.starts_with(PROFILE_IMAGE_PREFIX)
+    }
+}
+
 impl Default for TartConfig {
     fn default() -> Self {
         TartConfig {
@@ -99,6 +110,20 @@ impl TartProvider {
     /// The Tart VM name for a session id, e.g. `"wg-dh-out-of-bound-a1b2c3"`.
     pub fn vm_name(&self, session_id: &str) -> String {
         format!("{}{session_id}", self.cfg.vm_prefix)
+    }
+
+    /// Refuses to touch a VM outside this app's namespaces, before `tart`
+    /// is run at all. The application layer decides ownership from its own
+    /// records; this is the floor under it, so no caller can turn a user's
+    /// own VM into a casualty (spec.md §3 FR-5).
+    fn refuse_unowned(&self, vm: &VmRef) -> Result<()> {
+        if self.cfg.owns_name(&vm.name) {
+            return Ok(());
+        }
+        Err(WargameError::CleanupFailed(format!(
+            "refusing to touch Tart virtual machine {:?}: its name is outside this app's {:?} and {:?} namespaces, so wargame did not create it",
+            vm.name, self.cfg.vm_prefix, PROFILE_IMAGE_PREFIX
+        )))
     }
 
     /// The configured boot timeout (used for `wait_ip`/`wait_ready` waits by
@@ -353,6 +378,7 @@ impl VmProvider for TartProvider {
     }
 
     async fn stop(&self, vm: &VmRef) -> Result<()> {
+        self.refuse_unowned(vm)?;
         let out = self
             .runner
             .run(&self.cmd(args::stop_args(&vm.name, self.cfg.stop_timeout_secs)))
@@ -367,6 +393,7 @@ impl VmProvider for TartProvider {
     }
 
     async fn delete(&self, vm: &VmRef) -> Result<()> {
+        self.refuse_unowned(vm)?;
         if let VmStatus::Running = self.status(vm).await? {
             // Best-effort: `tart delete` on a stopped VM still succeeds.
             let _ = self.stop(vm).await;
@@ -805,6 +832,50 @@ mod tests {
         let p = provider(runner.clone());
         let vm = VmRef::new("tart", "wg-x".to_string());
         assert_eq!(p.status(&vm).await.unwrap(), VmStatus::Running);
+    }
+
+    /// spec.md §3 FR-5: "사용자 VM `kindle-vm`과 원본 VM은 수정·중지·삭제하지
+    /// 않는다". The provider is the last line of defence: whatever asks, a VM
+    /// outside this app's own namespaces is never stopped or deleted, and
+    /// `tart` is not even run.
+    #[tokio::test]
+    async fn stop_and_delete_refuse_a_vm_outside_this_apps_namespace() {
+        for name in ["kindle-vm", "my-macos-vm"] {
+            let runner = Arc::new(FakeRunner::new());
+            let p = provider(runner.clone());
+            let vm = VmRef::new("tart", name.to_string());
+
+            let err = p.delete(&vm).await.unwrap_err();
+            assert!(err.to_string().contains(name), "{err}");
+            let err = p.stop(&vm).await.unwrap_err();
+            assert!(err.to_string().contains(name), "{err}");
+            assert!(
+                runner.calls().is_empty(),
+                "tart must never be run for {name}: {:?}",
+                runner.calls()
+            );
+        }
+    }
+
+    /// The images a build publishes live in their own namespace
+    /// (`wargame-profile-<name>`), and replacing one deletes the old one --
+    /// so the namespace floor has to cover them too.
+    #[tokio::test]
+    async fn delete_accepts_a_published_profile_image() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_responder(|cmd| match cmd.args.first().map(String::as_str) {
+            Some("list") => Ok(Output {
+                status: 0,
+                stdout: r#"[{"Name":"wargame-profile-macos-re-arm64","Source":"local","State":"stopped","Running":false,"Size":1,"Disk":1}]"#.to_string(),
+                stderr: String::new(),
+            }),
+            _ => Ok(Output::default()),
+        });
+        let p = provider(runner.clone());
+        let vm = VmRef::new("tart", "wargame-profile-macos-re-arm64".to_string());
+
+        p.delete(&vm).await.unwrap();
+        assert_eq!(runner.calls().last().unwrap().args[0], "delete");
     }
 
     #[tokio::test]

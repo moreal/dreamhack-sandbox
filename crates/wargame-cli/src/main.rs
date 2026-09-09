@@ -280,25 +280,40 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
         }
 
         Command::Prune { dry_run } => {
-            let orphans = prune(ctx, dry_run).await?;
-            if orphans.is_empty() {
+            let report = prune(ctx, dry_run).await?;
+            if report.is_empty() {
                 println!("No orphaned VMs found.");
                 return Ok(0);
             }
-            for name in &orphans {
+            for name in &report.orphans {
                 if dry_run {
                     println!("would delete {name}");
                 } else {
                     println!("deleted {name}");
                 }
             }
-            if dry_run {
+            // Never deleted, but never hidden either: the user still gets to
+            // learn these VMs exist (spec.md §3 FR-5).
+            for leftover in &report.running {
                 println!(
-                    "{} orphaned VM(s). Run `wargame prune` to delete them.",
-                    orphans.len()
+                    "still running, left alone: {} — stop it first: wargame delete {} --force",
+                    leftover.vm, leftover.session
                 );
+            }
+            for name in &report.unmanaged {
+                println!("not managed by this wargame home — ignored: {name}");
+            }
+            if !report.orphans.is_empty() {
+                if dry_run {
+                    println!(
+                        "{} orphaned VM(s). Run `wargame prune` to delete them.",
+                        report.orphans.len()
+                    );
+                } else {
+                    println!("Deleted {} orphaned VM(s).", report.orphans.len());
+                }
             } else {
-                println!("Deleted {} orphaned VM(s).", orphans.len());
+                println!("No orphaned VMs to delete.");
             }
             Ok(0)
         }
