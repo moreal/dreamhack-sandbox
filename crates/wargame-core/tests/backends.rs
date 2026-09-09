@@ -582,7 +582,7 @@ async fn prune_never_touches_an_identically_named_vm_on_another_backend() {
 
     let report = prune(&ctx, true).await.unwrap();
     assert!(report.orphans.is_empty(), "{report:?}");
-    assert_eq!(report.unmanaged, vec!["tart/wg-shared-name".to_string()]);
+    assert_eq!(report.unmanaged_names(), vec!["tart/wg-shared-name"]);
 
     prune(&ctx, false).await.unwrap();
     assert!(

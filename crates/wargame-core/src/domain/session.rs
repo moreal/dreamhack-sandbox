@@ -84,9 +84,12 @@ impl SessionState {
             (Running, Stopped) => true,
             (Stopped, Running) => true,
             (Stopped, Booting) => true,
-            (Ready, Deleting) | (Running, Deleting) | (Stopped, Deleting) | (Failed, Deleting) => {
-                true
-            }
+            // `delete` is the last resort and has to work on whatever a
+            // crash left behind -- a launch killed mid-boot as much as a
+            // finished session. `Deleting -> Deleting` is excluded by the
+            // `self == to` guard above: an interrupted delete is continued,
+            // not re-entered.
+            (_, Deleting) if self != Deleted => true,
             (Deleting, Deleted) => true,
             // Any non-terminal state may fail.
             (_, Failed) if self != Deleted => true,
@@ -520,6 +523,32 @@ mod tests {
             assert!(from.can_transition_to(SessionState::Deleting));
         }
         assert!(SessionState::Deleting.can_transition_to(SessionState::Deleted));
+    }
+
+    /// `delete` is the last resort, so `Deleting` has to be reachable from
+    /// every state a crash can leave behind -- a launch that died mid-boot
+    /// included. Only a record that is already gone (`Deleted`) refuses.
+    #[test]
+    fn every_live_state_can_start_deleting() {
+        for from in [
+            SessionState::Creating,
+            SessionState::Downloading,
+            SessionState::Booting,
+            SessionState::Provisioning,
+            SessionState::Ready,
+            SessionState::Running,
+            SessionState::Stopped,
+            SessionState::Failed,
+        ] {
+            assert!(
+                from.can_transition_to(SessionState::Deleting),
+                "{from:?} -> Deleting"
+            );
+        }
+        assert!(!SessionState::Deleted.can_transition_to(SessionState::Deleting));
+        // An interrupted delete is not a *transition* -- it is the same
+        // state again, which `delete` continues rather than re-enters.
+        assert!(!SessionState::Deleting.can_transition_to(SessionState::Deleting));
     }
 
     #[test]

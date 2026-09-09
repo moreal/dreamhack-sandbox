@@ -223,13 +223,24 @@ pub async fn resume(ctx: &AppContext, id: &str) -> Result<Session> {
 
 /// Deletes a session's VM (if any) and its metadata. A `Keep`-policy
 /// session refuses unless `force` is set (NFR-07).
+///
+/// This is the last resort, so it works from whatever state a crash left
+/// behind. A record that is already `Deleting` is an *interrupted* delete:
+/// it is continued rather than re-entered, which would be an illegal
+/// same-state transition and would leave the user with no way to finish the
+/// cleanup that `prune` points them at.
 pub async fn delete(ctx: &AppContext, id: &str, force: bool) -> Result<()> {
     let mut session = ctx.repo.load(id).await?;
     if session.keep == KeepPolicy::Keep && !force {
         return Err(WargameError::SessionKept(session.id.clone()));
     }
-    session.transition(SessionState::Deleting)?;
-    ctx.repo.save(&session).await?;
+    if !matches!(
+        session.state,
+        SessionState::Deleting | SessionState::Deleted
+    ) {
+        session.transition(SessionState::Deleting)?;
+        ctx.repo.save(&session).await?;
+    }
 
     if let Some(vm_ref) = &session.vm_ref {
         let vm = provider_for_session(ctx, &session)?;
@@ -266,6 +277,19 @@ pub struct RunningLeftover {
     pub session: String,
 }
 
+/// One VM inside the configured name prefix that no record in this home
+/// owns. `prune` will never touch it, so the caller has what it needs to
+/// name the manual remedy on the right backend instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmanagedVm {
+    /// `<backend>/<name>`.
+    pub vm: String,
+    /// The backend it lives on (`"tart"`, `"utm"`).
+    pub backend: String,
+    /// Its display name on that backend.
+    pub name: String,
+}
+
 /// What one [`prune`] pass found. Every VM is named `<backend>/<name>`,
 /// because a name alone is not unique across backends.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -280,10 +304,16 @@ pub struct PruneReport {
     /// prefix, but no record in this `WARGAME_HOME` owns them -- another
     /// home's VMs, or the user's own. Reported so they are not a mystery,
     /// never touched (spec.md §3 FR-5).
-    pub unmanaged: Vec<String>,
+    pub unmanaged: Vec<UnmanagedVm>,
 }
 
 impl PruneReport {
+    /// The `<backend>/<name>` of every VM that carries this app's prefix but
+    /// belongs to no record here.
+    pub fn unmanaged_names(&self) -> Vec<&str> {
+        self.unmanaged.iter().map(|u| u.vm.as_str()).collect()
+    }
+
     /// Whether there is nothing at all to report.
     pub fn is_empty(&self) -> bool {
         self.orphans.is_empty() && self.running.is_empty() && self.unmanaged.is_empty()
@@ -361,7 +391,11 @@ pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<PruneReport> {
                 .or_else(|| by_name.get(&(vm_ref.backend.clone(), vm_ref.name.clone())))
                 .copied();
             let Some(session) = owner else {
-                report.unmanaged.push(label);
+                report.unmanaged.push(UnmanagedVm {
+                    vm: label,
+                    backend: vm_ref.backend.clone(),
+                    name: vm_ref.name.clone(),
+                });
                 continue;
             };
             if session.keep == KeepPolicy::Keep || !is_leftover(session.state) {
@@ -378,6 +412,7 @@ pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<PruneReport> {
                 VmStatus::Stopped => {
                     if !dry_run {
                         vm.delete(&vm_ref).await?;
+                        settle_record(ctx, session).await?;
                     }
                     report.orphans.push(label);
                 }
@@ -385,6 +420,26 @@ pub async fn prune(ctx: &AppContext, dry_run: bool) -> Result<PruneReport> {
         }
     }
     Ok(report)
+}
+
+/// Brings the owning record in line with the VM `prune` has just deleted.
+///
+/// A record that was already `Deleting` is an interrupted delete, and
+/// removing the VM was the part that was left: the record goes too, rather
+/// than haunting `wargame sessions` as a session with nothing behind it. A
+/// failed session's record is kept -- the failure is still worth reading --
+/// but it must stop pointing at a VM that no longer exists.
+async fn settle_record(ctx: &AppContext, session: &Session) -> Result<()> {
+    match session.state {
+        SessionState::Deleting | SessionState::Deleted => ctx.repo.delete(&session.id).await,
+        _ => {
+            let mut session = session.clone();
+            session.vm_ref = None;
+            session.runner_pid = None;
+            session.guest_ip = None;
+            ctx.repo.save(&session).await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -888,7 +943,7 @@ mod tests {
         // across backends.
         let dry = prune(&ctx, true).await.unwrap();
         assert_eq!(dry.orphans, vec!["tart/wg-leftover".to_string()]);
-        assert_eq!(dry.unmanaged, vec!["tart/wg-not-ours".to_string()]);
+        assert_eq!(dry.unmanaged_names(), vec!["tart/wg-not-ours"]);
         assert_eq!(vm.vm_names().len(), 3, "dry run must not delete anything");
 
         let report = prune(&ctx, false).await.unwrap();
@@ -934,7 +989,7 @@ mod tests {
 
         let report = prune(&ctx, false).await.unwrap();
         assert_eq!(report.orphans, vec!["utm/wg-same-name".to_string()]);
-        assert_eq!(report.unmanaged, vec!["tart/wg-same-name".to_string()]);
+        assert_eq!(report.unmanaged_names(), vec!["tart/wg-same-name"]);
         assert_eq!(
             vm.vm_names(),
             vec!["wg-same-name".to_string()],

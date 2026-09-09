@@ -177,6 +177,157 @@ async fn stop_then_resume_round_trips_through_the_fake_vm() {
     assert!(resumed.guest_ip.is_some());
 }
 
+/// An interrupted `delete` leaves the record in `Deleting`. Finishing it has
+/// to work -- it is what `prune` tells the user to run for a leftover it
+/// will not delete itself -- and it has to work on a VM that is still up.
+#[tokio::test]
+async fn delete_finishes_an_interrupted_delete_of_a_running_vm() {
+    let (ctx, vm) = context();
+    let vm_ref = vm
+        .create(&VmSpec::new(
+            "wg-half-deleted".to_string(),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
+        .await
+        .unwrap();
+    vm.start(
+        &vm_ref,
+        &StartOptions {
+            network: NetworkMode::Isolated,
+            headless: true,
+            log_path: "/dev/null".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut s = session("half-deleted", SessionState::Deleting, KeepPolicy::Discard);
+    s.vm_ref = Some(vm_ref);
+    ctx.repo.save(&s).await.unwrap();
+
+    delete(&ctx, "half-deleted", true).await.unwrap();
+    assert!(vm.vm_names().is_empty(), "the VM is gone");
+    assert!(
+        ctx.repo.load("half-deleted").await.is_err(),
+        "and so is the record"
+    );
+}
+
+/// A launch whose process was killed leaves a record stuck mid-flight.
+/// `delete` still has to be able to clean it up.
+#[tokio::test]
+async fn delete_cleans_up_a_session_stuck_mid_launch() {
+    let (ctx, vm) = context();
+    let vm_ref = vm
+        .create(&VmSpec::new(
+            "wg-stuck".to_string(),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
+        .await
+        .unwrap();
+    let mut s = session("stuck", SessionState::Booting, KeepPolicy::Discard);
+    s.vm_ref = Some(vm_ref);
+    ctx.repo.save(&s).await.unwrap();
+
+    delete(&ctx, "stuck", false).await.unwrap();
+    assert!(vm.vm_names().is_empty());
+    assert!(ctx.repo.load("stuck").await.is_err());
+}
+
+/// The recovery `prune` names for a running leftover has to work from the
+/// state that produced it, or the user has no way out inside the CLI.
+#[tokio::test]
+async fn the_recovery_prune_names_for_a_running_leftover_works() {
+    let (ctx, vm) = context();
+    let vm_ref = vm
+        .create(&VmSpec::new(
+            "wg-still-up".to_string(),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
+        .await
+        .unwrap();
+    vm.start(
+        &vm_ref,
+        &StartOptions {
+            network: NetworkMode::Isolated,
+            headless: true,
+            log_path: "/dev/null".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut s = session("still-up", SessionState::Deleting, KeepPolicy::Discard);
+    s.vm_ref = Some(vm_ref);
+    ctx.repo.save(&s).await.unwrap();
+
+    let report = prune(&ctx, false).await.unwrap();
+    assert_eq!(report.running.len(), 1, "{report:?}");
+    let id = report.running[0].session.clone();
+
+    delete(&ctx, &id, false).await.unwrap();
+    assert!(vm.vm_names().is_empty());
+    assert!(ctx.repo.load(&id).await.is_err());
+}
+
+/// Finishing an interrupted delete means finishing it: `prune` removed the
+/// VM the record was still pointing at, so the record goes too rather than
+/// haunting `wargame sessions`.
+#[tokio::test]
+async fn prune_completes_the_record_of_the_delete_it_finished() {
+    let (ctx, vm) = context();
+    let vm_ref = vm
+        .create(&VmSpec::new(
+            "wg-half-deleted".to_string(),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
+        .await
+        .unwrap();
+    let mut s = session("half-deleted", SessionState::Deleting, KeepPolicy::Discard);
+    s.vm_ref = Some(vm_ref);
+    ctx.repo.save(&s).await.unwrap();
+
+    prune(&ctx, true).await.unwrap();
+    assert!(
+        ctx.repo.load("half-deleted").await.is_ok(),
+        "a dry run changes no record"
+    );
+
+    prune(&ctx, false).await.unwrap();
+    assert!(ctx.repo.load("half-deleted").await.is_err());
+}
+
+/// A failed session is worth reading afterwards, so its record stays -- but
+/// it must stop pointing at a VM `prune` has just deleted.
+#[tokio::test]
+async fn prune_stops_a_failed_record_pointing_at_the_vm_it_deleted() {
+    let (ctx, vm) = context();
+    let vm_ref = vm
+        .create(&VmSpec::new(
+            "wg-broken".to_string(),
+            ImageRef("img".to_string()),
+            small_resources(),
+        ))
+        .await
+        .unwrap();
+    let mut s = session("broken", SessionState::Failed, KeepPolicy::Discard);
+    s.vm_ref = Some(vm_ref);
+    s.runner_pid = Some(4242);
+    s.guest_ip = Some("10.0.0.5".parse().unwrap());
+    ctx.repo.save(&s).await.unwrap();
+
+    prune(&ctx, false).await.unwrap();
+    let after = ctx.repo.load("broken").await.expect("the failure is kept");
+    assert_eq!(after.state, SessionState::Failed);
+    assert!(after.vm_ref.is_none(), "no dangling VM ref: {after:?}");
+    assert!(after.runner_pid.is_none());
+    assert!(after.guest_ip.is_none());
+    // And deleting it afterwards still works.
+    delete(&ctx, "broken", false).await.unwrap();
+}
+
 /// Ownership is what a record says, not what a name starts with (spec.md §3
 /// FR-5: "앱 기록의 UUID와 소유권을 대조한다"). The VM a session record owns
 /// after an interrupted `delete` is the one thing `prune` may remove.
@@ -226,8 +377,8 @@ async fn prune_never_deletes_a_prefix_matching_vm_no_record_here_owns() {
         let report = prune(&ctx, dry_run).await.unwrap();
         assert!(report.orphans.is_empty(), "{report:?}");
         assert_eq!(
-            report.unmanaged,
-            vec!["tart/wg-build-kali-other-home".to_string()]
+            report.unmanaged_names(),
+            vec!["tart/wg-build-kali-other-home"]
         );
     }
     assert_eq!(

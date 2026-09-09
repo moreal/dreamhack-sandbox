@@ -16,7 +16,7 @@ use wargame_core::app::{
     build_profile_image, create_profile_vm, delete, doctor, doctor_profile, init_profile, inspect,
     keep, launch, list_sessions, open, open_gui, open_profile_console, profile_overviews, prune,
     resolve_session, resume, search, ssh_command, stop, AppContext, CreateSource, LaunchEvent,
-    LaunchRequest,
+    LaunchRequest, UnmanagedVm,
 };
 use wargame_core::domain::{ChallengeRef, KeepPolicy, NetworkMode, SessionState};
 use wargame_core::error::{Result, WargameError};
@@ -292,16 +292,27 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
                     println!("deleted {name}");
                 }
             }
-            // Never deleted, but never hidden either: the user still gets to
-            // learn these VMs exist (spec.md §3 FR-5).
+            // `prune` never stops a guest, so a running leftover is reported
+            // with the one command that does finish it off. `delete`
+            // continues an interrupted delete, so this works from the state
+            // that produced the leftover.
             for leftover in &report.running {
                 println!(
-                    "still running, left alone: {} — stop it first: wargame delete {} --force",
+                    "still running, left alone: {} — remove it with: wargame delete {}",
                     leftover.vm, leftover.session
                 );
             }
-            for name in &report.unmanaged {
-                println!("not managed by this wargame home — ignored: {name}");
+            // Never deleted, but never hidden either: the user still gets to
+            // learn these VMs exist, and what to do if one really is theirs
+            // to remove (spec.md §3 FR-5).
+            if !report.unmanaged.is_empty() {
+                println!(
+                    "{} VM(s) carry this app's name prefix but no record here owns them — another wargame home's, or your own — so they were left alone:",
+                    report.unmanaged.len()
+                );
+                for vm in &report.unmanaged {
+                    println!("  {} — {}", vm.vm, manual_removal_hint(vm));
+                }
             }
             if !report.orphans.is_empty() {
                 if dry_run {
@@ -341,6 +352,20 @@ async fn dispatch(ctx: &AppContext, command: Command) -> Result<i32> {
         Command::Auth { action } => dispatch_auth(ctx, action).await,
 
         Command::Completions { .. } => unreachable!("handled before the context is built"),
+    }
+}
+
+/// What to run to remove a VM `wargame` will not touch, on the backend it
+/// actually lives on. `prune` deliberately never deletes these, so saying
+/// "ignored" without saying this would leave the user stuck.
+fn manual_removal_hint(vm: &UnmanagedVm) -> String {
+    match vm.backend.as_str() {
+        "tart" => format!("if you want it gone: tart delete {}", vm.name),
+        "utm" => format!(
+            "if you want it gone: delete {:?} in the UTM app (right-click the VM ▸ Delete)",
+            vm.name
+        ),
+        other => format!("if you want it gone, remove it with {other}'s own tools"),
     }
 }
 
@@ -588,4 +613,34 @@ fn exec_replacing_process(mut cmd: std::process::Command) -> Result<i32> {
         .status()
         .map_err(|e| WargameError::Other(e.to_string()))?;
     Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unmanaged(backend: &str, name: &str) -> UnmanagedVm {
+        UnmanagedVm {
+            vm: format!("{backend}/{name}"),
+            backend: backend.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    /// `prune` never deletes a VM no record here owns, so the row that says
+    /// so has to name the way out on the backend it actually lives on.
+    #[test]
+    fn an_ignored_vm_names_the_manual_remedy_for_its_backend() {
+        let tart = manual_removal_hint(&unmanaged("tart", "wg-other"));
+        assert!(tart.contains("tart delete wg-other"), "{tart}");
+
+        let utm = manual_removal_hint(&unmanaged("utm", "wg-build-kali"));
+        assert!(utm.contains("UTM app"), "{utm}");
+        assert!(utm.contains("wg-build-kali"), "{utm}");
+
+        // An unknown backend still says something actionable rather than
+        // nothing at all.
+        let other = manual_removal_hint(&unmanaged("qemu", "wg-x"));
+        assert!(other.contains("qemu"), "{other}");
+    }
 }
