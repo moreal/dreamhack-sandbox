@@ -79,6 +79,33 @@ impl BuildObserver for () {
     }
 }
 
+/// Told about every VM the publish step brings into existence, the moment
+/// the backend knows its id.
+///
+/// This is what makes "a failed publish never leaks a VM" true rather than
+/// hoped for. UTM's `duplicate` can register a copy and *then* fail (a name
+/// whose bundle already exists fails the move it does last), so a publish
+/// that returns an error can still have created a virtual machine. Writing
+/// it down here -- before the backend does anything else with it, and
+/// before the error is raised -- is what lets the record carry it as a
+/// leaked image, so `prune` keeps skipping it and the next successful build
+/// deletes it (spec.md §3 FR-3; task-7-b2b-report.md D5).
+///
+/// An error here aborts the publish: a VM that could not be written down is
+/// one nothing would ever clean up.
+#[async_trait]
+pub trait ImageRegistrar: Send + Sync {
+    async fn image_created(&self, image: &PublishedImage) -> Result<()>;
+}
+
+/// For callers that keep no record (every backend's own tests).
+#[async_trait]
+impl ImageRegistrar for () {
+    async fn image_created(&self, _image: &PublishedImage) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// What detaching the installation VM's installer media did.
 ///
 /// An installed guest that still has its installer CD attached boots the CD
@@ -214,11 +241,16 @@ pub trait ProfileImageBuilder: Send + Sync {
 
     /// Step 8 -- publish: turn the stopped, provisioned VM into the
     /// launchable image and hand back what to record.
+    ///
+    /// Every VM this step creates must be reported to `registrar` as soon
+    /// as the backend knows its id, whether or not the publish then
+    /// succeeds -- see [`ImageRegistrar`].
     async fn publish(
         &self,
         req: &BuildRequest<'_>,
         vm: &VmRef,
         progress: Progress<'_>,
+        registrar: &dyn ImageRegistrar,
     ) -> Result<PublishedImage>;
 
     /// Deletes an image that has been replaced. Only ever called *after* the

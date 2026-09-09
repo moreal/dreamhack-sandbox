@@ -37,7 +37,8 @@ use crate::domain::{GuestOs, GuestShell, Profile, VmRef};
 use crate::error::{Result, WargameError};
 use crate::infra::GuestOps;
 use crate::ports::image_builder::{
-    BuildObserver, BuildRequest, EjectOutcome, GuestLink, InstallerRequest, Progress,
+    BuildObserver, BuildRequest, EjectOutcome, GuestLink, ImageRegistrar, InstallerRequest,
+    Progress,
 };
 use crate::ports::{BuildRecordRepository, ImageRef, ProfileImageBuilder, VmProvider};
 use crate::security::hash::sha256_file;
@@ -816,7 +817,7 @@ pub async fn build(
     // The flow persists the phase it reaches, so a build killed halfway
     // leaves an accurate record rather than the phase of the previous run.
     let phases = RecordPhases::new(ctx.builds.clone(), record);
-    let outcome = run_build_flow(builder.as_ref(), &request, progress, &phases).await;
+    let outcome = run_build_flow(builder.as_ref(), &request, progress, &phases, &phases).await;
     let mut record = phases.into_record();
 
     match outcome {
@@ -983,6 +984,30 @@ impl BuildObserver for RecordPhases {
     }
 }
 
+/// The publish step's new VMs land in the record as **leaked images** the
+/// instant the backend knows their ids, and are saved before the publish
+/// carries on.
+///
+/// That looks backwards for the one that is about to become the profile's
+/// image, and is deliberate: a build interrupted between "UTM registered a
+/// copy" and "the record names it as the image" would otherwise leave a
+/// virtual machine nothing knows about -- which is exactly what a failed
+/// publish did (task-7-b2b-report.md D5). Carried as leaked, it is skipped
+/// by `prune` and deleted by the next successful build; and when this build
+/// does succeed, `discard_replaced_images` drops the new image from that
+/// list rather than deleting it, because the record now points at it.
+#[async_trait]
+impl ImageRegistrar for RecordPhases {
+    async fn image_created(&self, image: &PublishedImage) -> Result<()> {
+        let snapshot = {
+            let mut record = self.record.lock().unwrap_or_else(|e| e.into_inner());
+            record.track_leaked_image(image.clone());
+            record.clone()
+        };
+        self.builds.save(&snapshot).await
+    }
+}
+
 // --- image readiness (launch / doctor / profiles) -------------------------
 
 /// What a profile has to launch from right now.
@@ -1121,6 +1146,7 @@ pub async fn run_build_flow(
     req: &BuildRequest<'_>,
     progress: Progress<'_>,
     observer: &dyn BuildObserver,
+    registrar: &dyn ImageRegistrar,
 ) -> std::result::Result<BuildFlowOutcome, BuildFlowError> {
     let profile = req.profile;
 
@@ -1157,7 +1183,7 @@ pub async fn run_build_flow(
     };
 
     // From here every failure cleans up after itself before propagating.
-    let outcome = build_from(builder, req, &vm, progress, observer).await;
+    let outcome = build_from(builder, req, &vm, progress, observer, registrar).await;
     match outcome {
         Ok(mut outcome) => {
             outcome.media = media;
@@ -1191,6 +1217,7 @@ async fn build_from(
     vm: &VmRef,
     progress: Progress<'_>,
     observer: &dyn BuildObserver,
+    registrar: &dyn ImageRegistrar,
 ) -> std::result::Result<BuildFlowOutcome, BuildFlowError> {
     stage(observer, BuildStage::Booting).await?;
     builder
@@ -1226,11 +1253,14 @@ async fn build_from(
         failure
     })?;
 
-    let image = builder.publish(req, vm, progress).await.map_err(|e| {
-        let mut failure = BuildFlowError::new(BuildStage::Publishing, e);
-        failure.verification = verification.clone();
-        failure
-    })?;
+    let image = builder
+        .publish(req, vm, progress, registrar)
+        .await
+        .map_err(|e| {
+            let mut failure = BuildFlowError::new(BuildStage::Publishing, e);
+            failure.verification = verification.clone();
+            failure
+        })?;
 
     Ok(BuildFlowOutcome {
         vm: vm.clone(),

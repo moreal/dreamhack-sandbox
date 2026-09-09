@@ -129,7 +129,9 @@ Never match a sentence containing an apostrophe.
 | Set port forwards | **AS only** | `port forwards:{{host port:22022, guest port:22}}` on `mode:emulated` | **verified**; see the `protocol:TCP` bug in §4 |
 | Query id / name / backend / status | both | `id of vm`, `name of vm`, `backend of vm`, `status of vm`; `utmctl status <id\|name>` | **verified** |
 | Read configuration | **AS only** | `set c to configuration of vm` | **verified**, but incomplete — see §4 |
-| Clone | both | `duplicate vm with properties {configuration:{name:…}}` / `utmctl clone <id> --name <n>` | **verified**; **neither returns the new VM** |
+| Clone | both | `duplicate (first virtual machine whose id is vmId) with properties {configuration:{name:…}}` / `utmctl clone <id> --name <n>` | **verified**; **neither returns the new VM**. The name must be one **no registered VM already carries** — see T14. The loop reference (`duplicate vm`) fails with -10014 |
+| Set a VM's MAC address | **AS only** | `set item 1 of network interfaces of c to {index:n, address:"02:AB:CD:12:34:56"}` + `update configuration` | **verified 2026-09-09** (§4 T15): the readback goes `86:61:47:CB:D0:E9` → `02:AB:CD:12:34:56` and the interface's `mode`, `hardware` and port forwards are untouched. A copy inherits its source's address, so every clone needs this |
+| Rename a VM | **AS only** | `set name of c to …` + `update configuration` | **verified 2026-09-09**: the **bundle on disk is renamed with it** (`Documents/<old>.utm` → `Documents/<new>.utm`, read out of the running QEMU argv). This is why the name is a scarce resource — T14 |
 | Start | both | `utmctl start <id>` / `start vm` | **verified**; `started` in ~2 s (arm64) / ~6 s (x86_64 TCG) |
 | Start disposable | both | `utmctl start <id> --disposable` / `start vm without saving` | **unverified** (flag exists in `--help` and the sdef) |
 | Start recovery | both | `utmctl start <id> --recovery` / `start vm with recovery` | **unverified** |
@@ -139,7 +141,7 @@ Never match a sentence containing an apostrophe.
 | Stop (ACPI/force) | both | `utmctl stop <id>` / `stop vm by force` | **verified** for arm64 `virt` (1 s); **hung in `stopping` > 60 s** for x86_64 `q35` sitting in GRUB |
 | Stop (kill) | both | `utmctl stop <id> --kill` / `stop vm by kill` | **verified**, `stopped` reported immediately — but see **T12**: `stopped` does not mean the QEMU process is gone, and once it was still alive minutes later |
 | Stop (guest request) | both | `utmctl stop <id> --request` | **unverified** (needs an installed OS) |
-| Delete | both | `utmctl delete <id>` / `delete virtual machine …` | **verified**, no confirmation |
+| Delete | both | `utmctl delete <id>` / `delete (first virtual machine whose id is vmId)` | **verified**, no confirmation. **`delete vm` on a `repeat` loop's reference deletes the whole library** — T13. `utmctl delete <id>` deletes exactly one (**verified 2026-09-09**) |
 | Export bundle | **AS only** | `export virtual machine named … to POSIX file "…/x.utm"` | **verified**, transcript §11 — 964 KB for a VM whose disk is an untouched sparse qcow2 |
 | Import bundle | **AS only** | `import new virtual machine from POSIX file "…/x.utm"` | **verified**, transcript §11 — returns a specifier, but **keeps the source display name**, so `utmctl list` then showed two VMs called `wargame-t1-evidence` |
 | Serial console address | **AS only** | `address of first serial port of vm` | **verified**: a `/dev/ttysNNN` path while running, **empty string while stopped**. The number is allocated per run — `ttys010`, `ttys002` and `ttys003` all appear across the captures — so never cache it across a stop |
@@ -322,9 +324,10 @@ is unaffected — the trap only bites when something writes to the device as wel
 
 ## 4. Defects and traps found (with evidence)
 
-Twelve of them. Each changes what a `wargame-utm` adapter has to do. Raw output for every one is
+Fifteen of them. Each changes what a `wargame-utm` adapter has to do. Raw output for every one is
 in `crates/wargame-utm/tests/fixtures/`; the readback-heavy ones cite
-`readback-transcript.txt` by section.
+`readback-transcript.txt` by section. T13–T15 were found by the real-VM acceptance run
+(`.superpowers/sdd/PLAN/task-7-b2b-report.md`) and confirmed on throwaway VMs afterwards.
 
 ### T1. `utmctl` exit codes do not report Apple-Event failures
 
@@ -588,6 +591,115 @@ FR-5 already forbids acting on VMs we do not own. A `--force`-style opt-in that 
 UUID-matched orphan on the user's explicit instruction is acceptable later; silent `kill -9` is
 not. FR-5's "실패 시 단계별 정리와 정리 실패를 기록한다" covers exactly this: record the cleanup
 failure, do not paper over it.
+
+### T13. A verb applied to a `repeat` loop's reference acts on the **whole collection**
+
+`repeat with vm in (virtual machines)` binds `vm` to a reference *into* the collection, not to a
+copy of the element. `delete` follows that reference back to the collection:
+
+```
+--- before ---
+8BDD289D-…  stopped  wg-build-t7-p1
+5F3D66E8-…  stopped  wg-build-t7-p2      <-- the only id passed to the script
+1F4BB274-…  stopped  wg-build-t7-p3
+--- run --- osascript delete-exact.applescript 5F3D66E8-84DC-45F3-93DF-986A0473AA74
+ok                                        <-- reported success
+  osascript exit=0
+--- after ---
+UUID                                 Status   Name
+(empty)                                   <-- all three gone, on disk
+```
+
+`start`, `stop` and the `update configuration` writes happened to address the right VM through the
+same reference, and `duplicate` refuses it outright with `Handler only handles single objects.
+(-10014)` (T2/§2). So the shape is not uniformly wrong — it is *unpredictably* wrong, which is
+worse. A running VM raises `-2700` and aborts the cascade partway, so a partial deletion looks like
+an ordinary error.
+
+*Resolution:* **never apply a verb to the loop variable.** Use the loop only as the existence check
+that produces the not-found sentinel, and address the target as
+`(first virtual machine whose id is vmId)` — the single-object specifier — in every verb and every
+`update configuration`. `crates/wargame-utm/src/automation.rs` enumerates its own templates in a
+test and fails if any of them contains `<verb> vm`.
+
+### T14. A VM's **name is its bundle name**, and `duplicate` refuses a name that is taken
+
+Every VM lives in `~/Library/Containers/com.utmapp.UTM/Data/Documents/<display name>.utm`, and
+renaming the VM renames the directory. `duplicate` copies the bundle, registers the copy, applies
+the requested name and only then moves the bundle into place — so a name another VM already
+carries fails that last step:
+
+```
+$ osascript dup.applescript 4E355E9E-… wg-build-image-t7c        # first copy
+ok
+$ osascript dup.applescript 4E355E9E-… wg-build-image-t7c        # same name again
+execution error: UTM got an error: “wg-build-t7c-src 2.utm” couldn’t be moved to “Documents”
+because an item with the same name already exists. (-2700)
+exit=1
+$ utmctl list
+4E355E9E-…  stopped  wg-build-t7c-src
+9A8BFBFD-…  stopped  wg-build-image-t7c      <-- registered by the FAILED duplicate
+A38289F3-…  stopped  wg-build-image-t7c
+```
+
+Two things to take from that transcript:
+
+* **The message names the wrong thing.** `wg-build-t7c-src 2.utm` is the *staging* name UTM copies
+  under; the name that actually clashed is the one that was asked for. Do not chase the source.
+* **A failed `duplicate` still leaves a registered VM.** It is a real, usable VM with the requested
+  name; nothing removes it.
+
+A copy under a **free** name always succeeds, however many other VMs exist — verified immediately
+after the failure above:
+
+```
+$ osascript dup.applescript 4E355E9E-… wg-build-image-t7c-second
+ok
+$ utmctl list | grep image
+B8B5DAEF-…  stopped  wg-build-image-t7c-second
+B525AF67-…  stopped  wg-build-image-t7c
+```
+
+*Resolution, and what `wargame` does.* Publishing a rebuilt image cannot reuse a fixed name,
+because the image being replaced still carries it until the record points at the new one (spec.md
+§3 FR-3 requires keeping it that long). So a build publishes under
+`wg-build-image-<profile>-<6 hex>` — a name nothing holds — the record names the image by UUID,
+and only then is the previous image deleted. The adapter also refuses a taken name itself, before
+`duplicate` runs, so the user sees the name that clashed rather than the staging bundle; and every
+VM UTM registers during a publish is written into the build record as a leaked image *before* any
+error is raised, so a failure can never leave one untracked.
+
+### T15. A copy inherits its source's MAC address
+
+`duplicate` copies the network interface verbatim. Two sessions cloned from one image came up on
+the same `bridge105` segment with the same address and the same host key, and an `scp` addressed to
+that IP landed in the other guest (`task-7-b2b-report.md` D4):
+
+```
+wg-build-image-t7-kali-arm64: mac=02:FD:8F:A5:F2:75
+wg-dh-no-main-2f8d45:         mac=02:FD:8F:A5:F2:75   ip=192.168.128.2
+wg-fi-hello-fixture-3c715d:   mac=02:FD:8F:A5:F2:75   ip=192.168.128.2
+```
+
+A VM made by `make new virtual machine` gets a fresh one, so this is specific to copies.
+
+The sdef's `qemu network configuration` has a writable `address` — "MAC address (formatted as
+XX:XX:XX:XX:XX:XX, if empty a random address will be genertaed)" — and a **partial** interface
+record updates only what it names (verified 2026-09-09):
+
+```
+$ osascript rawnet.applescript B525AF67-…
+mode=shared hw=virtio-net-pci mac=86:61:47:CB:D0:E9 idx=0
+$ osascript setmac.applescript B525AF67-… 02:AB:CD:12:34:56
+ok
+$ osascript rawnet.applescript B525AF67-…
+mode=shared hw=virtio-net-pci mac=02:AB:CD:12:34:56 idx=0     <-- mode and hardware untouched
+```
+
+*Resolution:* write a fresh locally-administered unicast address (first octet `& 0x03 == 0x02`)
+onto every copy, while it is still stopped (T9), before anything can start it. Read `index` back
+first: the sdef says it "is invalid after updating the configuration and must be reset to the
+current position", and the first interface answers **0**.
 
 ## 5. Network modes (FR-6)
 

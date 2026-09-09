@@ -23,7 +23,7 @@ use wargame_core::domain::build::PublishedImage;
 use wargame_core::domain::{GuestEndpoint, GuestShell, NetworkMode, Profile, VmRef};
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::process::{Cmd, ProcessRunner};
-use wargame_core::ports::image_builder::{BuildRequest, GuestLink, Progress};
+use wargame_core::ports::image_builder::{BuildRequest, GuestLink, ImageRegistrar, Progress};
 use wargame_core::ports::{
     GuestTransport, ImageRef, ProfileImageBuilder, StartOptions, VmProvider, VmSpec, VmStatus,
 };
@@ -282,6 +282,10 @@ impl ProfileImageBuilder for TartImageBuilder {
         req: &BuildRequest<'_>,
         vm: &VmRef,
         _progress: Progress<'_>,
+        // Tart creates nothing here: the provisioned VM already is the
+        // image, under the same name every build, so there is never a copy
+        // to write down.
+        _registrar: &dyn ImageRegistrar,
     ) -> Result<PublishedImage> {
         let _ = vm;
         let name = req.profile.image_name();
@@ -466,7 +470,7 @@ mod tests {
         let req = request(&profile, &record, Path::new("/tmp"));
         let mut messages = Vec::new();
 
-        let outcome = run_build_flow(&*b, &req, &mut |m| messages.push(m), &())
+        let outcome = run_build_flow(&*b, &req, &mut |m| messages.push(m), &(), &())
             .await
             .unwrap_or_else(|e| panic!("build failed: {}", e.error));
         assert_eq!(outcome.image.name, "wargame-profile-macos-minimal-arm64");
@@ -618,7 +622,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&*b, &req, &mut |_| {}, &())
+        let failure = run_build_flow(&*b, &req, &mut |_| {}, &(), &())
             .await
             .err()
             .expect("the build must fail");
@@ -647,7 +651,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&*b, &req, &mut |_| {}, &())
+        let failure = run_build_flow(&*b, &req, &mut |_| {}, &(), &())
             .await
             .err()
             .unwrap();
@@ -676,7 +680,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&*b, &req, &mut |_| {}, &())
+        let failure = run_build_flow(&*b, &req, &mut |_| {}, &(), &())
             .await
             .err()
             .unwrap();
@@ -723,7 +727,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&b, &req, &mut |_| {}, &())
+        let failure = run_build_flow(&b, &req, &mut |_| {}, &(), &())
             .await
             .err()
             .expect("a missing host key must fail the build");
@@ -755,7 +759,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, Path::new("/tmp"));
 
-        let failure = run_build_flow(&*b, &req, &mut |_| {}, &())
+        let failure = run_build_flow(&*b, &req, &mut |_| {}, &(), &())
             .await
             .err()
             .unwrap();
@@ -774,7 +778,7 @@ mod tests {
         let log_dir = tempfile::tempdir().unwrap();
         let req = request(&profile, &record, log_dir.path());
 
-        run_build_flow(&*b, &req, &mut |_| {}, &())
+        run_build_flow(&*b, &req, &mut |_| {}, &(), &())
             .await
             .unwrap_or_else(|e| panic!("build failed: {}", e.error));
 
@@ -826,7 +830,7 @@ mod tests {
         let record = record(&profile);
         let req = request(&profile, &record, log_dir.path());
 
-        let failure = run_build_flow(&*b, &req, &mut |_| {}, &())
+        let failure = run_build_flow(&*b, &req, &mut |_| {}, &(), &())
             .await
             .err()
             .unwrap();

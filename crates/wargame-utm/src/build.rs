@@ -25,7 +25,7 @@ use wargame_core::domain::build::{BuildSource, PublishedImage};
 use wargame_core::domain::{GuestEndpoint, GuestShell, NetworkMode, VmRef};
 use wargame_core::error::{Result, WargameError};
 use wargame_core::ports::image_builder::{
-    BuildRequest, EjectOutcome, GuestLink, InstallerRequest, Progress,
+    BuildRequest, EjectOutcome, GuestLink, ImageRegistrar, InstallerRequest, Progress,
 };
 use wargame_core::ports::{
     BuildRecordRepository, GuestTransport, ImageRef, ProfileImageBuilder, StartOptions, VmProvider,
@@ -50,9 +50,31 @@ impl UtmImageBuilder {
 
     /// The display name of the image VM a build publishes for `profile`:
     /// inside the build namespace, so `prune` never sees it as a session
-    /// orphan, and distinct from the installation VM's name.
+    /// orphan, distinct from the installation VM's name -- and **different
+    /// on every build**.
+    ///
+    /// UTM names each virtual machine's bundle after its display name, and
+    /// `duplicate` fails when the name it is given is already taken: the
+    /// move it does last cannot land, it reports the *staging* bundle
+    /// (`<source> 2.utm`) rather than the name that actually clashed, and
+    /// it leaves the copy it had already registered behind. While a profile
+    /// is being rebuilt the previous image still carries the fixed name, so
+    /// with one every rebuild died at `Publishing` after a complete,
+    /// successful provision and verify -- no profile that had an image could
+    /// ever be rebuilt (task-7-b2b-report.md D5, docs/utm-compatibility.md
+    /// §2).
+    ///
+    /// A per-build suffix removes the clash at its source: the copy is made
+    /// under a name nothing holds, the record is what names the image, and
+    /// the previous image keeps its own name until it is deleted -- which
+    /// happens only after the record points at the new one. It also makes
+    /// the two tellable apart in UTM's sidebar while both exist.
     pub fn image_vm_name(&self, profile: &str) -> String {
-        format!("{}image-{profile}", self.utm.config().build_prefix)
+        format!(
+            "{}image-{profile}-{}",
+            self.utm.config().build_prefix,
+            build_tag()
+        )
     }
 
     /// The installation VM a build must run against, or an error telling the
@@ -65,6 +87,18 @@ impl UtmImageBuilder {
             ))
         })
     }
+}
+
+/// Six hex characters that make one build's published image name its own.
+/// Random rather than a counter: a leftover from an interrupted build must
+/// not be able to collide with the next one either.
+fn build_tag() -> String {
+    let bytes: [u8; 3] = rand::random();
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 #[async_trait]
@@ -287,10 +321,26 @@ impl ProfileImageBuilder for UtmImageBuilder {
         req: &BuildRequest<'_>,
         vm: &VmRef,
         progress: Progress<'_>,
+        registrar: &dyn ImageRegistrar,
     ) -> Result<PublishedImage> {
         let name = self.image_vm_name(&req.profile.name);
         progress(format!("publishing {} -> {name}", vm.name));
-        let image = self.utm.clone_vm(&vm.id, &name).await?;
+
+        // Whatever UTM registered is written down before this step does
+        // anything else with it, and before any error is raised: a
+        // `duplicate` that fails can still have registered a copy, and one
+        // nothing knows about is one nothing will ever clean up (D5).
+        let mut created = Vec::new();
+        let copied = self
+            .utm
+            .clone_vm_reporting(&vm.id, &name, &mut created)
+            .await;
+        for vm in &created {
+            registrar
+                .image_created(&PublishedImage::new(vm.id.clone(), vm.name.clone()))
+                .await?;
+        }
+        let image = copied?;
         Ok(PublishedImage::new(image.id, image.name))
     }
 

@@ -20,7 +20,9 @@ use wargame_core::domain::{
 };
 use wargame_core::error::WargameError;
 use wargame_core::infra::process::{Cmd, Output, ProcessRunner};
-use wargame_core::ports::image_builder::{BuildRequest, EjectOutcome, InstallerRequest};
+use wargame_core::ports::image_builder::{
+    BuildRequest, EjectOutcome, ImageRegistrar, InstallerRequest,
+};
 use wargame_core::ports::{
     BuildRecordRepository, GuestTransport, ImageRef, ProfileImageBuilder, VmProvider,
 };
@@ -81,6 +83,17 @@ impl Registry {
             .iter()
             .find(|(vm_id, _, _)| vm_id == id)
             .map(|(_, status, _)| status.clone())
+    }
+
+    /// Whether a VM already carries this display name. UTM names each
+    /// bundle after its VM, so a `duplicate` under a name that is taken
+    /// cannot land (D5).
+    fn has_name(&self, name: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, existing)| existing == name)
     }
 
     fn names(&self) -> Vec<String> {
@@ -171,6 +184,40 @@ struct Harness {
     /// Overrides what the eject script answers, for the branch where every
     /// drive is removable and the script refuses to write.
     eject_answer: Arc<Mutex<Option<String>>>,
+    /// Makes the next `duplicate` fail the way UTM fails one whose bundle
+    /// cannot be moved: the copy is registered, and *then* the error comes.
+    duplicate_error: Arc<Mutex<Option<String>>>,
+}
+
+/// A fresh UUID for each copy: UTM's `duplicate` never reuses one, and a
+/// rebuild has to be able to tell the new image from the one it replaces.
+fn next_image_id(copies: &Arc<Mutex<usize>>) -> String {
+    let mut n = copies.lock().unwrap();
+    *n += 1;
+    if *n == 1 {
+        IMAGE_ID.to_string()
+    } else {
+        format!("B{n}111111-2222-3333-4444-555555555555")
+    }
+}
+
+/// A recording [`ImageRegistrar`]: what the publish step wrote down, in
+/// order.
+#[derive(Clone, Default)]
+struct Registered(Arc<Mutex<Vec<PublishedImage>>>);
+
+impl Registered {
+    fn all(&self) -> Vec<PublishedImage> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ImageRegistrar for Registered {
+    async fn image_created(&self, image: &PublishedImage) -> wargame_core::error::Result<()> {
+        self.0.lock().unwrap().push(image.clone());
+        Ok(())
+    }
 }
 
 /// A runner that plays the scripted registry back. `guest_ip` answers with
@@ -187,6 +234,9 @@ fn harness(registry: Registry, no_guest_agent: bool) -> Harness {
     let drives = removable.clone();
     let eject_answer: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let eject_override = eject_answer.clone();
+    let copies = Arc::new(Mutex::new(0usize));
+    let duplicate_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let duplicate_override = duplicate_error.clone();
     fake.set_responder(move |cmd: &Cmd| {
         if cmd.program.ends_with("utmctl") {
             let sub = cmd.args.first().map(String::as_str).unwrap_or("");
@@ -225,8 +275,26 @@ fn harness(registry: Registry, no_guest_agent: bool) -> Harness {
                     // argv: <source id> <new name>; the copy is a new UUID
                     // that only shows up in the next `list` (T2).
                     let new_name = cmd.args.get(2).cloned().unwrap_or_default();
-                    reg.push(IMAGE_ID, "stopped", &new_name);
-                    ok("ok\n")
+                    let forced = duplicate_override.lock().unwrap().take();
+                    let taken = forced.is_some() || reg.has_name(&new_name);
+                    let id = next_image_id(&copies);
+                    // What UTM really does, verified live on 4.7.5: it
+                    // copies the bundle, registers the copy, applies the
+                    // requested name -- and only then moves the bundle into
+                    // Documents. A name another VM already carries fails
+                    // that move with -2700, naming the *staging* bundle
+                    // rather than the name that clashed, and leaves the
+                    // copy it registered behind (task-7-b2b-report.md D5).
+                    reg.push(&id, "stopped", &new_name);
+                    if taken {
+                        Output {
+                            status: 1,
+                            stdout: String::new(),
+                            stderr: forced.unwrap_or_else(|| "execution error: UTM got an error: \u{201c}wg-build-kali-custom 2.utm\u{201d} couldn\u{2019}t be moved to \u{201c}Documents\u{201d} because an item with the same name already exists. (-2700)\n".to_string()),
+                        }
+                    } else {
+                        ok("ok\n")
+                    }
                 }
                 "start" => {
                     reg.set_status(&first, "started");
@@ -284,6 +352,7 @@ fn harness(registry: Registry, no_guest_agent: bool) -> Harness {
         transport,
         removable,
         eject_answer,
+        duplicate_error,
     }
 }
 
@@ -461,13 +530,20 @@ async fn the_whole_flow_provisions_the_installation_vm_and_publishes_a_copy() {
     let record = record_with_installer(&profile);
     let req = request(&profile, &record);
 
-    let outcome = run_build_flow(&h.builder, &req, &mut |_| {}, &())
+    let outcome = run_build_flow(&h.builder, &req, &mut |_| {}, &(), &())
         .await
         .unwrap_or_else(|e| panic!("build failed: {}", e.error));
 
     // Published image: a *copy*, so the installation VM stays available.
     assert_eq!(outcome.image.id, IMAGE_ID);
-    assert_eq!(outcome.image.name, "wg-build-image-kali-custom");
+    assert!(
+        outcome
+            .image
+            .name
+            .starts_with("wg-build-image-kali-custom-"),
+        "{}",
+        outcome.image.name
+    );
     assert_eq!(outcome.vm.id, INSTALLER_ID, "provisioned in place");
     assert_eq!(
         outcome.verification,
@@ -499,7 +575,12 @@ async fn the_whole_flow_provisions_the_installation_vm_and_publishes_a_copy() {
     // Both VMs now exist: the installation VM and the image.
     let names = h.registry.names();
     assert!(names.contains(&"wg-build-kali-custom".to_string()));
-    assert!(names.contains(&"wg-build-image-kali-custom".to_string()));
+    assert!(
+        names
+            .iter()
+            .any(|n| n.starts_with("wg-build-image-kali-custom-")),
+        "{names:?}"
+    );
 
     // The guest really was provisioned over the transport.
     let guest: Vec<String> = h
@@ -526,10 +607,17 @@ async fn a_build_uses_an_installation_vm_the_console_left_running() {
     let record = record_with_installer(&profile);
     let req = request(&profile, &record);
 
-    let outcome = run_build_flow(&h.builder, &req, &mut |_| {}, &())
+    let outcome = run_build_flow(&h.builder, &req, &mut |_| {}, &(), &())
         .await
         .unwrap_or_else(|e| panic!("build failed: {}", e.error));
-    assert_eq!(outcome.image.name, "wg-build-image-kali-custom");
+    assert!(
+        outcome
+            .image
+            .name
+            .starts_with("wg-build-image-kali-custom-"),
+        "{}",
+        outcome.image.name
+    );
     assert!(
         !h.calls.contains("osascript:start"),
         "a running VM must not be started again: {:?}",
@@ -554,7 +642,7 @@ async fn a_guest_without_the_agent_fails_at_connect_and_keeps_the_installation_v
     let record = record_with_installer(&profile);
     let req = request(&profile, &record);
 
-    let failure = run_build_flow(&h.builder, &req, &mut |_| {}, &())
+    let failure = run_build_flow(&h.builder, &req, &mut |_| {}, &(), &())
         .await
         .err()
         .expect("the build must fail");
@@ -604,7 +692,7 @@ async fn the_flow_ejects_the_installer_cd_before_starting_the_vm() {
     let record = record_with_installer(&profile);
     let req = request(&profile, &record);
 
-    let outcome = run_build_flow(&h.builder, &req, &mut |_| {}, &())
+    let outcome = run_build_flow(&h.builder, &req, &mut |_| {}, &(), &())
         .await
         .unwrap_or_else(|e| panic!("build failed: {}", e.error));
     assert_eq!(outcome.media, EjectOutcome::Detached(1));
@@ -701,7 +789,7 @@ async fn a_build_continues_when_every_drive_is_removable_and_nothing_is_detached
     let req = request(&profile, &record);
 
     let mut messages = Vec::new();
-    let outcome = run_build_flow(&h.builder, &req, &mut |m| messages.push(m), &())
+    let outcome = run_build_flow(&h.builder, &req, &mut |m| messages.push(m), &(), &())
         .await
         .unwrap_or_else(|e| panic!("the build must not fail over this: {}", e.error));
 
@@ -748,7 +836,7 @@ async fn a_missing_installation_vm_is_reported_not_recreated() {
     let record = record_with_installer(&profile);
     let req = request(&profile, &record);
 
-    let failure = run_build_flow(&h.builder, &req, &mut |_| {}, &())
+    let failure = run_build_flow(&h.builder, &req, &mut |_| {}, &(), &())
         .await
         .err()
         .unwrap();
@@ -800,16 +888,145 @@ async fn discarding_a_replaced_image_deletes_that_vm_only() {
         .contains(&format!("osascript:delete:{INSTALLER_ID}")));
 }
 
+/// **D5.** A profile that already had an image could never be rebuilt:
+/// `duplicate` was asked for the fixed image name, the previous image still
+/// carried it, and UTM fails the bundle move it does last -- so the build
+/// died at `Publishing` *after* a complete provision and verify, and left
+/// the copy it had already registered behind (task-7-b2b-report.md D5, AC-06
+/// and AC-09).
+///
+/// The fake here is the mechanism, not a stand-in for it: it refuses a
+/// duplicate under a name any registered VM already carries, exactly as UTM
+/// 4.7.5 does.
 #[tokio::test]
-async fn the_image_vm_name_is_inside_the_build_namespace() {
+async fn a_second_build_publishes_a_new_image_and_leaves_the_previous_one_alone() {
+    let h = harness(
+        Registry::with(&[(INSTALLER_ID, "stopped", "wg-build-kali-custom")]),
+        false,
+    );
+    let profile = kali_profile();
+    let record = record_with_installer(&profile);
+    let req = request(&profile, &record);
+
+    let first = run_build_flow(&h.builder, &req, &mut |_| {}, &(), &())
+        .await
+        .unwrap_or_else(|e| panic!("first build failed: {}", e.error));
+    let second = run_build_flow(&h.builder, &req, &mut |_| {}, &(), &())
+        .await
+        .unwrap_or_else(|e| panic!("the rebuild failed: {}", e.error));
+
+    assert_ne!(first.image.id, second.image.id, "a rebuild makes a new VM");
+    assert_ne!(
+        first.image.name, second.image.name,
+        "and asks UTM for a name nothing holds"
+    );
+    // Both are still registered: publishing never deletes the image it
+    // replaces -- that happens only once the record names the new one.
+    let names = h.registry.names();
+    assert!(names.contains(&first.image.name), "{names:?}");
+    assert!(names.contains(&second.image.name), "{names:?}");
+    assert!(
+        !h.calls.contains("osascript:delete"),
+        "publishing deletes nothing: {:?}",
+        h.calls.all()
+    );
+}
+
+/// And when UTM refuses the copy anyway, the VM it registered before
+/// refusing is written down before the error is raised -- so the record
+/// carries it as a leaked image instead of nobody knowing it exists (D5).
+#[tokio::test]
+async fn a_publish_utm_refuses_still_records_the_vm_it_registered() {
+    let h = harness(
+        Registry::with(&[(INSTALLER_ID, "stopped", "wg-build-kali-custom")]),
+        false,
+    );
+    *h.duplicate_error.lock().unwrap() = Some(
+        "execution error: UTM got an error: \u{201c}wg-build-kali-custom 2.utm\u{201d} couldn\u{2019}t be moved to \u{201c}Documents\u{201d} because an item with the same name already exists. (-2700)\n"
+            .to_string(),
+    );
+    let profile = kali_profile();
+    let record = record_with_installer(&profile);
+    let req = request(&profile, &record);
+    let vm = VmRef {
+        backend: "utm".to_string(),
+        id: INSTALLER_ID.to_string(),
+        name: "wg-build-kali-custom".to_string(),
+    };
+
+    let registered = Registered::default();
+    let err = h
+        .builder
+        .publish(&req, &vm, &mut |_| {}, &registered)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("-2700"), "{err}");
+
+    let seen = registered.all();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].id, IMAGE_ID);
+    assert!(
+        h.registry.names().contains(&seen[0].name),
+        "the recorded VM is the one UTM actually registered"
+    );
+}
+
+/// A copy under a name UTM already has is refused *before* the copy is
+/// attempted, with the name that actually clashed -- UTM's own message
+/// names the staging bundle (`<source> 2.utm`) instead, which sent the
+/// first investigation looking in the wrong place.
+#[tokio::test]
+async fn a_copy_is_refused_before_utm_can_fail_on_a_name_it_already_has() {
+    let h = harness(
+        Registry::with(&[
+            (SOURCE_ID, "stopped", "kali base"),
+            (INSTALLER_ID, "stopped", "wg-build-kali-custom"),
+        ]),
+        false,
+    );
+    let profile = kali_profile();
+    let source = BuildSource::UtmVm {
+        uuid: SOURCE_ID.to_string(),
+    };
+    let err = h
+        .builder
+        .create_installer_vm(&InstallerRequest {
+            profile: &profile,
+            name: "wg-build-kali-custom".to_string(),
+            execution: compat::resolve(&profile).unwrap(),
+            source: &source,
+        })
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("wg-build-kali-custom"), "{message}");
+    assert!(message.contains(INSTALLER_ID), "{message}");
+    assert!(
+        !h.calls.contains("osascript:duplicate"),
+        "nothing was copied: {:?}",
+        h.calls.all()
+    );
+}
+
+#[tokio::test]
+async fn the_image_vm_name_is_inside_the_build_namespace_and_never_repeats() {
     let h = harness(Registry::default(), false);
-    assert_eq!(
-        h.builder.image_vm_name("kali-custom"),
-        "wg-build-image-kali-custom"
+    let name = h.builder.image_vm_name("kali-custom");
+    assert!(
+        name.starts_with("wg-build-image-kali-custom-"),
+        "the profile is still recognisable in UTM's sidebar: {name}"
     );
     // Not the session prefix, so `prune`'s name-independent ownership check
     // is the only thing that can reach it.
-    assert!(!h.builder.image_vm_name("kali-custom").starts_with("wg-dh-"));
+    assert!(!name.starts_with("wg-dh-"));
+    // D5: UTM names each bundle after its VM and refuses a copy under a
+    // name that is taken, so two builds of one profile must never ask for
+    // the same one -- the previous image still holds its name while the new
+    // one is being made.
+    let names: std::collections::HashSet<String> = (0..32)
+        .map(|_| h.builder.image_vm_name("kali-custom"))
+        .collect();
+    assert!(names.len() > 28, "{names:?}");
 }
 
 // --- the image catalog ----------------------------------------------------
@@ -900,6 +1117,14 @@ async fn a_stopped_installation_vm_is_what_publishing_copies() {
         h.registry.status_of(INSTALLER_ID).as_deref(),
         Some("stopped")
     );
-    let image = h.builder.publish(&req, &vm, &mut |_| {}).await.unwrap();
-    assert_eq!(image.name, "wg-build-image-kali-custom");
+    let image = h
+        .builder
+        .publish(&req, &vm, &mut |_| {}, &())
+        .await
+        .unwrap();
+    assert!(
+        image.name.starts_with("wg-build-image-kali-custom-"),
+        "{}",
+        image.name
+    );
 }

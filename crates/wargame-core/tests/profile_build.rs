@@ -24,7 +24,7 @@ use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::fs::AppDirs;
 use wargame_core::infra::process::ProcessRunner;
 use wargame_core::ports::image_builder::{
-    BuildRequest, EjectOutcome, GuestLink, InstallerRequest, Progress,
+    BuildRequest, EjectOutcome, GuestLink, ImageRegistrar, InstallerRequest, Progress,
 };
 use wargame_core::ports::{
     BuildRecordRepository, DiskSpace, GuestTransport, ProfileImageBuilder, VmProvider,
@@ -128,6 +128,10 @@ impl FakeBuilder {
 
     fn set_fail_on(&self, step: &'static str) {
         *self.fail_on.lock().unwrap() = Some(step);
+    }
+
+    fn clear_fail(&self) {
+        *self.fail_on.lock().unwrap() = None;
     }
 
     /// Makes cleanup after a failed build report a leftover.
@@ -269,21 +273,34 @@ impl ProfileImageBuilder for FakeBuilder {
         req: &BuildRequest<'_>,
         _vm: &VmRef,
         _progress: Progress<'_>,
+        registrar: &dyn ImageRegistrar,
     ) -> Result<PublishedImage> {
         self.record("publish");
         *self.last_profile.lock().unwrap() = req.profile.name.clone();
-        self.should_fail("publish")?;
         let (name, id) = if self.stable_image_id {
             // Tart: the built VM is the image, so the same name comes back
-            // from every build.
+            // from every build, and nothing new is created.
             let name = req.profile.image_name();
             (name.clone(), name)
         } else {
             let name = format!("wg-build-image-{}", req.profile.name);
             (name, self.new_id("IMAGE"))
         };
-        self.published.lock().unwrap().push(name.clone());
-        self.live_images.lock().unwrap().push(id.clone());
+        if !self.stable_image_id {
+            // A backend that copies a VM here (UTM) has one the moment the
+            // copy is registered, before it can know the publish will
+            // finish -- so it says so first.
+            self.published.lock().unwrap().push(name.clone());
+            self.live_images.lock().unwrap().push(id.clone());
+            registrar
+                .image_created(&PublishedImage::new(id.clone(), name.clone()))
+                .await?;
+        }
+        self.should_fail("publish")?;
+        if self.stable_image_id {
+            self.published.lock().unwrap().push(name.clone());
+            self.live_images.lock().unwrap().push(id.clone());
+        }
         Ok(PublishedImage::new(id, name))
     }
 
@@ -1927,6 +1944,50 @@ async fn each_stage_is_written_down_as_the_build_reaches_it() {
 }
 
 /// A run that died between "the new image is recorded" and "the old one is
+/// **D5.** A publish that fails *after* the backend has already created the
+/// copy left a virtual machine nothing knew about: UTM registers the copy
+/// and only then fails the move it does last, and the record's
+/// `leaked_images` stayed empty while two images sat in UTM
+/// (task-7-b2b-report.md D5).
+///
+/// The copy is written down the moment the backend knows its id, so the
+/// record carries it, `prune` keeps skipping it, and the next successful
+/// build deletes it.
+#[tokio::test]
+async fn a_publish_that_fails_after_creating_a_vm_records_it_and_the_next_build_deletes_it() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    f.utm.set_fail_on("publish");
+    profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap_err();
+
+    let record = f.ctx.builds.load("kali-arm64").await.unwrap().unwrap();
+    assert_eq!(record.image, None, "nothing is launchable yet");
+    let leaked: Vec<String> = record.leaked_images.iter().map(|i| i.id.clone()).collect();
+    assert_eq!(leaked.len(), 1, "{:?}", record.leaked_images);
+    assert!(
+        f.utm.live_images.lock().unwrap().contains(&leaked[0]),
+        "the VM the failed publish created really does exist"
+    );
+    // `prune` must not offer it: the record owns it.
+    assert!(record.owned_vm_ids().iter().any(|(_, id)| id == &leaked[0]));
+
+    f.utm.clear_fail();
+    let second = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    assert!(
+        second.leaked_images.is_empty(),
+        "{:?}",
+        second.leaked_images
+    );
+    assert!(f.utm.discarded.lock().unwrap().contains(&leaked[0]));
+    assert_ne!(second.ready_image().unwrap().id, leaked[0]);
+}
+
 /// deleted" leaves `previous_image` naming an image that still exists. The
 /// next build must not overwrite that reference with its own replacement:
 /// the image would stop being deleted, and `prune` would stop protecting it.

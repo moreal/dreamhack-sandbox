@@ -24,7 +24,7 @@ use wargame_core::domain::VmRef;
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::fs::AppDirs;
 use wargame_core::ports::image_builder::{
-    BuildRequest, EjectOutcome, GuestLink, InstallerRequest, Progress,
+    BuildRequest, EjectOutcome, GuestLink, ImageRegistrar, InstallerRequest, Progress,
 };
 use wargame_core::ports::{
     BuildRecordRepository, DiskSpace, GuestTransport, ProfileImageBuilder, VmProvider, VmStatus,
@@ -147,6 +147,7 @@ impl ProfileImageBuilder for StubBuilder {
         _req: &BuildRequest<'_>,
         _vm: &VmRef,
         _progress: Progress<'_>,
+        _registrar: &dyn ImageRegistrar,
     ) -> Result<PublishedImage> {
         Err(unused("publish"))
     }
