@@ -349,7 +349,10 @@ in this MVP.
 - **Ephemeral by default.** Every launch clones the profile's base image
   fresh; nothing about a session mutates the canonical profile image, and a
   session with no `keep` flag is easy to delete completely (`wargame delete`,
-  or `wargame prune` for orphaned VMs Tart still has on disk).
+  or `wargame prune` for the VMs a failed or interrupted session left on
+  disk). `prune` decides what it owns from this home's own records, never
+  from a VM's name: a VM another `WARGAME_HOME` or you made is reported and
+  left alone, and a running VM is never deleted.
 - **Isolated networking by default**, with an explicit, confirmed opt-in for
   NAT — see above.
 - **No secret ever touches argv, logs, or a config/session file.** Every
