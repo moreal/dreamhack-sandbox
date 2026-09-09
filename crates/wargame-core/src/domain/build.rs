@@ -155,6 +155,42 @@ impl std::fmt::Display for BuildPhase {
     }
 }
 
+/// Whether the installation VM still has its installer CD in the drive.
+///
+/// It matters because UEFI boots the removable drive first: an installed
+/// guest with the CD still attached comes back up in the installer, never
+/// reaches SSH, and hands a copy of itself the same CD
+/// (task-7-phase-a-report.md §5 D3). `profile create` attaches one;
+/// `profile build` and `profile eject` take it out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallerMedia {
+    /// Never established -- an older record, a backend with no installation
+    /// VM, or a VM cloned from one the user already had.
+    #[default]
+    Unknown,
+    /// A removable drive with installer media is attached.
+    Attached,
+    /// No removable drive: the guest boots from its own disk.
+    Detached,
+}
+
+impl InstallerMedia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InstallerMedia::Unknown => "unknown",
+            InstallerMedia::Attached => "attached",
+            InstallerMedia::Detached => "detached",
+        }
+    }
+}
+
+impl std::fmt::Display for InstallerMedia {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A published, launchable image: the stopped VM (UTM) or local image
 /// (Tart) a finished build produced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +241,11 @@ pub struct BuildRecord {
     /// so the user can resume the install (spec.md §3 FR-5).
     #[serde(default)]
     pub installer_vm: Option<VmRef>,
+    /// Whether that VM still has its installer CD attached. Written by
+    /// `profile create` (which attaches one), by the build's eject step and
+    /// by `profile eject`.
+    #[serde(default)]
+    pub installer_media: InstallerMedia,
     pub phase: BuildPhase,
     /// The image a finished build published, and what `launch` clones from.
     #[serde(default)]
@@ -254,6 +295,7 @@ impl BuildRecord {
             arch: profile.guest.arch,
             mode: profile.vm.mode,
             installer_vm: None,
+            installer_media: InstallerMedia::Unknown,
             phase: BuildPhase::Created,
             image: None,
             previous_image: None,

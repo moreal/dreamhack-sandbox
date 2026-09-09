@@ -233,12 +233,37 @@ impl UtmProvider {
         self.automation.attach_iso(&vm.id, iso).await
     }
 
-    /// Points the VM's first removable drive at another ISO. There is no
-    /// verified way to *remove* a drive, so an installer CD is swapped, not
-    /// detached (§2 lists "Attach a second ISO" and "Replace an ISO"; no
-    /// detach was reproduced).
+    /// Points the VM's first removable drive at another ISO.
     pub async fn replace_iso(&self, vm: &VmRef, iso: &Path) -> Result<()> {
         self.automation.replace_iso(&vm.id, iso).await
+    }
+
+    /// Detaches the installer CD: writes the drive list back without its
+    /// removable entries and answers how many went. Zero means there was
+    /// nothing attached, which is a success -- an eject is idempotent.
+    ///
+    /// Once the OS is installed the CD is not merely redundant: UEFI boots
+    /// it first, so the guest comes back up in the installer instead of the
+    /// system that was installed, and a copy taken of that VM inherits the
+    /// CD (task-7-phase-a-report.md §5 D3).
+    ///
+    /// The VM must be **stopped**: `update configuration` is refused
+    /// otherwise (T9), and the recovery for that is to stop it, not to
+    /// retry.
+    pub async fn eject_removable_drives(&self, vm: &VmRef) -> Result<usize> {
+        let Some(entry) = self.owned_vm(vm).await? else {
+            return Err(WargameError::VmNotFound(format!(
+                "UTM has no virtual machine with id {} ({})",
+                vm.id, vm.name
+            )));
+        };
+        if entry.status != UtmStatus::Stopped {
+            return Err(WargameError::Other(format!(
+                "{} ({}) is {}; UTM writes a configuration only to a stopped virtual machine, so its installer media cannot be detached now",
+                entry.name, vm.id, entry.status
+            )));
+        }
+        self.automation.eject_removable_drives(&vm.id).await
     }
 
     /// Shows the VM's window: starts it if it is not running (which

@@ -29,15 +29,15 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::domain::build::{
-    profile_hash, scripts_hash, BuildPhase, BuildRecord, BuildSource, BuildStage, PublishedImage,
-    VerificationResult,
+    profile_hash, scripts_hash, BuildPhase, BuildRecord, BuildSource, BuildStage, InstallerMedia,
+    PublishedImage, VerificationResult,
 };
 use crate::domain::compat::Backend;
 use crate::domain::{GuestOs, GuestShell, Profile, VmRef};
 use crate::error::{Result, WargameError};
 use crate::infra::GuestOps;
 use crate::ports::image_builder::{
-    BuildObserver, BuildRequest, GuestLink, InstallerRequest, Progress,
+    BuildObserver, BuildRequest, EjectOutcome, GuestLink, InstallerRequest, Progress,
 };
 use crate::ports::{BuildRecordRepository, ImageRef, ProfileImageBuilder};
 use crate::security::hash::sha256_file;
@@ -402,6 +402,12 @@ pub async fn create(
         .await?;
 
     let mut record = BuildRecord::new(&profile, execution.backend.as_str(), source);
+    // An ISO source is attached to the new VM as a removable drive, and the
+    // record has to know: the guest boots it in preference to its own disk
+    // until something ejects it (D3).
+    if matches!(record.source, BuildSource::Iso { .. }) {
+        record.installer_media = InstallerMedia::Attached;
+    }
     record.installer_vm = Some(vm);
     // The OS still has to be installed (or, for a clone, its SSH and guest
     // agent still have to answer), so the honest phase is the same for both
@@ -699,6 +705,9 @@ pub async fn build(
             if builder.uses_installer_vm() {
                 record.installer_vm = Some(outcome.vm);
             }
+            if outcome.media.is_detached() {
+                record.installer_media = InstallerMedia::Detached;
+            }
             // A run that died between recording a new image and deleting the
             // one it replaced left that image behind and still named here.
             // It exists, so it stays tracked rather than being overwritten
@@ -735,6 +744,12 @@ pub async fn build(
                 if let Some(vm) = failure.vm {
                     record.installer_vm = Some(vm);
                 }
+            }
+            // The eject happens before the boot, so a build that failed
+            // later still left the CD out; the record must say so or the
+            // next run has no idea what state the VM is in.
+            if failure.media.as_ref().map(EjectOutcome::is_detached) == Some(true) {
+                record.installer_media = InstallerMedia::Detached;
             }
             if failure.awaiting_install {
                 // Not a failed build: the guest simply is not installed or
@@ -936,6 +951,8 @@ pub struct BuildFlowOutcome {
     pub image: PublishedImage,
     pub verification: Vec<VerificationResult>,
     pub cleanup_failures: Vec<String>,
+    /// What the eject step did to the installation VM's installer media.
+    pub media: EjectOutcome,
 }
 
 /// Where a build stopped and what it left behind.
@@ -949,6 +966,10 @@ pub struct BuildFlowError {
     /// The guest was never reachable on a backend that installs its OS by
     /// hand: a wait, not a failure.
     pub awaiting_install: bool,
+    /// What the eject step did before the failure, when it got that far.
+    /// The CD is out whatever happens afterwards, and the record has to say
+    /// so or the next run cannot tell.
+    pub media: Option<EjectOutcome>,
 }
 
 impl BuildFlowError {
@@ -960,6 +981,7 @@ impl BuildFlowError {
             verification: Vec::new(),
             cleanup_failures: Vec::new(),
             awaiting_install: false,
+            media: None,
         }
     }
 }
@@ -992,11 +1014,21 @@ pub async fn run_build_flow(
         .await
         .map_err(|e| BuildFlowError::new(BuildStage::Cloning, e))?;
 
+    // Before the boot, not after it: an installed guest whose installer CD
+    // is still attached boots the CD, so the build would wait out its whole
+    // boot timeout and the image it published would carry the CD too
+    // (task-7-phase-a-report.md §5 D3). Idempotent, so a rebuild is free.
+    let media = eject_installer_media(builder, req, &vm, progress).await?;
+
     // From here every failure cleans up after itself before propagating.
     let outcome = build_from(builder, req, &vm, progress, observer).await;
     match outcome {
-        Ok(outcome) => Ok(outcome),
+        Ok(mut outcome) => {
+            outcome.media = media;
+            Ok(outcome)
+        }
         Err(mut failure) => {
+            failure.media = Some(media);
             progress("build failed; cleaning up".to_string());
             failure
                 .cleanup_failures
@@ -1069,7 +1101,48 @@ async fn build_from(
         image,
         verification,
         cleanup_failures: Vec::new(),
+        // Filled in by `run_build_flow`, which owns the eject step.
+        media: EjectOutcome::NotApplicable,
     })
+}
+
+/// The eject step, with its two outcomes that are *not* failures: a backend
+/// with no installation media, and a VM that is not stopped (its
+/// configuration cannot be written then, and the answer is a recovery step
+/// rather than a dead build).
+async fn eject_installer_media(
+    builder: &dyn ProfileImageBuilder,
+    req: &BuildRequest<'_>,
+    vm: &VmRef,
+    progress: Progress<'_>,
+) -> std::result::Result<EjectOutcome, BuildFlowError> {
+    let media = builder
+        .eject_installer_media(vm, progress)
+        .await
+        .map_err(|e| {
+            // Attributed to the boot: this is what makes the boot land in
+            // the installed system rather than in the installer.
+            let mut failure = BuildFlowError::new(BuildStage::Booting, e);
+            failure.vm = Some(vm.clone());
+            failure
+        })?;
+    match &media {
+        EjectOutcome::Detached(n) => progress(format!(
+            "detached the installer media from {} ({n} removable drive{})",
+            vm.name,
+            if *n == 1 { "" } else { "s" }
+        )),
+        EjectOutcome::NothingAttached => progress(format!(
+            "{} has no installer media attached; nothing to eject",
+            vm.name
+        )),
+        EjectOutcome::Blocked(reason) => progress(format!(
+            "leaving the installer media attached: {reason}. Stop it and build again -- `wargame profile stop {0}` then `wargame profile build {0}` -- if this build cannot reach the guest.",
+            req.profile.name
+        )),
+        EjectOutcome::NotApplicable => {}
+    }
+    Ok(media)
 }
 
 /// Announces a stage to the observer, turning a refusal to record it into a

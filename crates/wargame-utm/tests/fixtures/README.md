@@ -134,6 +134,18 @@ ps -Aww -o command | grep 'qemu-x86_64-softmmu'  | grep -v grep     # x86_64 VMs
 | `attach-probe.sh` | that driver. Creates one VM, `wargame-t1-attach2`, and deletes it. |
 | `orphan-qemu-process.txt` | trap T12. **One-off observation, transcribed command by command** — see its own PROVENANCE header. Every quoted line is byte-exact; the trigger is unknown and it has not been reproduced deliberately. |
 
+## Task 7 phase A (the installed Kali guests)
+
+Two shapes the first real installation run turned up
+(`.superpowers/sdd/PLAN/task-7-phase-a-report.md` §5 D8). **Transcribed from that report's
+transcripts, not re-captured here** — every character, the typographic apostrophe included, is as
+the report quotes it.
+
+| File | Command | Exit |
+|---|---|---|
+| `utmctl-ip-address-three-lines.txt` | `utmctl ip-address 91195127-B639-471B-B5CF-9EC732973E4D` on the installed Kali arm64 guest — the guest agent answers with **three** lines: IPv4, a global (ULA) IPv6 and a link-local `fe80::`. A caller must pick, never read line 1 blindly. | 0 |
+| `utmctl-error-609-app-not-running.stderr.txt` | `utmctl start <uuid>` issued straight after a `stop`, with UTM not yet back (trap T8). Written to **stderr with exit 0**, and the VM does not start; the `open -a UTM` + poll-`utmctl version` handshake clears it. | **0** |
+
 ## Boot evidence
 
 | File | How |

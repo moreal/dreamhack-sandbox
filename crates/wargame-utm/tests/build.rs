@@ -20,7 +20,7 @@ use wargame_core::domain::{
 };
 use wargame_core::error::WargameError;
 use wargame_core::infra::process::{Cmd, Output, ProcessRunner};
-use wargame_core::ports::image_builder::{BuildRequest, InstallerRequest};
+use wargame_core::ports::image_builder::{BuildRequest, EjectOutcome, InstallerRequest};
 use wargame_core::ports::{
     BuildRecordRepository, GuestTransport, ImageRef, ProfileImageBuilder, VmProvider,
 };
@@ -144,6 +144,8 @@ fn verb_of(script: &str) -> &'static str {
         ("network interfaces of c", "network"),
         ("set displays of c", "display"),
         ("set hypervisor of c", "hardware"),
+        // The eject also touches `drives of c`, so it is matched first.
+        ("removable of d", "eject"),
         ("drives of c", "drives"),
         ("UTM version", "version"),
     ] {
@@ -159,6 +161,10 @@ struct Harness {
     registry: Registry,
     calls: Calls,
     transport: Arc<FakeTransport>,
+    /// How many removable drives the scripted VM still has. The eject
+    /// script answers with this and empties it, so a second eject really
+    /// does report "nothing attached".
+    removable: Arc<Mutex<usize>>,
 }
 
 /// A runner that plays the scripted registry back. `guest_ip` answers with
@@ -169,6 +175,10 @@ fn harness(registry: Registry, no_guest_agent: bool) -> Harness {
     fake.set_which("utmctl", PathBuf::from("/opt/homebrew/bin/utmctl"));
     let reg = registry.clone();
     let recorded = calls.clone();
+    // Every installation VM here was made from an ISO, so it starts with
+    // one removable drive.
+    let removable = Arc::new(Mutex::new(1usize));
+    let drives = removable.clone();
     fake.set_responder(move |cmd: &Cmd| {
         if cmd.program.ends_with("utmctl") {
             let sub = cmd.args.first().map(String::as_str).unwrap_or("");
@@ -218,6 +228,12 @@ fn harness(registry: Registry, no_guest_agent: bool) -> Harness {
                     reg.set_status(&first, "stopped");
                     ok("ok\n")
                 }
+                "eject" => {
+                    let mut left = drives.lock().unwrap();
+                    let removed = *left;
+                    *left = 0;
+                    ok(&format!("{removed}\n"))
+                }
                 "status" => match reg.status_of(&first) {
                     Some(status) => ok(&format!("{status}\tqemu\n")),
                     None => ok("wargame-utm:vm-not-found\n"),
@@ -255,6 +271,7 @@ fn harness(registry: Registry, no_guest_agent: bool) -> Harness {
         registry,
         calls,
         transport,
+        removable,
     }
 }
 
@@ -557,6 +574,118 @@ async fn a_guest_without_the_agent_fails_at_connect_and_keeps_the_installation_v
             .contains(&"wg-build-image-kali-custom".to_string()),
         "a failed build publishes nothing"
     );
+}
+
+// --- ejecting the installer CD (phase A, D3) -------------------------------
+
+/// The build takes the CD out *before* it starts the VM. With the CD in,
+/// UEFI boots the installer instead of the installed system, so the build
+/// would burn its whole boot timeout and then publish a copy that still
+/// carries the CD.
+#[tokio::test]
+async fn the_flow_ejects_the_installer_cd_before_starting_the_vm() {
+    let h = harness(
+        Registry::with(&[(INSTALLER_ID, "stopped", "wg-build-kali-custom")]),
+        false,
+    );
+    let profile = kali_profile();
+    let record = record_with_installer(&profile);
+    let req = request(&profile, &record);
+
+    let outcome = run_build_flow(&h.builder, &req, &mut |_| {}, &())
+        .await
+        .unwrap_or_else(|e| panic!("build failed: {}", e.error));
+    assert_eq!(outcome.media, EjectOutcome::Detached(1));
+
+    let calls = h.calls.all();
+    let eject = h.calls.index_of("osascript:eject").expect("an eject");
+    let start = h.calls.index_of("osascript:start").expect("a start");
+    assert!(
+        eject < start,
+        "the CD comes out before the VM boots: {calls:?}"
+    );
+    assert!(
+        eject < h.calls.index_of("osascript:duplicate").unwrap(),
+        "and long before the copy is taken: {calls:?}"
+    );
+    assert_eq!(*h.removable.lock().unwrap(), 0);
+}
+
+/// Idempotent: the second build finds nothing to eject and says so.
+#[tokio::test]
+async fn ejecting_a_vm_whose_cd_is_already_out_is_a_no_op() {
+    let h = harness(
+        Registry::with(&[(INSTALLER_ID, "stopped", "wg-build-kali-custom")]),
+        false,
+    );
+    let vm = VmRef {
+        backend: "utm".to_string(),
+        id: INSTALLER_ID.to_string(),
+        name: "wg-build-kali-custom".to_string(),
+    };
+    assert_eq!(
+        h.builder
+            .eject_installer_media(&vm, &mut |_| {})
+            .await
+            .unwrap(),
+        EjectOutcome::Detached(1)
+    );
+    assert_eq!(
+        h.builder
+            .eject_installer_media(&vm, &mut |_| {})
+            .await
+            .unwrap(),
+        EjectOutcome::NothingAttached
+    );
+}
+
+/// T9: UTM writes a configuration only to a stopped VM. `profile console`
+/// leaves the installation VM running, and that must not turn into a failed
+/// build -- it is reported and the build carries on.
+#[tokio::test]
+async fn ejecting_a_running_installation_vm_is_blocked_not_a_failure() {
+    let h = harness(
+        Registry::with(&[(INSTALLER_ID, "started", "wg-build-kali-custom")]),
+        false,
+    );
+    let vm = VmRef {
+        backend: "utm".to_string(),
+        id: INSTALLER_ID.to_string(),
+        name: "wg-build-kali-custom".to_string(),
+    };
+    let outcome = h
+        .builder
+        .eject_installer_media(&vm, &mut |_| {})
+        .await
+        .unwrap();
+    match outcome {
+        EjectOutcome::Blocked(reason) => {
+            assert!(reason.contains("started"), "{reason}");
+            assert!(
+                reason.contains("stopped virtual machine"),
+                "it has to say why: {reason}"
+            );
+        }
+        other => panic!("a running VM must not be written to: {other:?}"),
+    }
+    assert!(!h.calls.contains("osascript:eject"), "{:?}", h.calls.all());
+    assert_eq!(*h.removable.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn ejecting_from_a_vm_utm_no_longer_knows_is_an_error() {
+    let h = harness(Registry::default(), false);
+    let vm = VmRef {
+        backend: "utm".to_string(),
+        id: INSTALLER_ID.to_string(),
+        name: "wg-build-kali-custom".to_string(),
+    };
+    let err = h
+        .builder
+        .eject_installer_media(&vm, &mut |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WargameError::VmNotFound(_)), "{err:?}");
 }
 
 /// The installation VM was deleted in UTM behind our back: say so, and never

@@ -17,13 +17,15 @@ use wargame_core::app::{
     AppContext, BackendRegistry, BuilderRegistry, ProfileStore, TransportRegistry,
 };
 use wargame_core::domain::build::{
-    BuildPhase, BuildRecord, BuildSource, BuildStage, PublishedImage,
+    BuildPhase, BuildRecord, BuildSource, BuildStage, InstallerMedia, PublishedImage,
 };
 use wargame_core::domain::{GuestEndpoint, GuestShell, VmRef};
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::fs::AppDirs;
 use wargame_core::infra::process::ProcessRunner;
-use wargame_core::ports::image_builder::{BuildRequest, GuestLink, InstallerRequest, Progress};
+use wargame_core::ports::image_builder::{
+    BuildRequest, EjectOutcome, GuestLink, InstallerRequest, Progress,
+};
 use wargame_core::ports::{
     BuildRecordRepository, DiskSpace, GuestTransport, ProfileImageBuilder, VmProvider,
 };
@@ -62,6 +64,9 @@ struct FakeBuilder {
     builds: Mutex<Option<Arc<MemoryBuildRepo>>>,
     last_profile: Mutex<String>,
     image_at_discard: Mutex<Option<String>>,
+    /// What `eject_installer_media` answers, when a test wants something
+    /// other than "one drive came out".
+    eject: Mutex<Option<EjectOutcome>>,
 }
 
 impl FakeBuilder {
@@ -83,7 +88,12 @@ impl FakeBuilder {
             builds: Mutex::new(None),
             last_profile: Mutex::new(String::new()),
             image_at_discard: Mutex::new(None),
+            eject: Mutex::new(None),
         }
+    }
+
+    fn set_eject(&self, outcome: EjectOutcome) {
+        *self.eject.lock().unwrap() = Some(outcome);
     }
 
     fn set_transport(&self, transport: Arc<dyn GuestTransport>) {
@@ -190,6 +200,24 @@ impl ProfileImageBuilder for FakeBuilder {
         let name = req.profile.image_name();
         self.created.lock().unwrap().push(name.clone());
         Ok(VmRef::new(self.backend.clone(), name))
+    }
+
+    async fn eject_installer_media(
+        &self,
+        vm: &VmRef,
+        _progress: Progress<'_>,
+    ) -> Result<EjectOutcome> {
+        if !self.installer {
+            return Ok(EjectOutcome::NotApplicable);
+        }
+        self.record(&format!("eject_installer_media:{}", vm.id));
+        self.should_fail("eject_installer_media")?;
+        Ok(self
+            .eject
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(EjectOutcome::Detached(1)))
     }
 
     async fn boot(
@@ -873,6 +901,11 @@ async fn a_successful_build_runs_every_step_in_order_and_publishes_a_ready_image
         vec![
             "prepare",
             "clone_for_build",
+            // The installer CD comes out *before* the VM boots: UEFI boots
+            // the CD first, so a build that skipped this would sit in the
+            // installer until its boot timeout ran out, and the image it
+            // published would still carry the CD (phase A, D3).
+            "eject_installer_media",
             "boot",
             "connect",
             "shutdown",
@@ -1720,4 +1753,89 @@ async fn a_stale_previous_image_from_a_killed_run_is_not_lost() {
     );
     assert_eq!(second.previous_image, None);
     assert!(f.utm.has_image(&second.ready_image().unwrap().id));
+}
+
+// --- the installer CD (phase A, D3) ---------------------------------------
+
+/// `profile create` attaches an installer ISO, so the record says the media
+/// is on; a build that ejects it says so too. That is what tells a later
+/// `profile console` -- and the next reader of the record -- whether the VM
+/// still boots the installer.
+#[tokio::test]
+async fn the_record_tracks_whether_the_installer_media_is_still_attached() {
+    let f = fixture();
+    let created = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    assert_eq!(created.record.installer_media, InstallerMedia::Attached);
+
+    let record = profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap();
+    assert_eq!(record.installer_media, InstallerMedia::Detached);
+    assert_eq!(
+        f.record("kali-arm64").await.installer_media,
+        InstallerMedia::Detached,
+        "and it is persisted, not only returned"
+    );
+}
+
+/// The eject happens before the boot, so even a build that then fails has
+/// left the VM bootable from its own disk -- and the record says so, or the
+/// next run would have no idea.
+#[tokio::test]
+async fn a_build_that_fails_after_the_eject_still_records_it() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    f.utm.set_fail_on("connect");
+    profile_build::build(&f.ctx, "kali-arm64", &mut noop)
+        .await
+        .unwrap_err();
+
+    let record = f.record("kali-arm64").await;
+    assert_eq!(record.phase, BuildPhase::AwaitingInstall);
+    assert_eq!(record.installer_media, InstallerMedia::Detached);
+}
+
+/// An installation VM that is still running cannot have its configuration
+/// written (UTM refuses that), so the eject is skipped rather than failing
+/// the build -- and the record must not claim the CD is gone.
+#[tokio::test]
+async fn a_blocked_eject_does_not_stop_the_build_and_does_not_claim_the_media_is_gone() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    f.utm
+        .set_eject(EjectOutcome::Blocked("the VM is started".to_string()));
+    let mut messages = Vec::new();
+    let record = profile_build::build(&f.ctx, "kali-arm64", &mut |m| messages.push(m))
+        .await
+        .unwrap();
+    assert_eq!(record.installer_media, InstallerMedia::Attached);
+    assert!(
+        messages.iter().any(|m| m.contains("started")),
+        "the user has to be told why it was skipped: {messages:?}"
+    );
+}
+
+/// A Tart profile has no installation media at all: nothing is ejected and
+/// nothing is claimed about it.
+#[tokio::test]
+async fn a_tart_build_ejects_nothing() {
+    let f = fixture();
+    profile_build::build(&f.ctx, "macos-re-arm64", &mut noop)
+        .await
+        .unwrap();
+    assert!(
+        !f.tart.calls().iter().any(|c| c.starts_with("eject")),
+        "{:?}",
+        f.tart.calls()
+    );
+    assert_eq!(
+        f.record("macos-re-arm64").await.installer_media,
+        InstallerMedia::Unknown
+    );
 }

@@ -79,6 +79,38 @@ impl BuildObserver for () {
     }
 }
 
+/// What detaching the installation VM's installer media did.
+///
+/// An installed guest that still has its installer CD attached boots the CD
+/// (UEFI prefers it), so it never reaches SSH and every copy taken of it
+/// inherits the CD (task-7-phase-a-report.md §5 D3). Ejecting is therefore
+/// part of building, not a convenience -- and it is idempotent, so both
+/// [`EjectOutcome::Detached`] and [`EjectOutcome::NothingAttached`] mean
+/// "this VM now boots from its own disk".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EjectOutcome {
+    /// This many removable drives were detached.
+    Detached(usize),
+    /// There was nothing to detach.
+    NothingAttached,
+    /// This backend has no installation media (Tart builds from an image).
+    NotApplicable,
+    /// Not done, and why -- the VM has to be stopped for its configuration
+    /// to be written, and it was not. Never an error on its own: the build
+    /// carries on and says what it skipped.
+    Blocked(String),
+}
+
+impl EjectOutcome {
+    /// Whether the VM is now free of installer media.
+    pub fn is_detached(&self) -> bool {
+        matches!(
+            self,
+            EjectOutcome::Detached(_) | EjectOutcome::NothingAttached
+        )
+    }
+}
+
 /// A live connection to the guest being provisioned.
 pub struct GuestLink {
     pub endpoint: GuestEndpoint,
@@ -138,6 +170,19 @@ pub trait ProfileImageBuilder: Send + Sync {
         req: &BuildRequest<'_>,
         progress: Progress<'_>,
     ) -> Result<VmRef>;
+
+    /// Step 2.5 -- eject: detach the installer media before the VM boots.
+    ///
+    /// Runs on every build, and must be idempotent: a VM whose CD is
+    /// already gone answers [`EjectOutcome::NothingAttached`]. A backend
+    /// that has no installation media at all leaves this alone.
+    async fn eject_installer_media(
+        &self,
+        _vm: &VmRef,
+        _progress: Progress<'_>,
+    ) -> Result<EjectOutcome> {
+        Ok(EjectOutcome::NotApplicable)
+    }
 
     /// Step 3 -- boot: start `vm` on NAT (spec.md §3 FR-6: builds install
     /// packages, so they never run isolated).

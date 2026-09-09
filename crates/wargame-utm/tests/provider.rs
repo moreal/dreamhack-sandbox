@@ -36,6 +36,12 @@ const ERR_ORPHAN_LOCK: &str = include_str!("fixtures/utmctl-error-orphan-qemu-lo
 const ERR_AUTOMATION_DENIED: &str =
     include_str!("fixtures/applescript-error-appleevents-denied.txt");
 const ERR_MUST_BE_STOPPED: &str = include_str!("fixtures/applescript-error-vm-must-be-stopped.txt");
+/// The three lines `utmctl ip-address` really answers with, once a guest
+/// agent is running (phase A, D8): IPv4, a global IPv6, a link-local one.
+const IP_THREE_LINES: &str = include_str!("fixtures/utmctl-ip-address-three-lines.txt");
+/// T8: `utmctl start` right after a stop, with UTM not back yet -- exit 0,
+/// `-609` on stderr, and the VM does not start.
+const ERR_609: &str = include_str!("fixtures/utmctl-error-609-app-not-running.stderr.txt");
 
 /// The first UUID in `utmctl-list-multi.txt` (`wargame-t1-x86`).
 const X86_ID: &str = "A8E9F979-A198-433A-B2DE-74A6D7302D2F";
@@ -701,6 +707,146 @@ async fn wait_ip_timeout_names_the_guest_agent_the_log_and_the_timeout_setting()
     );
 }
 
+#[tokio::test]
+async fn wait_ip_picks_the_ipv4_out_of_the_agents_three_addresses() {
+    // The real answer on an installed Kali guest is three lines. Reading
+    // line 1 blindly happens to work there and breaks the moment the agent
+    // orders them differently, so the choice is by kind, not by position.
+    let p = UtmProvider::new(
+        runner(|cmd| (utmctl_sub(cmd) == Some("ip-address")).then(|| ok(IP_THREE_LINES)))
+            as Arc<dyn ProcessRunner>,
+        fast_config(),
+    );
+    let ip = p
+        .wait_ip(&vm_ref(X86_ID, "wg-x"), Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert_eq!(ip, IpAddr::from_str("192.168.64.27").unwrap());
+}
+
+#[tokio::test]
+async fn wait_ip_never_takes_the_first_line_and_never_a_link_local_one() {
+    // Same three addresses, reordered: a `lines[0]` implementation would
+    // hand ssh an `fe80::` address that cannot be connected to.
+    const REORDERED: &str =
+        "fe80::3176:9ad0:835c:65b9\n192.168.64.27\nfd14:a432:91d3:c29f:e585:fc6f:d6b4:3529\n";
+    let p = UtmProvider::new(
+        runner(|cmd| (utmctl_sub(cmd) == Some("ip-address")).then(|| ok(REORDERED)))
+            as Arc<dyn ProcessRunner>,
+        fast_config(),
+    );
+    let ip = p
+        .wait_ip(&vm_ref(X86_ID, "wg-x"), Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert_eq!(ip, IpAddr::from_str("192.168.64.27").unwrap());
+}
+
+#[tokio::test]
+async fn wait_ip_falls_back_to_a_routable_ipv6_when_there_is_no_ipv4() {
+    let p = UtmProvider::new(
+        runner(|cmd| {
+            (utmctl_sub(cmd) == Some("ip-address"))
+                .then(|| ok("fe80::3176:9ad0:835c:65b9\nfd14:a432:91d3:c29f:e585:fc6f:d6b4:3529\n"))
+        }) as Arc<dyn ProcessRunner>,
+        fast_config(),
+    );
+    let ip = p
+        .wait_ip(&vm_ref(X86_ID, "wg-x"), Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert_eq!(
+        ip,
+        IpAddr::from_str("fd14:a432:91d3:c29f:e585:fc6f:d6b4:3529").unwrap()
+    );
+}
+
+#[tokio::test]
+async fn wait_ip_treats_only_link_local_answers_as_not_ready_yet() {
+    let p = UtmProvider::new(
+        runner(|cmd| {
+            (utmctl_sub(cmd) == Some("ip-address")).then(|| ok("fe80::3176:9ad0:835c:65b9\n"))
+        }) as Arc<dyn ProcessRunner>,
+        fast_config(),
+    );
+    let err = p
+        .wait_ip(&vm_ref(X86_ID, "wg-x"), Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("fe80"), "{err}");
+}
+
+// --- T8: the app was not up (-609) -----------------------------------------
+
+/// Every verb that can hit a cold or wedged app re-handshakes and retries
+/// once: `utmctl start` right after a stop answers `-609` **with exit 0**
+/// and does not start the VM (phase A, D8).
+#[tokio::test]
+async fn a_609_from_a_cold_app_is_re_handshaked_and_retried_once() {
+    let attempts = Arc::new(std::sync::Mutex::new(0usize));
+    let seen = attempts.clone();
+    let listing = owned_list(X86_ID, "stopped", "wg-x");
+    let fake = runner(move |cmd| {
+        if utmctl_sub(cmd) == Some("list") {
+            return Some(ok(&listing));
+        }
+        if is_osascript(cmd, "status of vm") {
+            return Some(ok("stopped\tqemu\n"));
+        }
+        if !is_osascript(cmd, "start vm") {
+            return None;
+        }
+        let mut n = seen.lock().unwrap();
+        *n += 1;
+        Some(if *n == 1 {
+            apple_event_failure(ERR_609)
+        } else {
+            ok("ok")
+        })
+    });
+    let p = UtmProvider::new(fake.clone() as Arc<dyn ProcessRunner>, fast_config());
+
+    p.start(&vm_ref(X86_ID, "wg-x"), &start_opts(NetworkMode::Nat))
+        .await
+        .expect("a -609 must be retried after re-handshaking, not reported as a failure");
+
+    assert_eq!(*attempts.lock().unwrap(), 2, "exactly one retry");
+    let calls = fake.calls();
+    let opens = calls
+        .iter()
+        .filter(|c| c.program == "open" && c.args == ["-a", "UTM"])
+        .count();
+    assert!(
+        opens >= 2,
+        "the app has to be re-opened before the retry, saw {opens} `open -a UTM` calls"
+    );
+}
+
+/// The same retry, on the `utmctl` side of the automation surface.
+#[tokio::test]
+async fn a_609_on_a_utmctl_call_is_re_handshaked_and_retried_once() {
+    let attempts = Arc::new(std::sync::Mutex::new(0usize));
+    let seen = attempts.clone();
+    let listing = owned_list(X86_ID, "stopped", "wg-x");
+    let fake = runner(move |cmd| {
+        if utmctl_sub(cmd) != Some("list") {
+            return None;
+        }
+        let mut n = seen.lock().unwrap();
+        *n += 1;
+        Some(if *n == 1 {
+            apple_event_failure(ERR_609)
+        } else {
+            ok(&listing)
+        })
+    });
+    let p = UtmProvider::new(fake.clone() as Arc<dyn ProcessRunner>, fast_config());
+
+    let vms = p.list().await.expect("a -609 must be retried");
+    assert_eq!(vms.len(), 1);
+    assert_eq!(*attempts.lock().unwrap(), 2);
+}
+
 // --- stop ------------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
@@ -1162,6 +1308,125 @@ async fn attach_iso_appends_a_removable_drive_with_the_path_as_data() {
         posix < tell,
         "POSIX file must be resolved outside the tell block"
     );
+}
+
+// --- ejecting the installer media (D3) -------------------------------------
+
+/// The verified mechanism (docs §2 "Change any setting"): write the whole
+/// `drives` list back without the removable entries, on a **stopped** VM.
+/// Each surviving drive is echoed back by its own `id`, the same rule that
+/// makes "replace an ISO" replace rather than append.
+#[tokio::test]
+async fn eject_writes_the_drives_back_without_the_removable_ones() {
+    let fake = runner(|cmd| {
+        if utmctl_sub(cmd) == Some("list") {
+            return Some(ok(&owned_list(X86_ID, "stopped", "wg-x")));
+        }
+        is_osascript(cmd, "removable of d").then(|| ok("1\n"))
+    });
+    let p = provider(fake.clone());
+
+    let removed = p
+        .eject_removable_drives(&vm_ref(X86_ID, "wg-x"))
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+
+    let calls = fake.calls();
+    let call = calls
+        .iter()
+        .find(|c| is_osascript(c, "removable of d"))
+        .expect("an eject call");
+    assert_eq!(call.args[1], X86_ID, "the VM travels as argv, by UUID");
+    let script = script_of(call);
+    assert!(
+        script.contains("if (id of vm) is vmId then"),
+        "addressed by UUID, never by name: {script}"
+    );
+    assert!(!script.contains("virtual machine named"), "{script}");
+    assert!(
+        script.contains("set drives of c to"),
+        "the drives list is written back: {script}"
+    );
+    assert!(
+        script.contains("update configuration of vm with c"),
+        "the write needs `update configuration`: {script}"
+    );
+    assert!(
+        script.contains("id:(id of d)"),
+        "a kept drive must echo its own id back, or UTM adds one instead: {script}"
+    );
+}
+
+/// Idempotent: a VM whose installer CD is already gone reports zero and
+/// still succeeds, so `profile build` and `profile eject` can both run twice.
+#[tokio::test]
+async fn ejecting_a_vm_with_no_removable_drive_removes_nothing_and_succeeds() {
+    let fake = runner(|cmd| {
+        if utmctl_sub(cmd) == Some("list") {
+            return Some(ok(&owned_list(X86_ID, "stopped", "wg-x")));
+        }
+        is_osascript(cmd, "removable of d").then(|| ok("0\n"))
+    });
+    let p = provider(fake);
+    assert_eq!(
+        p.eject_removable_drives(&vm_ref(X86_ID, "wg-x"))
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+/// T9: `update configuration` is accepted only while the VM is `stopped`,
+/// so the drive list is never written to a live one.
+#[tokio::test]
+async fn eject_refuses_a_vm_that_is_not_stopped() {
+    for status in ["started", "paused", "stopping"] {
+        let listing = owned_list(X86_ID, status, "wg-x");
+        let fake = runner(move |cmd| (utmctl_sub(cmd) == Some("list")).then(|| ok(&listing)));
+        let p = provider(fake.clone());
+        let err = p
+            .eject_removable_drives(&vm_ref(X86_ID, "wg-x"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(status), "{status}: {err}");
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|c| is_osascript(c, "removable of d")),
+            "{status}: nothing may be written to a VM that is not stopped"
+        );
+    }
+}
+
+#[tokio::test]
+async fn eject_refuses_a_vm_outside_the_apps_namespace() {
+    let fake = runner(|cmd| {
+        (utmctl_sub(cmd) == Some("list")).then(|| ok(&owned_list(X86_ID, "stopped", "kindle-vm")))
+    });
+    let p = provider(fake.clone());
+    let err = p
+        .eject_removable_drives(&vm_ref(X86_ID, "kindle-vm"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("kindle-vm"), "{err}");
+    assert!(!fake
+        .calls()
+        .iter()
+        .any(|c| is_osascript(c, "removable of d")));
+}
+
+#[tokio::test]
+async fn eject_of_a_vm_utm_no_longer_knows_is_an_error() {
+    let p = provider(runner(|cmd| {
+        (utmctl_sub(cmd) == Some("list")).then(|| ok(LIST_EMPTY))
+    }));
+    let err = p
+        .eject_removable_drives(&vm_ref(UNKNOWN_ID, "wg-x"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WargameError::VmNotFound(_)), "{err:?}");
 }
 
 #[tokio::test]

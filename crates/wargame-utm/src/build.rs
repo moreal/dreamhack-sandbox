@@ -24,7 +24,9 @@ use async_trait::async_trait;
 use wargame_core::domain::build::{BuildSource, PublishedImage};
 use wargame_core::domain::{GuestEndpoint, GuestShell, NetworkMode, VmRef};
 use wargame_core::error::{Result, WargameError};
-use wargame_core::ports::image_builder::{BuildRequest, GuestLink, InstallerRequest, Progress};
+use wargame_core::ports::image_builder::{
+    BuildRequest, EjectOutcome, GuestLink, InstallerRequest, Progress,
+};
 use wargame_core::ports::{
     BuildRecordRepository, GuestTransport, ImageRef, ProfileImageBuilder, StartOptions, VmProvider,
     VmStatus,
@@ -129,6 +131,42 @@ impl ProfileImageBuilder for UtmImageBuilder {
         let vm = self.installer_vm(req)?;
         progress(format!("building in {} ({})", vm.name, vm.id));
         Ok(vm)
+    }
+
+    /// Takes the installer CD out before the VM boots (D3).
+    ///
+    /// UEFI boots the removable drive in preference to the disk, so an
+    /// installed guest that still has its CD comes back up in the installer
+    /// -- it never reaches SSH, and the copy `publish` takes would carry the
+    /// CD too. UTM has no "remove a drive" verb: the drive list is written
+    /// back without the removable entries, which needs a **stopped** VM
+    /// (T9).
+    ///
+    /// A running VM is therefore not an error -- `profile console` leaves
+    /// one running, and failing the build for that would be worse than
+    /// saying what was skipped.
+    async fn eject_installer_media(
+        &self,
+        vm: &VmRef,
+        progress: Progress<'_>,
+    ) -> Result<EjectOutcome> {
+        match self.utm.status(vm).await? {
+            VmStatus::Missing => Err(WargameError::VmNotFound(format!(
+                "UTM has no virtual machine with id {} ({})",
+                vm.id, vm.name
+            ))),
+            VmStatus::Running => Ok(EjectOutcome::Blocked(format!(
+                "{} is started, and UTM writes a configuration only to a stopped virtual machine, so the installer CD stays in -- and while it is in, the guest boots it rather than the system on its own disk",
+                vm.name
+            ))),
+            VmStatus::Stopped => {
+                progress(format!("detaching the installer media from {}", vm.name));
+                Ok(match self.utm.eject_removable_drives(vm).await? {
+                    0 => EjectOutcome::NothingAttached,
+                    removed => EjectOutcome::Detached(removed),
+                })
+            }
+        }
     }
 
     async fn boot(&self, req: &BuildRequest<'_>, vm: &VmRef, progress: Progress<'_>) -> Result<()> {

@@ -263,6 +263,39 @@ const REPLACE_ISO_BODY: &str = r#"set c to configuration of vm
 				update configuration of vm with c
 				return "ok""#;
 
+// Detaching the installer CD. UTM's dictionary has no "remove a drive"
+// verb, so the drive *list* is written back without the removable entries
+// -- the same `update configuration of drives` mechanism §2 verified for
+// appending and replacing one, and the sequence the first real install had
+// to run by hand (task-7-phase-a-report.md §3).
+//
+// Two rules the readback proved:
+//
+// * a surviving drive must echo its own `id` back (`{id:(id of d)}`), or
+//   UTM treats the record as a *new* drive and adds one;
+// * `update configuration` needs a `stopped` VM (T9), which the caller
+//   checks -- so the write only happens when something is actually removable
+//   and the whole thing is a no-op otherwise.
+//
+// `kept` and `gone` are deliberately ordinary names: a local whose name
+// collides with an AppleScript parameter name fails to compile with
+// `-2741 Expected expression but found parameter name` (D6).
+const EJECT_MEDIA_BODY: &str = r#"set c to configuration of vm
+				set kept to {}
+				set gone to 0
+				repeat with d in (drives of c)
+					if (removable of d) is false then
+						set end of kept to {id:(id of d)}
+					else
+						set gone to gone + 1
+					end if
+				end repeat
+				if gone > 0 then
+					set drives of c to kept
+					update configuration of vm with c
+				end if
+				return (gone as text)"#;
+
 /// `make` is the only way to create a VM (`utmctl` has no create verb), and
 /// unlike `duplicate` it does return a specifier, so the new UUID is read
 /// straight back. `drives` is always explicit: omitting it still produces
@@ -623,6 +656,12 @@ impl Automation {
     /// sentinel itself, because there "missing" is the answer rather than a
     /// failure.
     async fn run_on_vm(&self, id: &str, script: &str, args: &[&str]) -> Result<()> {
+        self.run_on_vm_for(id, script, args).await.map(|_| ())
+    }
+
+    /// [`Automation::run_on_vm`] for the scripts whose *answer* matters
+    /// (the eject reports how many drives it removed).
+    async fn run_on_vm_for(&self, id: &str, script: &str, args: &[&str]) -> Result<String> {
         self.ensure_app_running().await?;
         let mut argv = vec![id];
         argv.extend_from_slice(args);
@@ -632,7 +671,7 @@ impl Automation {
                 "UTM has no virtual machine with id {id}"
             )));
         }
-        Ok(())
+        Ok(out)
     }
 
     pub async fn start(&self, id: &str) -> Result<()> {
@@ -745,6 +784,27 @@ impl Automation {
             &[&iso.display().to_string()],
         )
         .await
+    }
+
+    /// Detaches every removable drive (the installer CD) by writing the
+    /// drive list back without them, and answers how many were removed.
+    /// Zero is a success: an eject is idempotent.
+    ///
+    /// The VM must be `stopped` (T9); the caller checks that, because the
+    /// answer to "it is running" is a recovery step, not a retry.
+    pub async fn eject_removable_drives(&self, id: &str) -> Result<usize> {
+        let out = self
+            .run_on_vm_for(id, &vm_script("", EJECT_MEDIA_BODY), &[])
+            .await?;
+        let answer = out.trim();
+        answer
+            .parse::<usize>()
+            .map_err(|_| WargameError::ProviderChanged {
+                provider: "utm".to_string(),
+                what: format!(
+                    "detaching the removable drives of {id} answered {answer:?}, expected the number of drives it removed"
+                ),
+            })
     }
 
     /// The guest's address, via the QEMU guest agent. `Ok(None)` means the
