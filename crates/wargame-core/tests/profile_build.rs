@@ -399,18 +399,64 @@ impl GuestTransport for RebootingTransport {
     }
 }
 
-/// A disk with however much free space a test wants.
-struct FakeDisk(Mutex<u64>);
+/// A disk with however much free space a test wants, per volume.
+///
+/// It records every path it was asked about, because *which* filesystem a
+/// check measures is half the answer: a UTM disk never lands in
+/// `$WARGAME_HOME` (phase A, D1).
+struct FakeDisk {
+    default: Mutex<u64>,
+    /// Paths this disk cannot answer for, and the paths it was asked about.
+    unreadable: Mutex<Vec<PathBuf>>,
+    per_path: Mutex<Vec<(PathBuf, u64)>>,
+    asked: Mutex<Vec<PathBuf>>,
+}
 
 impl FakeDisk {
     fn with_gib(gib: u64) -> Self {
-        FakeDisk(Mutex::new(gib * 1024 * 1024 * 1024))
+        FakeDisk {
+            default: Mutex::new(gib * 1024 * 1024 * 1024),
+            unreadable: Mutex::new(Vec::new()),
+            per_path: Mutex::new(Vec::new()),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_gib_at(self, path: impl Into<PathBuf>, gib: u64) -> Self {
+        self.per_path
+            .lock()
+            .unwrap()
+            .push((path.into(), gib * 1024 * 1024 * 1024));
+        self
+    }
+
+    /// A volume whose free space cannot be read at all -- a sandboxed
+    /// directory this process may not stat.
+    fn unreadable_at(self, path: impl Into<PathBuf>) -> Self {
+        self.unreadable.lock().unwrap().push(path.into());
+        self
     }
 }
 
 impl DiskSpace for FakeDisk {
-    fn free_bytes(&self, _path: &Path) -> Result<u64> {
-        Ok(*self.0.lock().unwrap())
+    fn free_bytes(&self, path: &Path) -> Result<u64> {
+        self.asked.lock().unwrap().push(path.to_path_buf());
+        if self.unreadable.lock().unwrap().iter().any(|p| p == path) {
+            return Err(WargameError::Other(format!(
+                "cannot stat {}: Operation not permitted",
+                path.display()
+            )));
+        }
+        if let Some((_, free)) = self
+            .per_path
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(p, _)| p == path)
+        {
+            return Ok(*free);
+        }
+        Ok(*self.default.lock().unwrap())
     }
 }
 
@@ -520,6 +566,10 @@ struct Fixture {
     utm: Arc<FakeBuilder>,
     tart: Arc<FakeBuilder>,
     builds: Arc<MemoryBuildRepo>,
+    /// The UTM-named `VmProvider`, so a test can say where that backend
+    /// stores its disks.
+    utm_vms: Arc<FakeVmProvider>,
+    disk: Arc<FakeDisk>,
     home: PathBuf,
     iso: PathBuf,
 }
@@ -543,6 +593,7 @@ fn fixture() -> Fixture {
 }
 
 fn fixture_with_disk(disk: FakeDisk) -> Fixture {
+    let disk = Arc::new(disk);
     let home = tempfile::tempdir().unwrap().keep();
     let dirs = AppDirs { root: home.clone() };
     dirs.ensure_layout().unwrap();
@@ -569,14 +620,14 @@ fn fixture_with_disk(disk: FakeDisk) -> Fixture {
     let builds = Arc::new(MemoryBuildRepo::new());
     utm.watch(builds.clone());
     tart.watch(builds.clone());
-    let vm_utm = Arc::new(FakeVmProvider::with_backend("utm"));
+    let utm_vms = Arc::new(FakeVmProvider::with_backend("utm"));
     let ctx = AppContext {
         config: Default::default(),
         dirs,
         wargame: Arc::new(FakeWargameProvider::new()),
         backends: BackendRegistry::new(vec![
             Arc::new(FakeVmProvider::new()) as Arc<dyn VmProvider>,
-            vm_utm as Arc<dyn VmProvider>,
+            utm_vms.clone() as Arc<dyn VmProvider>,
         ]),
         // One transport serves both shells: it phrases each command for the
         // endpoint it is given, exactly as `wiring.rs` registers it.
@@ -588,7 +639,7 @@ fn fixture_with_disk(disk: FakeDisk) -> Fixture {
             utm.clone() as Arc<dyn ProfileImageBuilder>,
             tart.clone() as Arc<dyn ProfileImageBuilder>,
         ]),
-        disk: Arc::new(disk),
+        disk: disk.clone(),
         profiles: ProfileStore::new(Vec::new(), profiles_dir),
         runner: Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
         bootstrap: wargame_core::app::BootstrapScripts::new("#!/bin/bash\n", "# ps\n"),
@@ -598,6 +649,8 @@ fn fixture_with_disk(disk: FakeDisk) -> Fixture {
         utm,
         tart,
         builds,
+        utm_vms,
+        disk,
         home,
         iso,
     }
@@ -805,18 +858,111 @@ async fn create_refuses_a_missing_iso_before_any_vm_exists() {
     assert!(f.utm.calls().is_empty());
 }
 
+// --- the free-space precondition (phase A, D1) -----------------------------
+//
+// A UTM disk is a *sparse* qcow2: a fresh one occupies nothing at all and a
+// finished minimal Kali install about 2.3 GiB of its nominal 20. Demanding
+// the nominal size up front blocked both shipped Kali profiles on any host
+// with less than 80 GiB free, for a VM that would have used single digits.
+
 #[tokio::test]
-async fn create_refuses_when_the_disk_cannot_hold_the_profile() {
-    let f = fixture_with_disk(FakeDisk::with_gib(10)); // the profile asks for 80
+async fn create_refuses_only_when_the_volume_is_below_the_working_floor() {
+    let f = fixture_with_disk(FakeDisk::with_gib(4)); // the floor is 8 GiB
     let err = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
         .await
         .unwrap_err();
     assert!(
-        matches!(err, WargameError::InsufficientResources(_)),
+        matches!(err, WargameError::InsufficientResources { .. }),
         "{err:?}"
     );
+    let message = err.to_string();
+    assert!(message.contains("4.0 GiB"), "what is free: {message}");
+    assert!(
+        message.contains("8"),
+        "and the floor it is under: {message}"
+    );
+
+    let hint = err.hint().unwrap_or_default();
+    assert!(
+        !hint.contains("wargame sessions"),
+        "a UTM profile has no session to delete for space: {hint}"
+    );
+    assert!(
+        hint.contains("disk_gib"),
+        "the profile's own request is the thing to lower: {hint}"
+    );
+
     assert!(f.utm.calls().is_empty(), "{:?}", f.utm.calls());
     assert!(f.builds.load("kali-arm64").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn create_allows_less_free_space_than_the_nominal_disk_and_says_why() {
+    // 20 GiB free against a profile that asks for 80: fine, because the
+    // disk grows as it is used -- but the user has to be told.
+    let f = fixture_with_disk(FakeDisk::with_gib(20));
+    let outcome = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let guidance = outcome.guidance.join("\n");
+    assert!(guidance.contains("20.0 GiB"), "{guidance}");
+    assert!(guidance.contains("80 GiB"), "{guidance}");
+    assert!(
+        guidance.contains("grows") || guidance.contains("sparse"),
+        "it has to explain why this is allowed: {guidance}"
+    );
+    assert_eq!(f.utm.created.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn create_with_room_for_the_whole_disk_warns_about_nothing() {
+    let f = fixture_with_disk(FakeDisk::with_gib(500));
+    let outcome = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let guidance = outcome.guidance.join("\n");
+    assert!(!guidance.contains("GiB is free"), "{guidance}");
+}
+
+/// The volume that matters is the one the *backend* writes disks to. UTM is
+/// sandboxed and keeps its bundles in its own container, so measuring
+/// `$WARGAME_HOME` measures the wrong filesystem and names a directory that
+/// will never hold the disk.
+#[tokio::test]
+async fn the_space_check_measures_the_volume_the_backend_stores_disks_on() {
+    let container = PathBuf::from("/Users/x/Library/Containers/com.utmapp.UTM/Data/Documents");
+    let f = fixture_with_disk(FakeDisk::with_gib(500).with_gib_at(&container, 2));
+    f.utm_vms.set_storage_dir(&container);
+
+    let err = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("com.utmapp.UTM"),
+        "the message must name the directory that is actually short: {err}"
+    );
+    assert!(
+        f.disk.asked.lock().unwrap().iter().any(|p| p == &container),
+        "the container volume was never measured: {:?}",
+        f.disk.asked.lock().unwrap()
+    );
+}
+
+/// That directory is `drwx------` inside an app sandbox. If this process
+/// cannot read its free space at all, fall back to the wargame home rather
+/// than refusing to create anything.
+#[tokio::test]
+async fn a_storage_volume_that_cannot_be_read_falls_back_to_the_wargame_home() {
+    let container = PathBuf::from("/Users/x/Library/Containers/com.utmapp.UTM/Data/Documents");
+    let f = fixture_with_disk(FakeDisk::with_gib(500).unreadable_at(&container));
+    f.utm_vms.set_storage_dir(&container);
+
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .expect("an unreadable container must not block the create");
+    let asked = f.disk.asked.lock().unwrap().clone();
+    assert!(asked.iter().any(|p| p == &container));
+    assert!(asked.iter().any(|p| p == &f.home));
 }
 
 #[tokio::test]

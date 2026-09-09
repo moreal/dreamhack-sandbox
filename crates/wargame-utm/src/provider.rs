@@ -776,6 +776,13 @@ impl VmProvider for UtmProvider {
             .collect())
     }
 
+    /// UTM's own container, not `$WARGAME_HOME`: that is where the qcow2
+    /// actually lands, and its volume is the one a free-space check has to
+    /// measure (D1). `None` until UTM has run once and made the directory.
+    fn storage_dir(&self) -> Option<PathBuf> {
+        crate::config::utm_vm_directory()
+    }
+
     fn console(&self, vm: &VmRef) -> ConsoleDescriptor {
         // Without UTM there is no console at all. Handing back an argv
         // pointing at a `utmctl` that is not there would fail as "no such

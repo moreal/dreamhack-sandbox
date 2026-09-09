@@ -38,8 +38,12 @@ pub enum WargameError {
         detail: String,
         hint: String,
     },
-    #[error("insufficient resources: {0}")]
-    InsufficientResources(String),
+    /// Not enough of something physical -- disk, so far. Carries its own
+    /// hint: what frees space differs by what asked for it (a session's
+    /// clone, an installation VM on a backend that stores its disks
+    /// somewhere else entirely).
+    #[error("insufficient resources: {detail}")]
+    InsufficientResources { detail: String, hint: String },
     /// A command that does not apply right now, together with the command
     /// that makes it apply. Carries its own hint because the recovery is
     /// specific to what was refused -- "stop it first", "build it first" --
@@ -165,9 +169,7 @@ impl WargameError {
             WargameError::AuthenticationRequired { .. } => {
                 Some("wargame auth login".to_string())
             }
-            WargameError::InsufficientResources(_) => Some(
-                "wargame sessions   # then delete an old session to free space".to_string(),
-            ),
+            WargameError::InsufficientResources { hint, .. } => Some(hint.clone()),
             WargameError::BackendUnavailable { .. } => Some("wargame doctor".to_string()),
             WargameError::AutomationDenied { app, .. } => Some(automation_permission_hint(app)),
             WargameError::OrphanProcess { pid, .. } => Some(format!(

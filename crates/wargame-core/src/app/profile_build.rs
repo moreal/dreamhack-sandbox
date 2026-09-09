@@ -39,7 +39,7 @@ use crate::infra::GuestOps;
 use crate::ports::image_builder::{
     BuildObserver, BuildRequest, EjectOutcome, GuestLink, InstallerRequest, Progress,
 };
-use crate::ports::{BuildRecordRepository, ImageRef, ProfileImageBuilder};
+use crate::ports::{BuildRecordRepository, ImageRef, ProfileImageBuilder, VmProvider};
 use crate::security::hash::sha256_file;
 
 use super::backends::resolve_backend;
@@ -375,17 +375,7 @@ pub async fn create(
         });
     }
 
-    let needed = profile.resources.disk_gib.saturating_mul(GIB);
-    let free = ctx.disk.free_bytes(&ctx.dirs.root)?;
-    if free < needed {
-        return Err(WargameError::InsufficientResources(format!(
-            "profile {:?} asks for a {} GiB disk, only {:.1} GiB is free at {}",
-            profile.name,
-            profile.resources.disk_gib,
-            free as f64 / GIB as f64,
-            ctx.dirs.root.display(),
-        )));
-    }
+    let space = check_free_space(ctx, &profile, execution.backend.as_str())?;
 
     let name = format!(
         "{}{}",
@@ -415,12 +405,96 @@ pub async fn create(
     record.set_phase(BuildPhase::AwaitingInstall);
     ctx.builds.save(&record).await?;
 
-    let guidance = create_guidance(ctx, &profile, &record, false);
+    let mut guidance = create_guidance(ctx, &profile, &record, false);
+    guidance.splice(1..1, space.warning);
     Ok(CreateOutcome {
         record,
         reused: false,
         guidance,
     })
+}
+
+/// The least free space a guest install can work in at all. Well under any
+/// profile's nominal disk, because that number is not what gets allocated:
+/// a UTM guest disk is a sparse qcow2 -- a fresh one occupies nothing and a
+/// finished minimal Kali install about 2.3 GiB of a nominal 20
+/// (task-7-phase-a-report.md §5 D1). Refusing on the nominal size blocked
+/// both shipped Kali profiles on any host with less than 80 GiB free, for
+/// VMs that would have used single-digit GiB.
+///
+/// 8 GiB is "enough to install a Linux guest and provision it, with room to
+/// notice before the volume fills".
+pub const MIN_FREE_GIB: u64 = 8;
+
+/// What [`check_free_space`] found.
+struct SpaceCheck {
+    /// The one line to show the user when there is less room than the
+    /// profile's nominal disk. Empty otherwise.
+    warning: Vec<String>,
+}
+
+/// Refuses a create the host has no room for at all, and warns about one it
+/// merely has less room for than the profile asks.
+///
+/// Measures the volume the *backend* writes disks to, which for UTM is its
+/// own sandbox container rather than `$WARGAME_HOME`. If that directory's
+/// free space cannot be read (it is `drwx------` inside an app sandbox), the
+/// wargame home is measured instead rather than refusing to create
+/// anything.
+fn check_free_space(ctx: &AppContext, profile: &Profile, backend: &str) -> Result<SpaceCheck> {
+    let provider = ctx.backends.get(backend)?;
+    let (storage, free) = free_space_for(ctx, provider.as_ref())?;
+    let nominal = profile.resources.disk_gib.saturating_mul(GIB);
+    let floor = MIN_FREE_GIB * GIB;
+
+    if free < floor {
+        return Err(WargameError::InsufficientResources {
+            detail: format!(
+                "only {:.1} GiB is free on the volume that holds {}, and an OS install needs at least {MIN_FREE_GIB} GiB there",
+                free as f64 / GIB as f64,
+                storage.display(),
+            ),
+            hint: format!(
+                "Free space on that volume, then run this again.
+A guest disk grows as it is used, so profile {:?}'s `disk_gib` is a ceiling rather than a reservation -- lowering it in {} will not help until the volume itself has room.",
+                profile.name,
+                ctx.profiles.user_dir().join(format!("{}.yaml", profile.name)).display(),
+            ),
+        });
+    }
+
+    let warning = if free < nominal {
+        vec![format!(
+                "! only {:.1} GiB is free on the volume that holds {}, less than this profile's {} GiB disk. That is allowed -- the guest disk is sparse and grows as it is used (a finished minimal Kali install is a few GiB) -- but the guest will fail once the volume fills. Lower `resources.disk_gib`, or free space, if that is close.",
+                free as f64 / GIB as f64,
+                storage.display(),
+            profile.resources.disk_gib,
+        )]
+    } else {
+        Vec::new()
+    };
+    Ok(SpaceCheck { warning })
+}
+
+/// The directory whose volume `provider` writes VM disks to, and the bytes
+/// free on it.
+///
+/// Falls back to `$WARGAME_HOME` both when the backend does not know where
+/// it stores disks and when that directory cannot be read -- a sandboxed
+/// container this process may not stat is not a reason to refuse a create.
+pub fn free_space_for(ctx: &AppContext, provider: &dyn VmProvider) -> Result<(PathBuf, u64)> {
+    if let Some(storage) = provider.storage_dir() {
+        match ctx.disk.free_bytes(&storage) {
+            Ok(free) => return Ok((storage, free)),
+            Err(e) => tracing::debug!(
+                path = %storage.display(),
+                error = %e,
+                "could not read the backend's storage volume; measuring the wargame home instead"
+            ),
+        }
+    }
+    let free = ctx.disk.free_bytes(&ctx.dirs.root)?;
+    Ok((ctx.dirs.root.clone(), free))
 }
 
 /// Checks an ISO exists, is readable and (if the user gave one) matches its

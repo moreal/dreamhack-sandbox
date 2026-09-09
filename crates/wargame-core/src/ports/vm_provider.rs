@@ -120,5 +120,19 @@ pub trait VmProvider: Send + Sync {
     async fn diagnostics(&self) -> Vec<BackendCheck> {
         Vec::new()
     }
+
+    /// The directory this backend writes VM disks into, when it is
+    /// knowable -- the volume a free-space check has to measure.
+    ///
+    /// `$WARGAME_HOME` is *not* it for every backend: UTM is sandboxed and
+    /// keeps its bundles in its own container
+    /// (`~/Library/Containers/com.utmapp.UTM/…`), so a check against
+    /// `$WARGAME_HOME` measures the wrong filesystem and names a directory
+    /// that will never hold the disk. `None` means "unknown, measure the
+    /// wargame home", which is what a backend that stores nothing locally
+    /// wants.
+    fn storage_dir(&self) -> Option<PathBuf> {
+        None
+    }
     fn console(&self, vm: &VmRef) -> ConsoleDescriptor;
 }

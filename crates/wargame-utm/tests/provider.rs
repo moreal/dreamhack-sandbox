@@ -1429,6 +1429,36 @@ async fn eject_of_a_vm_utm_no_longer_knows_is_an_error() {
     assert!(matches!(err, WargameError::VmNotFound(_)), "{err:?}");
 }
 
+/// D1: the qcow2 does not go anywhere near `$WARGAME_HOME`. UTM is
+/// sandboxed and writes its bundles into its own container, so that is the
+/// volume a free-space check has to measure.
+#[test]
+fn the_storage_directory_is_utms_own_sandbox_container() {
+    assert_eq!(
+        wargame_utm::UTM_VM_DIRECTORY,
+        "Library/Containers/com.utmapp.UTM/Data/Documents"
+    );
+    let p = provider(runner(|_| None));
+    // On a host where UTM has never run the directory does not exist, and
+    // the honest answer is "unknown" rather than a path that is not there.
+    match p.storage_dir() {
+        Some(dir) => {
+            assert!(dir.is_dir(), "{}", dir.display());
+            assert!(
+                dir.ends_with(wargame_utm::UTM_VM_DIRECTORY),
+                "{}",
+                dir.display()
+            );
+        }
+        None => assert!(!std::path::Path::new(&format!(
+            "{}/{}",
+            std::env::var("HOME").unwrap_or_default(),
+            wargame_utm::UTM_VM_DIRECTORY
+        ))
+        .is_dir()),
+    }
+}
+
 #[tokio::test]
 async fn image_readiness_without_a_build_record_is_not_ready() {
     let p = provider(runner(|_| None));

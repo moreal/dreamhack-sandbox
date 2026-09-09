@@ -6,6 +6,7 @@
 //! version (§1's "Decision: `doctor` requires UTM ≥ 4.3"), the network mode
 //! names (§5) and the architecture/hypervisor rules (§2, T6).
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use wargame_core::domain::{ExecutionMode, GuestArch, NetworkMode};
@@ -16,6 +17,23 @@ pub const BUNDLED_UTMCTL: &str = "/Applications/UTM.app/Contents/MacOS/utmctl";
 
 /// The macOS application UTM's automation (Apple Events) grant belongs to.
 pub const UTM_APP: &str = "UTM";
+
+/// Where UTM keeps the `.utm` bundles it creates, relative to `$HOME`.
+///
+/// UTM is sandboxed (`com.apple.security.app-sandbox`), so its VMs -- and
+/// therefore their qcow2 disks -- live in its own container, never in
+/// `$WARGAME_HOME` (docs/utm-compatibility.md §1). The adapter must not try
+/// to *read* anything in there: the directory is `drwx------` and listing it
+/// fails with `Operation not permitted`. Its **volume**, though, is the one
+/// a free-space check has to measure (task-7-phase-a-report.md §5 D1).
+pub const UTM_VM_DIRECTORY: &str = "Library/Containers/com.utmapp.UTM/Data/Documents";
+
+/// [`UTM_VM_DIRECTORY`] as an absolute path, when it exists on this host --
+/// it does not until UTM has run once.
+pub fn utm_vm_directory() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("HOME")?).join(UTM_VM_DIRECTORY);
+    dir.is_dir().then_some(dir)
+}
 
 /// The lowest UTM release this adapter supports. 4.2 is where scripting can
 /// first create and configure a VM at all, but Windows 11 is a release

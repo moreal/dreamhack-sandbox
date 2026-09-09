@@ -194,15 +194,20 @@ pub async fn launch(
 
     let required_bytes =
         (profile.resources.disk_gib as f64 * MIN_DISK_FRACTION * GIB as f64) as u64;
-    let free_bytes = ctx.disk.free_bytes(&ctx.dirs.root)?;
+    // The volume that matters is the one the *backend* clones into, which
+    // is not `$WARGAME_HOME` for a sandboxed backend like UTM (D1).
+    let (storage, free_bytes) = crate::app::profile_build::free_space_for(ctx, vm.as_ref())?;
     if free_bytes < required_bytes {
-        return Err(WargameError::InsufficientResources(format!(
-            "profile {:?} needs at least {:.1} GiB free, only {:.1} GiB available at {}",
-            profile.name,
-            required_bytes as f64 / GIB as f64,
-            free_bytes as f64 / GIB as f64,
-            ctx.dirs.root.display(),
-        )));
+        return Err(WargameError::InsufficientResources {
+            detail: format!(
+                "profile {:?} needs at least {:.1} GiB free, only {:.1} GiB available at {}",
+                profile.name,
+                required_bytes as f64 / GIB as f64,
+                free_bytes as f64 / GIB as f64,
+                storage.display(),
+            ),
+            hint: "wargame sessions   # then delete an old session to free space".to_string(),
+        });
     }
 
     emit(

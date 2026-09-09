@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -36,6 +37,7 @@ pub struct FakeVmProvider {
     default_ip: IpAddr,
     isolated_network: Mutex<Option<bool>>,
     orphan_on_stop: Mutex<Option<u32>>,
+    storage_dir: Mutex<Option<PathBuf>>,
 }
 
 impl FakeVmProvider {
@@ -70,6 +72,7 @@ impl FakeVmProvider {
             default_ip: IpAddr::from_str("10.0.0.5").unwrap(),
             isolated_network: Mutex::new(None),
             orphan_on_stop: Mutex::new(None),
+            storage_dir: Mutex::new(None),
         }
     }
 
@@ -119,6 +122,12 @@ impl FakeVmProvider {
     /// caller can be checked for passing that through with its pid.
     pub fn set_orphan_on_stop(&self, pid: u32) {
         *self.orphan_on_stop.lock().unwrap() = Some(pid);
+    }
+
+    /// Where this backend claims it stores VM disks, so a free-space check
+    /// can be seen measuring the right volume.
+    pub fn set_storage_dir(&self, dir: impl Into<PathBuf>) {
+        *self.storage_dir.lock().unwrap() = Some(dir.into());
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -291,6 +300,10 @@ impl VmProvider for FakeVmProvider {
             .keys()
             .map(|name| VmRef::new(self.name.clone(), name.clone()))
             .collect())
+    }
+
+    fn storage_dir(&self) -> Option<PathBuf> {
+        self.storage_dir.lock().unwrap().clone()
     }
 
     fn console(&self, vm: &VmRef) -> ConsoleDescriptor {
