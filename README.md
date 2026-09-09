@@ -544,8 +544,14 @@ published.
 
   ```sh
   WARGAME_E2E=1 WARGAME_E2E_UTM_PROFILE=kali-arm64 \
-    cargo test -p wargame-utm --test e2e -- --ignored --nocapture
+    cargo test -p wargame-utm --test e2e -- --ignored --nocapture --test-threads=1
   ```
+
+  `--test-threads=1` because UTM automation is a single AppleScript
+  connection: concurrent `osascript` calls make it answer `Connection is
+  invalid. (-609)`. The test file takes a process-wide lock of its own, so
+  the flag is a readability nicety rather than the only thing keeping the run
+  green — but it is the invocation to quote.
 
   The only VM it creates is `wg-build-e2e-<pid>`, and it deletes it however
   the test ends.

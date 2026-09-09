@@ -30,8 +30,20 @@
 //! WARGAME_E2E=1 \
 //! WARGAME_E2E_UTM_PROFILE=t7-kali-arm64 \
 //! WARGAME_HOME="$HOME/Library/Application Support/wargame-vm-t7" \
-//!   cargo test -p wargame-utm --test e2e -- --ignored --nocapture
+//!   cargo test -p wargame-utm --test e2e -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! **`--test-threads=1` is documented, and nothing here depends on it.** UTM
+//! automation is a single AppleScript connection: two `osascript` calls at
+//! once make it answer `UTM got an error: Connection is invalid. (-609)`, and
+//! under cargo's default four-thread harness three of these four tests failed
+//! on a healthy host (task-7-rerun-report.md N1). So every test takes
+//! [`UTM_LOCK`] before touching UTM and the file runs one test at a time
+//! whatever `--test-threads` says; the flag stays in the documented command
+//! because it also keeps `--nocapture` output readable and is what the task
+//! reports quote. The assertions that used to compare a *global* VM count
+//! (which any concurrent clone breaks, whoever holds the lock) now compare
+//! VMs by id instead.
 //!
 //! Optional knobs: `WARGAME_E2E_UTM_NETWORK=isolated|nat` (default `nat`,
 //! which is what `scripts/e2e-smoke.sh` uses and what the guest agent is
@@ -45,10 +57,15 @@
 //! (which matches sessions, not names) never mistakes it for an orphan. It is
 //! stopped and deleted at the end whatever happens, and nothing outside that
 //! one clone is ever written to: the installation VM and the image VM are
-//! only ever listed and status-checked.
+//! only ever listed and status-checked. (The blast-radius test makes three
+//! more, `<build_prefix>e2e-del-<pid>-1..3`, and deletes them too -- every
+//! throwaway this file creates is named `<build_prefix>e2e-`, which is how
+//! the comparisons tell another run's leftovers from the user's own VMs.)
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::sync::Mutex;
 
 use wargame_core::domain::{
     Backend, BuildRecord, NetworkMode, PublishedImage, ResolvedBackend, Resources, VmRef,
@@ -59,10 +76,19 @@ use wargame_core::ports::{
     BuildRecordRepository, ImageRef, StartOptions, VmProvider, VmSpec, VmStatus,
 };
 
-use wargame_utm::{UtmConfig, UtmProvider};
+use wargame_utm::{RecordImageCatalog, UtmConfig, UtmProvider};
 
 /// A UUID this app has certainly never created, for the ownership refusal.
 const FOREIGN_UUID: &str = "00000000-DEAD-4BEE-8000-000000000001";
+
+/// **One test at a time, in this process.** UTM's AppleScript bridge does not
+/// survive concurrent `osascript` calls (`-609`), so the whole file is
+/// serialised here rather than relying on the caller remembering
+/// `--test-threads=1` (task-7-rerun-report.md N1). `tokio::sync::Mutex` and
+/// not `std::sync::Mutex` because the guard is held across `await`s; it also
+/// does not poison, so a panicking test releases the lock and the rest of the
+/// suite still runs.
+static UTM_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Everything a test needs, or `None` when this run is not opted in / has no
 /// UTM. `None` is always accompanied by a printed reason.
@@ -98,14 +124,25 @@ async fn fixture(test: &str) -> Option<Fixture> {
     };
 
     let cfg = UtmConfig::default();
-    let provider = UtmProvider::new(Arc::new(RealRunner), cfg.clone());
+    let dirs = AppDirs::resolve().expect("could not resolve $WARGAME_HOME");
+    let builds: Arc<dyn BuildRecordRepository> =
+        Arc::new(JsonBuildRepository::new(dirs.builds_dir()));
+
+    // The catalog is not decoration. Since the D7 fix `UtmProvider::image_exists`
+    // asks the build records *first* and only then UTM, so a provider left on
+    // the default `NoBuildRecords` answers "not ready" for every image however
+    // healthy UTM is -- which is why the read-only test could not pass
+    // (task-7-rerun-report.md N2). `wargame-cli`'s `wiring.rs` gives the real
+    // binary a `RecordImageCatalog` over the same `$WARGAME_HOME` build
+    // records; a fixture without one would be testing a provider the CLI
+    // never builds.
+    let provider = UtmProvider::new(Arc::new(RealRunner), cfg.clone())
+        .with_image_catalog(Arc::new(RecordImageCatalog::new(builds.clone())));
     if let Err(e) = provider.utmctl_path() {
         eprintln!("skipping {test}: no UTM on this host ({e})");
         return None;
     }
 
-    let dirs = AppDirs::resolve().expect("could not resolve $WARGAME_HOME");
-    let builds = JsonBuildRepository::new(dirs.builds_dir());
     let record = builds
         .load(&profile)
         .await
@@ -241,6 +278,7 @@ async fn run_lifecycle(
 #[tokio::test]
 #[ignore]
 async fn utm_clone_boot_stop_delete_preserves_the_source() {
+    let _utm = UTM_LOCK.lock().await;
     let Some(Fixture {
         provider,
         cfg,
@@ -371,16 +409,24 @@ fn utm_only(test: &str) -> Option<(UtmProvider, UtmConfig)> {
 #[tokio::test]
 #[ignore]
 async fn utm_delete_removes_exactly_one_vm() {
+    let _utm = UTM_LOCK.lock().await;
     let Some((provider, cfg)) = utm_only("utm_delete_removes_exactly_one_vm") else {
         return;
     };
     let automation = provider.automation();
 
+    // Everything UTM holds before this test, by id, minus any throwaway
+    // belonging to another run of this suite: those are the only VMs entitled
+    // to come and go underneath us, and dropping them keeps the blast-radius
+    // comparison exact without depending on a global count (N1). The VMs this
+    // test makes are compared separately, so they are not lost by the filter.
+    let e2e_prefix = format!("{}e2e-", cfg.build_prefix);
     let before: Vec<String> = automation
         .list()
         .await
         .expect("utmctl list")
         .into_iter()
+        .filter(|vm| !vm.name.starts_with(&e2e_prefix))
         .map(|vm| vm.id)
         .collect();
 
@@ -463,20 +509,29 @@ async fn utm_delete_removes_exactly_one_vm() {
 #[tokio::test]
 #[ignore]
 async fn utm_never_deletes_a_vm_it_does_not_own() {
+    let _utm = UTM_LOCK.lock().await;
     let Some(Fixture { provider, .. }) = fixture("utm_never_deletes_a_vm_it_does_not_own").await
     else {
         return;
     };
 
-    // Everything UTM knows -- including the user's own VMs, which is the set
-    // that must be identical afterwards. `Automation::list` is the unfiltered
-    // view; `VmProvider::list` is this app's namespace only.
-    let all_before = provider
+    // Everything UTM knows -- including the user's own VMs, which are the
+    // ones that must all still be there afterwards. `Automation::list` is the
+    // unfiltered view; `VmProvider::list` is this app's namespace only.
+    //
+    // Compared by id, and only for *disappearances*: the old `len()` check was
+    // a global invariant that any other test breaks simply by cloning a VM
+    // while this one runs (N1), whereas "nothing that was here is gone" is
+    // precisely what refusing a foreign UUID has to guarantee, and additions
+    // cannot make it lie.
+    let all_before: Vec<String> = provider
         .automation()
         .list()
         .await
         .expect("utmctl list")
-        .len();
+        .into_iter()
+        .map(|vm| vm.id)
+        .collect();
 
     let foreign = VmRef {
         backend: "utm".to_string(),
@@ -503,15 +558,21 @@ async fn utm_never_deletes_a_vm_it_does_not_own() {
         .await
         .expect("stopping a VM UTM does not have must be a no-op");
 
-    let all_after = provider
+    let all_after: Vec<String> = provider
         .automation()
         .list()
         .await
         .expect("utmctl list")
-        .len();
-    assert_eq!(
-        all_before, all_after,
-        "the number of VMs UTM knows changed while refusing a foreign UUID"
+        .into_iter()
+        .map(|vm| vm.id)
+        .collect();
+    let disappeared: Vec<&String> = all_before
+        .iter()
+        .filter(|id| !all_after.contains(id))
+        .collect();
+    assert!(
+        disappeared.is_empty(),
+        "refusing the foreign UUID {FOREIGN_UUID} removed {disappeared:?} from UTM"
     );
 }
 
@@ -521,6 +582,7 @@ async fn utm_never_deletes_a_vm_it_does_not_own() {
 #[tokio::test]
 #[ignore]
 async fn utm_reports_the_recorded_vms_read_only() {
+    let _utm = UTM_LOCK.lock().await;
     let Some(Fixture {
         provider,
         record,
