@@ -69,7 +69,11 @@ To be released.
         source is refused rather than quietly making a second VM.
      -  `wargame profile console <yours>` opens the installer window. Install
         the OS, create your user, and leave an SSH server, the guest agent
-        and this host's public key in place.
+        and this host's public key in place. `profile create` prints the
+        whole list, including the elevated access the build needs — sudo
+        without a password on Kali, a local administrator account on Windows
+        — because a build that installs packages over a non-interactive
+        connection cannot answer a password prompt.
      -  `wargame profile build <yours>` then boots that VM, runs your
         profile's provisioning scripts, checks the tools the profile
         promises, shuts the guest down and publishes the result as the image

@@ -340,7 +340,7 @@ pub fn print_profiles(overviews: &[ProfileOverview], default_profile: &str, json
                     distribution: r.distribution.clone(),
                 }),
                 unsupported: o.unsupported(),
-                image_state: o.image_state.as_deref(),
+                image_state: o.image_state(),
                 default: o.profile.name == default_profile,
             })
             .collect();

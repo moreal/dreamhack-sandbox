@@ -537,16 +537,45 @@ fn create_guidance(
                 .to_string(),
         );
     }
+    // The baseline provisioning scripts need more than an account and a key,
+    // and refuse without it. Asking here costs a paste; finding out at the
+    // first `profile build` costs an install cycle (spec.md §6's "OS 설치
+    // 미완료: 설치·SSH 준비·build 재개 명령 안내").
+    lines.extend(privilege_guidance(profile));
     lines.push(format!(
-        "4. Authorize this host's key: append {} to ~{}/.ssh/authorized_keys in the guest.",
+        "5. Authorize this host's key: append {} to ~{}/.ssh/authorized_keys in the guest.",
         ctx.dirs.keys_dir().join("id_ed25519.pub").display(),
         profile.guest.user,
     ));
     lines.push(format!(
-        "5. Then build the reusable image:  wargame profile build {}",
+        "6. Then build the reusable image:  wargame profile build {}",
         profile.name
     ));
     lines
+}
+
+/// Step 4 of [`create_guidance`]: the elevated access `profile build` needs
+/// in the guest, phrased for the guest's OS with the profile's own user
+/// already substituted.
+///
+/// A POSIX build runs `apt-get` through `sudo -n`, which cannot answer a
+/// password prompt over a non-interactive SSH command; a Windows build
+/// installs a Windows capability and writes the machine PATH, both of which
+/// need the elevated token OpenSSH grants a local administrator.
+fn privilege_guidance(profile: &Profile) -> Vec<String> {
+    let user = &profile.guest.user;
+    match profile.guest.os {
+        GuestOs::Windows => vec![format!(
+            "4. Make {user:?} a local administrator (Computer Management > Local Users and Groups > Groups > Administrators). The build installs a Windows capability and edits the machine PATH, so an unelevated account is refused."
+        )],
+        _ => vec![
+            format!(
+                "4. Give {user:?} passwordless sudo -- the build installs packages over a non-interactive SSH command, which cannot answer a password prompt. In the guest:"
+            ),
+            format!("     echo '{user} ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/wargame"),
+            "     sudo chmod 0440 /etc/sudoers.d/wargame".to_string(),
+        ],
+    }
 }
 
 // --- profile console ------------------------------------------------------

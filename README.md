@@ -136,8 +136,11 @@ when a new binary re-seeds the built-in scripts. `profile create` makes one
 long-lived *installation VM* (a blank disk plus the installer ISO, or
 `--from-vm <utm-uuid>` to clone an already-installed VM, which is only ever
 copied) and prints its UUID plus what to prepare in the guest: your user
-account, an SSH server, the QEMU guest agent, and this host's public key in
-`~/.ssh/authorized_keys`. Re-running it with the same source re-prints that
+account, an SSH server, the QEMU guest agent, this host's public key in
+`~/.ssh/authorized_keys`, and the elevated access the build needs — a
+`NOPASSWD` sudoers entry on Kali, membership of Administrators on Windows,
+since a build installing packages over a non-interactive SSH command cannot
+answer a password prompt. Re-running it with the same source re-prints that
 guidance and creates nothing; pointing it at a *different* source is an
 error rather than a silent second VM. `--sha256 <hex>` is checked against
 the ISO before anything is created.

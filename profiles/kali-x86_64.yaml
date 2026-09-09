@@ -46,6 +46,8 @@ tools:
     - python3 -m venv --help
     - git --version
     - curl --version
+    # If the guest's unzip returns non-zero for `-v`, use `unzip -h`
+    # (scripts/kali/common.sh has to match).
     - unzip -v
     - file --version
     - gdb --version

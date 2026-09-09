@@ -50,6 +50,42 @@ function Write-Result {
     Write-Host "<== ${Label}: exit $Code"
 }
 
+# Runs a native command and returns nothing but its exit code.
+#
+# Two things matter here. `| Out-Host` (or `*> $null`) rather than letting
+# the command write to the pipeline: this returns the exit code, and anything
+# the command printed would otherwise come back alongside it as an array.
+# And `$ErrorActionPreference = 'Continue'` for the duration: in Windows
+# PowerShell 5.1 a native command that writes to stderr while its streams are
+# redirected raises a NativeCommandError, which under 'Stop' would be
+# reported as a failure for the very ordinary reason that a tool printed its
+# version banner to stderr. The exit code is the answer; the error stream is
+# not. (wargame's own command wrapper dodges the same trap the same way.)
+function Invoke-NativeExitCode {
+    param(
+        [Parameter(Mandatory)][string] $Command,
+        [string[]]                     $Arguments = @(),
+        [switch]                       $Quiet
+    )
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 0
+    try {
+        if ($Quiet) {
+            & $Command @Arguments *> $null
+        } else {
+            & $Command @Arguments | Out-Host
+        }
+        return $LASTEXITCODE
+    } catch {
+        # The command could not be started at all (not on PATH, say).
+        Write-Host "    ${Command}: $($_.Exception.Message)"
+        return 1
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 # Runs a native command, logs its exit code, and fails the build unless the
 # code is one this step accepts.
 function Invoke-Native {
@@ -57,16 +93,13 @@ function Invoke-Native {
         [Parameter(Mandatory)][string]   $Label,
         [Parameter(Mandatory)][string]   $Command,
         [string[]]                       $Arguments = @(),
-        [int[]]                          $AllowedExitCodes = @(0)
+        [int[]]                          $AllowedExitCodes = @(0),
+        [switch]                         $AllowAnyExitCode
     )
     Write-Step $Label
-    # `| Out-Host` rather than letting the command write to the pipeline:
-    # this function returns the exit code, and anything the command printed
-    # would otherwise be returned alongside it as an array.
-    & $Command @Arguments | Out-Host
-    $code = $LASTEXITCODE
+    $code = Invoke-NativeExitCode -Command $Command -Arguments $Arguments
     Write-Result $Label $code
-    if ($AllowedExitCodes -notcontains $code) {
+    if (-not $AllowAnyExitCode -and $AllowedExitCodes -notcontains $code) {
         throw "$Label failed (exit $code)"
     }
     return $code
@@ -77,12 +110,7 @@ function Invoke-Native {
 # installed" and "verified" can never disagree.
 function Test-Tool {
     param([Parameter(Mandatory)][string] $Command, [string[]] $Arguments = @())
-    try {
-        & $Command @Arguments *> $null
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
-    }
+    return (Invoke-NativeExitCode -Command $Command -Arguments $Arguments -Quiet) -eq 0
 }
 
 # Re-reads PATH from the registry so a tool installed a moment ago is
@@ -197,13 +225,22 @@ function Install-WingetPackage {
         Write-Result $Label 0
         return
     }
+    # Any exit code is accepted here, and the probe below decides. winget has
+    # a whole family of "nothing to do" codes -- already installed, no
+    # applicable update, a newer version present -- and hard-coding them
+    # would turn a re-run into a failed build the day one of them changes.
+    # What the build actually needs to know is whether the tool runs now.
     $code = Invoke-Native "$Label (winget install $Id)" 'winget' `
-        (@('install', '--id', $Id) + $wingetCommon) @(0, 1641, 3010)
+        (@('install', '--id', $Id) + $wingetCommon) -AllowAnyExitCode
     if ($code -eq 1641 -or $code -eq 3010) {
         Write-Host "    $Label asked for a restart"
         $script:RebootRequired = $true
+        return
     }
     Update-SessionPath
+    if (-not (Test-Tool -Command $ProbeCommand -Arguments $ProbeArguments)) {
+        throw "${Label}: winget exited $code and ``$ProbeCommand $($ProbeArguments -join ' ')`` still does not run"
+    }
 }
 
 Install-WingetPackage -Label 'Python 3' -Id 'Python.Python.3.12' `
@@ -217,20 +254,28 @@ Install-WingetPackage -Label '7-Zip' -Id '7zip.7zip' `
 # it by name in a fresh session.
 Add-MachinePath -Directory "$env:ProgramFiles\7-Zip"
 
-# --- workspace root ---------------------------------------------------------
-# The profile's `workspace.root`; each launched challenge gets its own
-# subdirectory underneath it.
-Write-Step 'workspace root C:\wargame'
-New-Item -Path 'C:\wargame' -ItemType Directory -Force | Out-Null
-Write-Result 'workspace root' 0
+# The workspace root is deliberately not created here: it comes from the
+# profile's `workspace.root`, which this script cannot see, and every launch
+# creates it (and the challenge's subdirectory under it) in the guest anyway.
+# Hard-coding `C:\wargame` would silently diverge the moment someone edits
+# the profile.
 
 # --- verification -----------------------------------------------------------
+# This runs *before* the `exit 3010` below, so a tool that only becomes
+# verifiable after the restart would fail here rather than taking the reboot
+# path. That is fine for the five checks this script ships -- PowerShell,
+# sshd, Python, Git and 7-Zip are all usable the moment their installer
+# finishes -- but a tool you add that genuinely needs the reboot belongs in a
+# script of its own, listed after this one, so the build reboots in between.
 Write-Step 'verifying the installed tools'
 Update-SessionPath
 $checks = @(
     @{ Label = 'powershell -NoProfile -Command $PSVersionTable.PSVersion.ToString()'
        Command = 'powershell'
        Arguments = @('-NoProfile', '-Command', '$PSVersionTable.PSVersion.ToString()') },
+    # `sc.exe query` exits 0 for a service that exists but is stopped, and
+    # prints its STATE either way. That it is *running* needs no separate
+    # check: this script is talking to the guest over that very service.
     @{ Label = 'sc.exe query sshd'; Command = 'sc.exe'; Arguments = @('query', 'sshd') },
     @{ Label = 'python --version';  Command = 'python'; Arguments = @('--version') },
     @{ Label = 'git --version';     Command = 'git';    Arguments = @('--version') },
@@ -238,13 +283,7 @@ $checks = @(
 )
 $failed = @()
 foreach ($check in $checks) {
-    $code = 1
-    try {
-        & $check.Command @($check.Arguments) | Out-Host
-        $code = $LASTEXITCODE
-    } catch {
-        Write-Host "    verify: $($check.Label) -> $($_.Exception.Message)"
-    }
+    $code = Invoke-NativeExitCode -Command $check.Command -Arguments $check.Arguments
     Write-Host "    verify: $($check.Label) -> exit $code"
     if ($code -ne 0) { $failed += "$($check.Label) (exit $code)" }
 }

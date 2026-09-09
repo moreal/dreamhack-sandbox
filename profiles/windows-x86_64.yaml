@@ -47,6 +47,8 @@ tools:
   # names the install source for each one.
   verify:
     - powershell -NoProfile -Command $PSVersionTable.PSVersion.ToString()
+    # Exits 0 for a service that exists but is stopped; that sshd is
+    # *running* is proven by the build reaching the guest at all.
     - sc.exe query sshd
     - python --version
     - git --version

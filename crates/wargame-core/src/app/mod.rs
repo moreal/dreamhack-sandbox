@@ -34,7 +34,8 @@ pub use profile_build::{
     InitOutcome, ProfileImageStatus,
 };
 pub use profiles::{
-    overview as profile_overview, overviews as profile_overviews, ProfileOverview, ProfileStore,
+    overview as profile_overview, overviews as profile_overviews, ImageReadiness, ProfileOverview,
+    ProfileStore,
 };
 pub use search::{open, search};
 

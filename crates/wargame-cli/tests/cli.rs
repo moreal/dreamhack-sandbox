@@ -313,6 +313,13 @@ fn doctor_profile_reports_an_unbuilt_utm_image() {
         .as_str()
         .unwrap()
         .contains("wargame profile create kali-arm64"));
+    // The row leads with what the profile resolved to, from the same
+    // overview `wargame profiles` renders (spec.md §3 FR-1).
+    let detail = image["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("kali/arm64, utm/virtualize — "),
+        "{detail}"
+    );
 }
 
 #[test]

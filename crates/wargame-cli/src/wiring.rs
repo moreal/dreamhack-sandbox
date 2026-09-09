@@ -493,14 +493,22 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&script).unwrap(), edited);
     }
 
-    /// A script the user added under a name of their own is not part of the
-    /// built-in set at all, so seeding neither writes nor removes it.
+    /// A script the user added under a name of their own is not one of the
+    /// paths the built-in set names, so seeding never writes it, never
+    /// removes it, and keeps no pristine copy of it.
     #[test]
-    fn seeding_never_touches_a_users_own_script() {
+    fn seeding_never_touches_a_path_the_builtin_set_does_not_name() {
         let home = tmp_home();
         let dirs = AppDirs { root: home.clone() };
         dirs.ensure_layout().unwrap();
-        let mine = home.join("profiles/scripts/custom/my-tools.sh");
+        let rel = "scripts/kali-custom/my-tools.sh";
+        assert!(
+            !profiles_builtin::builtin_provision_scripts()
+                .iter()
+                .any(|(path, _)| *path == rel),
+            "{rel} must not be one of the seeded paths, or this proves nothing"
+        );
+        let mine = home.join("profiles").join(rel);
         std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
         std::fs::write(&mine, "#!/usr/bin/env bash\necho mine\n").unwrap();
 
@@ -511,6 +519,29 @@ mod tests {
             std::fs::read_to_string(&mine).unwrap(),
             "#!/usr/bin/env bash\necho mine\n"
         );
+        assert!(
+            !home.join("profiles/.builtin").join(rel).exists(),
+            "seeding must not shadow a file it does not own"
+        );
+    }
+
+    /// The commented `scripts/custom/` examples *are* seeded -- they ship
+    /// with the binary -- but a user who turns one into their own script
+    /// keeps it, like any other built-in path they edit.
+    #[test]
+    fn the_custom_script_example_is_seeded_and_then_left_alone_once_edited() {
+        let home = tmp_home();
+        let dirs = AppDirs { root: home.clone() };
+        dirs.ensure_layout().unwrap();
+        let example = home.join("profiles/scripts/custom/my-tools.sh");
+
+        seed_builtin_scripts(&dirs).unwrap();
+        assert!(example.is_file(), "the example ships with the binary");
+
+        let mine = "#!/usr/bin/env bash\necho my own tools\n";
+        std::fs::write(&example, mine).unwrap();
+        seed_builtin_scripts(&dirs).unwrap();
+        assert_eq!(std::fs::read_to_string(&example).unwrap(), mine);
     }
 
     #[test]

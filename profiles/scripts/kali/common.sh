@@ -106,10 +106,11 @@ packages=(
 step "apt-get update" "${apt_get[@]}" update
 step "apt-get install: ${packages[*]}" "${apt_get[@]}" install "${packages[@]}"
 
-# --- workspace root ---------------------------------------------------------
-# The profile's `workspace.root`; each launched challenge gets its own
-# subdirectory underneath it.
-step "workspace root" mkdir -p "$HOME/wargame"
+# The workspace root is deliberately not created here: it comes from the
+# profile's `workspace.root`, which this script cannot see, and every launch
+# creates it (and the challenge's subdirectory under it) in the guest anyway.
+# Hard-coding "$HOME/wargame" would silently diverge the moment someone edits
+# the profile.
 
 # --- verification -----------------------------------------------------------
 log "verifying the installed tools"
@@ -118,6 +119,9 @@ verify python3 -m pip --version
 verify python3 -m venv --help
 verify git --version
 verify curl --version
+# `unzip -v` prints the version banner and exits 0. If the shipped image's
+# unzip returns non-zero for it, use `unzip -h` instead -- here and in the
+# profile's tools.verify, which has to match.
 verify unzip -v
 verify file --version
 verify gdb --version

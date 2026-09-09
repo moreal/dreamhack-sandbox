@@ -659,6 +659,14 @@ async fn create_makes_one_installer_vm_and_records_it_as_awaiting_install() {
     assert!(guidance.contains("wargame profile console kali-arm64"));
     assert!(guidance.contains("qemu-guest-agent"));
     assert!(guidance.contains("wargame profile build kali-arm64"));
+    // The baseline script needs `sudo -n` and refuses without it, so the
+    // guidance has to ask for it *before* the first build -- with the
+    // profile's own user substituted, ready to paste.
+    assert!(
+        guidance.contains("kali ALL=(ALL) NOPASSWD:ALL"),
+        "{guidance}"
+    );
+    assert!(guidance.contains("/etc/sudoers.d/wargame"), "{guidance}");
 
     assert_eq!(f.record("kali-arm64").await.installer_vm, Some(vm));
 }
@@ -1312,6 +1320,13 @@ async fn a_windows_create_prints_the_manual_tpm_and_secure_boot_step() {
     assert!(guidance.contains("TPM 2.0"), "{guidance}");
     assert!(guidance.contains("Secure Boot"), "{guidance}");
     assert!(guidance.contains("OpenSSH Server"), "{guidance}");
+    // The baseline script installs a Windows capability and writes the
+    // machine PATH, both of which need an elevated token, and refuses
+    // without one -- so the account has to be made an administrator during
+    // the install, not after the first failed build.
+    assert!(guidance.contains("Administrators"), "{guidance}");
+    // Nothing about sudo on a Windows guest.
+    assert!(!guidance.contains("sudoers"), "{guidance}");
 }
 
 /// The VMs a build record owns have no session, but they are not orphans:

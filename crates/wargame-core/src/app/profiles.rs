@@ -121,6 +121,26 @@ impl ProfileStore {
     }
 }
 
+/// Whether a profile has an image to launch from, and what to say about it.
+///
+/// One decision, made once: `profiles`, the TUI's picker and `doctor` all
+/// render this rather than each re-deriving "the record names an image, the
+/// backend still has it, and nothing has changed since".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageReadiness {
+    /// `"ready"`, `"rebuild needed"`, `"not built"`, `"not created"`, or the
+    /// phase a half-finished build stopped at -- the word a table shows.
+    pub state: String,
+    /// The longer line `doctor` shows: the image, or why there is none.
+    pub detail: String,
+    /// There is an image, the backend still has it, and neither the profile
+    /// nor its scripts changed since it was built.
+    pub ready: bool,
+    /// Nothing is published for this profile, so `profile create` comes
+    /// before `profile build`.
+    pub needs_create: bool,
+}
+
 /// A profile plus the state spec.md §3 FR-1 asks every profile view to show:
 /// what its OS, architecture, backend and execution mode resolved to, and
 /// whether it has an image to launch from.
@@ -135,10 +155,8 @@ pub struct ProfileOverview {
     /// says why.
     pub resolved: Option<ResolvedBackend>,
     unsupported: Option<String>,
-    /// `"ready"`, `"rebuild needed"`, `"not built"`, `"not created"`, or the
-    /// phase a half-finished build stopped at. `None` when it could not be
-    /// determined.
-    pub image_state: Option<String>,
+    /// The image state, or `(detail, hint)` of whatever prevented reading it.
+    image: std::result::Result<ImageReadiness, (String, Option<String>)>,
 }
 
 impl ProfileOverview {
@@ -168,9 +186,27 @@ impl ProfileOverview {
         }
     }
 
-    /// The image-readiness word for a table cell.
+    /// The image state, or `None` when it could not be determined at all.
+    pub fn image(&self) -> Option<&ImageReadiness> {
+        self.image.as_ref().ok()
+    }
+
+    /// `(detail, hint)` of what prevented reading the image state.
+    pub fn image_error(&self) -> Option<(&str, Option<&str>)> {
+        self.image
+            .as_ref()
+            .err()
+            .map(|(detail, hint)| (detail.as_str(), hint.as_deref()))
+    }
+
+    /// The image-readiness word, or `None` when it is unknown.
+    pub fn image_state(&self) -> Option<&str> {
+        self.image().map(|image| image.state.as_str())
+    }
+
+    /// The same, for a table cell that has to print something.
     pub fn image_label(&self) -> &str {
-        self.image_state.as_deref().unwrap_or("unknown")
+        self.image_state().unwrap_or("unknown")
     }
 
     /// Why this profile cannot run at all, when that is the reason its state
@@ -199,7 +235,7 @@ pub async fn overview(ctx: &AppContext, profile: &Profile) -> ProfileOverview {
         Err(e) => (None, Some(e.to_string())),
     };
     ProfileOverview {
-        image_state: image_state(ctx, profile).await,
+        image: image_readiness(ctx, profile).await,
         profile: profile.clone(),
         resolved,
         unsupported,
@@ -215,31 +251,44 @@ pub async fn overviews(ctx: &AppContext) -> Vec<ProfileOverview> {
     out
 }
 
-async fn image_state(ctx: &AppContext, profile: &Profile) -> Option<String> {
+async fn image_readiness(
+    ctx: &AppContext,
+    profile: &Profile,
+) -> std::result::Result<ImageReadiness, (String, Option<String>)> {
     let status = super::profile_build::image_status(ctx, profile)
         .await
-        .ok()?;
+        .map_err(|e| (e.to_string(), e.hint()))?;
     let Some(image) = &status.image else {
-        return Some(
-            status
+        return Ok(ImageReadiness {
+            state: status
                 .phase
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_else(|| "not created".to_string()),
-        );
+            detail: status.detail,
+            ready: false,
+            needs_create: true,
+        });
     };
     // A name is not an image: ask the backend whether it is actually there.
     let exists = match ctx.backends.get(status.backend.as_str()) {
         Ok(vm) => vm.image_exists(image).await.unwrap_or(false),
-        Err(_) => false,
+        Err(e) => return Err((e.to_string(), e.hint())),
     };
-    Some(
-        match (exists, status.rebuild_needed) {
+    Ok(ImageReadiness {
+        state: match (exists, status.rebuild_needed) {
             (false, _) => "not built",
             (true, true) => "rebuild needed",
             (true, false) => "ready",
         }
         .to_string(),
-    )
+        detail: if exists {
+            status.detail
+        } else {
+            format!("{} is not ready", status.detail)
+        },
+        ready: exists && !status.rebuild_needed,
+        needs_create: false,
+    })
 }
 
 #[cfg(test)]

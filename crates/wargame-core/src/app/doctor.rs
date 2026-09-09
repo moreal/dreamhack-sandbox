@@ -375,56 +375,38 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
 /// scripts changed since it was built (spec.md §3 FR-1/FR-3).
 async fn profile_image_check(ctx: &AppContext, profile: &Profile) -> Check {
     let name = profile.name.clone();
+    // The same overview `profiles` and the TUI's picker render: whether an
+    // image is actually launchable is one decision, made in one place.
+    let overview = crate::app::profiles::overview(ctx, profile).await;
+    let check = |ok: bool, detail: String, hint: Option<String>| Check {
+        name: format!("profile-image:{name}"),
+        ok,
+        detail,
+        hint,
+    };
+    let Some(image) = overview.image() else {
+        let (detail, hint) = overview.image_error().unwrap_or(("unknown", None));
+        return check(false, detail.to_string(), hint.map(str::to_string));
+    };
     // Every row leads with what the profile resolved to, so `doctor` names
     // the guest OS, architecture, backend and execution mode next to the
     // image state rather than only the last of those (spec.md §3 FR-1).
-    let resolved = match crate::app::backends::resolve_backend(profile) {
-        Ok(resolved) => format!("{}, {}", resolved.guest_label(), resolved.backend_label()),
-        Err(_) => format!("{}/{}", profile.vm.backend, profile.vm.mode),
-    };
-    let status = match crate::app::profile_build::image_status(ctx, profile).await {
-        Ok(status) => status,
-        Err(e) => {
-            return Check {
-                name: format!("profile-image:{name}"),
-                ok: false,
-                detail: e.to_string(),
-                hint: e.hint(),
+    check(
+        image.ready,
+        format!(
+            "{}, {} — {}",
+            overview.guest_label(),
+            overview.backend_label(),
+            image.detail
+        ),
+        (!image.ready).then(|| {
+            if image.needs_create {
+                format!("wargame profile create {name} --iso <path>   # then: wargame profile build {name}")
+            } else {
+                format!("wargame profile build {name}")
             }
-        }
-    };
-    let Some(image) = status.image.clone() else {
-        return Check {
-            name: format!("profile-image:{name}"),
-            ok: false,
-            detail: format!("{resolved} — {}", status.detail),
-            hint: Some(format!(
-                "wargame profile create {name} --iso <path>   # then: wargame profile build {name}"
-            )),
-        };
-    };
-    let exists = match ctx.backends.get(status.backend.as_str()) {
-        Ok(vm) => vm.image_exists(&image).await.unwrap_or(false),
-        Err(e) => {
-            return Check {
-                name: format!("profile-image:{name}"),
-                ok: false,
-                detail: e.to_string(),
-                hint: e.hint(),
-            }
-        }
-    };
-    let ok = exists && !status.rebuild_needed;
-    Check {
-        name: format!("profile-image:{name}"),
-        ok,
-        detail: if exists {
-            format!("{resolved} — {}", status.detail)
-        } else {
-            format!("{resolved} — {} is not ready", status.detail)
-        },
-        hint: (!ok).then(|| format!("wargame profile build {name}")),
-    }
+        }),
+    )
 }
 
 #[cfg(test)]
