@@ -135,4 +135,20 @@ pub trait VmProvider: Send + Sync {
         None
     }
     fn console(&self, vm: &VmRef) -> ConsoleDescriptor;
+
+    /// Shows a **running** VM's graphical console without disturbing the
+    /// guest, and answers whether it could.
+    ///
+    /// `Ok(false)` -- the default -- means this backend has no way to reveal
+    /// the window of a VM that is already up, and the caller has to restart
+    /// it with one. That is what `wargame gui` used to do unconditionally,
+    /// and on UTM it rebooted a running guest: UTM has no headless start at
+    /// all (docs/utm-compatibility.md T7), so the window was there the whole
+    /// time and only needed focusing (task-7-b2b-report.md D8).
+    ///
+    /// Never called for a stopped VM: starting one is how its window
+    /// appears.
+    async fn show_console(&self, _vm: &VmRef) -> Result<bool> {
+        Ok(false)
+    }
 }

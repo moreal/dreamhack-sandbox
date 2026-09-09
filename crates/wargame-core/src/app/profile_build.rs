@@ -1021,6 +1021,13 @@ pub struct ProfileImageStatus {
     pub phase: Option<BuildPhase>,
     /// The profile or its scripts changed since this image was built.
     pub rebuild_needed: bool,
+    /// The long-lived VM the user installs the OS into, when this backend
+    /// has one and `profile create` already made it. What tells "you have
+    /// not set this profile up" apart from "the OS install in the VM you
+    /// already have is not finished" -- and therefore whether the next
+    /// command is `profile create` or `profile console`/`profile build`
+    /// (task-7-b2b-report.md D9).
+    pub installer_vm: Option<VmRef>,
     /// One line for `doctor`/`profiles`.
     pub detail: String,
 }
@@ -1063,6 +1070,7 @@ pub async fn image_status(ctx: &AppContext, profile: &Profile) -> Result<Profile
     Ok(ProfileImageStatus {
         backend: execution.backend,
         image,
+        installer_vm: record.as_ref().and_then(|r| r.installer_vm.clone()),
         phase: record.map(|r| r.phase),
         rebuild_needed,
         detail: if rebuild_needed {

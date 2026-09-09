@@ -824,6 +824,26 @@ back automatically. Until the guest-side check above passes, `doctor --profile` 
 `isolated` as **"mechanism verified, guest isolation unverified"** rather than `ok`, and
 `AC-10` stays `unverified`.
 
+### Isolated guests have no DNS, by design — and find that out slowly
+
+Verified from inside a Kali guest on `mode:host` (`task-7-b2b-report.md` §9, AC-10): no default
+route, `curl 1.1.1.1` fails, LAN peers answer "Network is unreachable", and host→guest SSH works.
+That is the whole point of the mode.
+
+One consequence is worth stating rather than fixing. The `vmnet-host` DHCP lease carries the
+**host's own LAN resolvers** (`192.168.50.201`, `192.168.50.1` on the machine this was recorded
+on), which are on the other side of the isolation boundary, so the guest's `/etc/resolv.conf` is
+full of nameservers it can never reach. Name lookups therefore fail by **timeout** rather than
+immediately (`task-7-b2b-report.md` D10).
+
+**wargame leaves that alone on purpose.** An isolated guest is meant to have no name resolution;
+rewriting `/etc/resolv.conf` — or pointing it at a resolver on the host — would be a network change
+the user did not ask for, made invisibly, in the one mode whose value is that nothing reaches out.
+FR-6's rule that a network mode is never silently altered applies to what is inside the guest too.
+So: **isolated means no DNS**, and a lookup in an isolated guest is expected to hang for the
+resolver timeout and then fail. Use literal addresses in an isolated session, or launch with
+`--network nat`, which is the explicit opt-in.
+
 ### Guest address discovery
 
 | Mode | How the adapter learns the guest address |

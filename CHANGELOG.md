@@ -225,6 +225,24 @@ To be released.
     running, and names the commands that stop it and that take the installer
     disc out — which is what it should have said all along.
 
+ -  `wargame doctor --profile <name>` judges free disk space the same way
+    `wargame profile create` does: it measures the volume the guest disk
+    actually lands on, and only fails below the working floor rather than
+    demanding the profile's whole nominal disk. It also no longer suggests
+    lowering `resources.disk_gib`, which does not help.
+
+ -  A profile whose installation VM exists but whose OS install is unfinished
+    is now told to open its console and finish it — naming that VM — instead
+    of being sent to `wargame profile create`, which refuses.
+
+ -  A profile whose image was deleted outside wargame reads `missing`, not
+    `ready`. `wargame profiles` and `wargame doctor` ask the VM backend
+    whether the image is really there, so a UTM image you removed in UTM
+    shows up before a launch fails on it.
+
+ -  When a launch fails, the next step offered is to look at what happened,
+    not to delete the session. `wargame delete` is still there, second.
+
  -  `wargame doctor` no longer reports a profile you have never built as a
     failure. A Mac with no Kali or Windows installation ISO is not a broken
     machine, and three permanent ✗ rows for the templates that ship with
@@ -236,6 +254,13 @@ To be released.
     missing, when the profile changed since, or when a build stopped
     partway: nothing was swept under the rug. `doctor --json` says which is
     which in a new `status` field (`pass`, `fail` or `not-set-up`).
+
+ -  **`wargame gui` no longer reboots a running session.** On UTM the window
+    is open from the moment the VM starts, but `gui` stopped and restarted
+    the machine anyway — it came back with everything you were running in the
+    guest gone, and said "SSH keeps working" while the guest's uptime was
+    zero. It now just brings the window to the front. A stopped session is
+    still started with a window, as before.
 
  -  `wargame profile build` now takes the installer disc out of the
     installation VM before it boots it. With the disc still in, the machine

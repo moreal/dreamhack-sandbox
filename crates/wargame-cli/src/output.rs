@@ -227,12 +227,21 @@ pub fn print_session(session: &Session, log_path: Option<&std::path::Path>, json
 /// The single most useful follow-up command for a session in its current
 /// state, shown under `session inspect` and the launch summary.
 pub fn next_step_for(session: &Session) -> String {
+    next_step(session.state, &session.id)
+}
+
+fn next_step(state: wargame_core::domain::SessionState, id: &str) -> String {
     use wargame_core::domain::SessionState::*;
-    let id = &session.id;
-    match session.state {
+    match state {
         Ready | Running => format!("wargame ssh {id}   # or: wargame gui {id}"),
         Stopped => format!("wargame resume {id}   # or: wargame delete {id}"),
-        Failed => format!("wargame delete {id}   # discard it and launch again"),
+        // Never a destructive command first. Most launch failures are a
+        // guest that was not ready yet, and the session's own log says
+        // which; `delete` is the last resort, not the first suggestion
+        // (task-7-b2b-report.md D2's recovery note).
+        Failed => format!(
+            "wargame session inspect {id}   # what failed; then launch again, or wargame delete {id} to discard it"
+        ),
         _ => format!("wargame sessions   # wait for {id} to settle"),
     }
 }
@@ -345,7 +354,7 @@ struct ProfileJson<'a> {
     resolved: Option<ResolvedJson>,
     /// Why the profile does not resolve, when it does not.
     unsupported: Option<&'a str>,
-    /// `"ready"`, `"rebuild needed"`, `"not built"`, or the phase a
+    /// `"ready"`, `"rebuild needed"`, `"missing"`, `"not built"`, or the phase a
     /// half-finished build stopped at. `null` when it could not be
     /// determined.
     image_state: Option<&'a str>,
@@ -419,6 +428,27 @@ pub fn print_profiles(overviews: &[ProfileOverview], default_profile: &str, json
 mod tests {
     use super::*;
     use time::Duration;
+
+    /// A failed launch is usually a guest that was not ready in time, and
+    /// the first thing offered must not be the command that destroys the
+    /// VM -- especially not one that walks straight back into the same wait
+    /// (task-7-b2b-report.md D2).
+    #[test]
+    fn a_failed_sessions_next_step_leads_with_diagnosis_not_with_delete() {
+        use wargame_core::domain::SessionState;
+
+        let next = next_step(SessionState::Failed, "fi-hello-3c715d");
+        assert!(
+            next.starts_with("wargame session inspect fi-hello-3c715d"),
+            "{next}"
+        );
+        assert!(next.contains("launch again"), "{next}");
+        // `delete` is still offered, just not first.
+        let delete = next
+            .find("wargame delete")
+            .expect("delete is still offered");
+        assert!(delete > next.find("inspect").unwrap(), "{next}");
+    }
 
     #[test]
     fn age_buckets() {

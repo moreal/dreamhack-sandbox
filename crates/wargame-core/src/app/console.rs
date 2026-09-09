@@ -29,11 +29,21 @@ pub async fn ssh_command(ctx: &AppContext, id: &str) -> Result<std::process::Com
     Ok(transport.interactive_shell_cmd(&endpoint))
 }
 
-/// Reopens a session's VM with a graphical console (DESIGN.md §5's
-/// "delegate to Tart" decision): stops the current (headless) run if it is
-/// active, restarts it with a window, and waits for the guest to answer
-/// again before returning. A `Stopped` session (including one whose Tart
-/// window was closed, which stops the VM) is simply started with a window.
+/// Opens a session's VM in a graphical console.
+///
+/// A **running** VM is shown as it is whenever the backend can do that
+/// ([`crate::ports::VmProvider::show_console`]) -- nothing is stopped,
+/// nothing reboots, no process in the guest is lost. UTM is that case: it
+/// has no headless start at all, so the window was open all along and only
+/// needed focusing. `wargame gui` used to stop and restart every running
+/// session unconditionally, which cost the user whatever the guest was
+/// doing and reported "SSH keeps working" while `uptime` said 0 minutes
+/// (task-7-b2b-report.md D8).
+///
+/// A backend that cannot reveal an existing window (Tart, whose headless
+/// run has none) keeps the old behaviour: stop, start with a window, and
+/// wait for the guest to answer again. A `Stopped` session is simply
+/// started with a window either way -- that is how the window appears.
 pub async fn open_gui(ctx: &AppContext, id: &str) -> Result<()> {
     let session = ctx.repo.load(id).await?;
     let mut session = reconcile(ctx, session).await?;
@@ -50,6 +60,12 @@ pub async fn open_gui(ctx: &AppContext, id: &str) -> Result<()> {
 
     let vm = provider_for_session(ctx, &session)?;
     if vm.status(&vm_ref).await.unwrap_or(VmStatus::Stopped) == VmStatus::Running {
+        if vm.show_console(&vm_ref).await? {
+            // The window is already there and the guest is untouched, so
+            // there is nothing to wait for and nothing about the session
+            // has changed.
+            return Ok(());
+        }
         vm.stop(&vm_ref).await?;
     }
 
@@ -218,6 +234,65 @@ mod tests {
         let after = ctx.repo.load("s").await.unwrap();
         assert_eq!(after.state, SessionState::Running);
         assert!(after.guest_ip.is_some());
+    }
+
+    /// **D8.** On a backend whose running VM already has a window -- UTM has
+    /// no headless start at all -- `gui` must reveal it and leave the guest
+    /// alone. It used to stop and restart every running session, so
+    /// `wargame gui` on a working session came back with `uptime` at 0
+    /// minutes and whatever was running in the guest gone
+    /// (task-7-b2b-report.md D8).
+    #[tokio::test]
+    async fn open_gui_shows_a_running_window_without_restarting_the_guest() {
+        let (ctx, vm) = fixture();
+        vm.set_shows_console(true);
+        let vm_ref = vm
+            .create(&VmSpec::new(
+                "wg-s".to_string(),
+                ImageRef("img".to_string()),
+                Resources {
+                    cpu: 1,
+                    memory_mib: 1024,
+                    disk_gib: 10,
+                },
+            ))
+            .await
+            .unwrap();
+        vm.start(
+            &vm_ref,
+            &StartOptions {
+                network: NetworkMode::Isolated,
+                headless: false,
+                log_path: ctx.repo.session_dir("s").join("run.log"),
+            },
+        )
+        .await
+        .unwrap();
+        let mut session = sample_session("s", SessionState::Running);
+        session.vm_ref = Some(vm_ref.clone());
+        session.guest_ip = Some(IpAddr::from_str("10.0.0.5").unwrap());
+        ctx.repo.save(&session).await.unwrap();
+
+        let before = vm.calls().len();
+        open_gui(&ctx, "s").await.unwrap();
+
+        let after: Vec<String> = vm.calls().into_iter().skip(before).collect();
+        assert!(
+            after.iter().any(|c| c.starts_with("show_console")),
+            "{after:?}"
+        );
+        assert!(
+            !after.iter().any(|c| c.starts_with("stop")),
+            "the guest must not be stopped: {after:?}"
+        );
+        assert!(
+            !after.iter().any(|c| c.starts_with("start")),
+            "nor restarted: {after:?}"
+        );
+        assert_eq!(
+            ctx.repo.load("s").await.unwrap().state,
+            SessionState::Running
+        );
     }
 
     #[tokio::test]

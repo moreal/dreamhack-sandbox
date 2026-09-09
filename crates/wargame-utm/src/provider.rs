@@ -599,8 +599,23 @@ impl VmProvider for UtmProvider {
         checks
     }
 
+    /// Whether this profile's image is **both** recorded here and still in
+    /// UTM.
+    ///
+    /// The catalog alone answers "some build record of this home published
+    /// that VM", which is what `profiles` and `doctor` used to trust: after
+    /// the images were deleted in UTM they both still said `ready`, and
+    /// `launch` accepted that and failed much later
+    /// (task-7-b2b-report.md D7; spec.md §6's "외부에서 VM 삭제 → missing
+    /// 반영"). Tart asks its backend, so UTM asks its own.
+    ///
+    /// The record is consulted first, so a profile with nothing published
+    /// never launches the app to find that out.
     async fn image_exists(&self, image: &ImageRef) -> Result<bool> {
-        self.images.image_ready(image).await
+        if !self.images.image_ready(image).await? {
+            return Ok(false);
+        }
+        Ok(self.automation.find(&image.0).await?.is_some())
     }
 
     /// UTM has nothing to pull: an image is a VM this app built and
@@ -873,6 +888,14 @@ impl VmProvider for UtmProvider {
     /// measure (D1). `None` until UTM has run once and made the directory.
     fn storage_dir(&self) -> Option<PathBuf> {
         crate::config::utm_vm_directory()
+    }
+
+    /// UTM has no headless start (T7): a running VM's window already
+    /// exists, so showing its console is bringing the app to the front and
+    /// nothing else. The guest is never touched.
+    async fn show_console(&self, _vm: &VmRef) -> Result<bool> {
+        self.automation.activate_app().await?;
+        Ok(true)
     }
 
     fn console(&self, vm: &VmRef) -> ConsoleDescriptor {

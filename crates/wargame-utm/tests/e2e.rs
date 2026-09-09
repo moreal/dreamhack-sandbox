@@ -336,6 +336,127 @@ async fn utm_clone_boot_stop_delete_preserves_the_source() {
     }
 }
 
+/// UTM itself, without needing a built image: the two switches and
+/// `utmctl`, and nothing else. For the tests that make their own throwaway
+/// VMs.
+fn utm_only(test: &str) -> Option<(UtmProvider, UtmConfig)> {
+    if std::env::var("WARGAME_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping {test}: set WARGAME_E2E=1 to run this against a real UTM");
+        return None;
+    }
+    let cfg = UtmConfig::default();
+    let provider = UtmProvider::new(Arc::new(RealRunner), cfg.clone());
+    if let Err(e) = provider.utmctl_path() {
+        eprintln!("skipping {test}: no UTM on this host ({e})");
+        return None;
+    }
+    Some((provider, cfg))
+}
+
+/// **The blast-radius test (D1).** `delete` used to be applied to a `repeat`
+/// loop's reference, which UTM followed back to the whole collection: one
+/// `wargame profile delete` on a throwaway profile deleted **every** virtual
+/// machine on the host, on disk, and reported success
+/// (task-7-b2b-report.md D1).
+///
+/// No fake can see that -- the fakes model `delete` as removing one map
+/// entry -- so this is the test that has to run against real UTM. It makes
+/// three empty throwaway VMs, deletes the **middle** one through the
+/// project's own `VmProvider::delete`, and requires the registry afterwards
+/// to differ by exactly that one VM. Every other VM UTM knows, including the
+/// user's, is compared by UUID.
+///
+/// The three are tiny (a blank 1 GiB sparse disk, no ISO, never started) and
+/// are deleted again whatever happens.
+#[tokio::test]
+#[ignore]
+async fn utm_delete_removes_exactly_one_vm() {
+    let Some((provider, cfg)) = utm_only("utm_delete_removes_exactly_one_vm") else {
+        return;
+    };
+    let automation = provider.automation();
+
+    let before: Vec<String> = automation
+        .list()
+        .await
+        .expect("utmctl list")
+        .into_iter()
+        .map(|vm| vm.id)
+        .collect();
+
+    let mut made: Vec<VmRef> = Vec::new();
+    for n in 1..=3 {
+        let name = format!("{}e2e-del-{}-{n}", cfg.build_prefix, std::process::id());
+        match automation
+            .make_vm(&wargame_utm::MakeVmParams {
+                name: &name,
+                architecture: "aarch64",
+                memory_mib: 512,
+                cpu_cores: 1,
+                hypervisor: true,
+                uefi: true,
+                disk_mib: 1024,
+                iso: None,
+            })
+            .await
+        {
+            Ok((id, name)) => made.push(VmRef {
+                backend: "utm".to_string(),
+                id,
+                name,
+            }),
+            Err(e) => {
+                for vm in &made {
+                    let _ = provider.delete(vm).await;
+                }
+                panic!("could not create the throwaway VM {name}: {e}");
+            }
+        }
+    }
+    let target = made[1].clone();
+    eprintln!(
+        "made {:?}; deleting the middle one: {} ({})",
+        made.iter().map(|vm| vm.name.as_str()).collect::<Vec<_>>(),
+        target.name,
+        target.id
+    );
+
+    let deleted = provider.delete(&target).await;
+
+    let after: Vec<String> = automation
+        .list()
+        .await
+        .expect("utmctl list after the delete")
+        .into_iter()
+        .map(|vm| vm.id)
+        .collect();
+
+    // Clean up the survivors before asserting anything, so a failure here
+    // never leaves VMs behind either.
+    for vm in &made {
+        if vm.id != target.id {
+            if let Err(e) = provider.delete(vm).await {
+                eprintln!(
+                    "warning: could not delete the throwaway VM {}: {e}",
+                    vm.name
+                );
+            }
+        }
+    }
+
+    deleted.expect("delete failed");
+    let gone: Vec<&String> = before
+        .iter()
+        .chain(made.iter().map(|vm| &vm.id))
+        .filter(|id| !after.contains(id))
+        .collect();
+    assert_eq!(
+        gone,
+        vec![&target.id],
+        "delete must remove exactly the VM it was given, and nothing else"
+    );
+}
+
 /// FR-5: "앱 기록의 UUID와 소유권을 대조한다. 이름 prefix만으로 외부 VM을
 /// 삭제하지 않는다." A UUID this app never created is `Missing`, and asking to
 /// delete it removes nothing at all.

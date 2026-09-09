@@ -30,7 +30,7 @@ pub struct ProfileChoice {
     pub guest: String,
     /// `"utm/emulate"`.
     pub backend: String,
-    /// `"ready"`, `"rebuild needed"`, `"not built"`, ...
+    /// `"ready"`, `"rebuild needed"`, `"missing"`, `"not built"`, ...
     pub image: String,
 }
 

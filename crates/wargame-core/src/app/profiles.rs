@@ -163,17 +163,32 @@ fn declared_name(yaml: &str) -> Option<String> {
 /// backend still has it, and nothing has changed since".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageReadiness {
-    /// `"ready"`, `"rebuild needed"`, `"not built"`, `"not created"`, or the
-    /// phase a half-finished build stopped at -- the word a table shows.
+    /// `"ready"`, `"rebuild needed"`, `"missing"`, `"not built"`,
+    /// `"not created"`, or the phase a half-finished build stopped at -- the
+    /// word a table shows.
+    ///
+    /// `"missing"` is the one that means something is wrong rather than
+    /// undone: a build finished here and published an image, and the backend
+    /// does not have it any more -- deleted in UTM or Tart behind wargame's
+    /// back. It reads `ready` no longer (task-7-b2b-report.md D7).
     pub state: String,
     /// The longer line `doctor` shows: the image, or why there is none.
     pub detail: String,
     /// There is an image, the backend still has it, and neither the profile
     /// nor its scripts changed since it was built.
     pub ready: bool,
-    /// Nothing is published for this profile, so `profile create` comes
-    /// before `profile build`.
+    /// Nothing has been set up for this profile at all -- no build record,
+    /// so `profile create` is genuinely the next command.
+    ///
+    /// **Not** the same as "there is no image": a profile whose
+    /// installation VM exists and whose OS install is unfinished has no
+    /// image either, and `profile create` would refuse it with a source
+    /// conflict (task-7-b2b-report.md D9). [`ImageReadiness::installer_vm`]
+    /// is what that case has instead.
     pub needs_create: bool,
+    /// The installation VM this profile already owns, `<name> (<id>)`, when
+    /// `profile create` has run and there is still an OS to install in it.
+    pub installer_vm: Option<String>,
     /// Nothing has been built for this profile in this home yet, and no
     /// build failed trying: there is no build record at all, or one that
     /// has not got past the manual OS install. It means "you have not set
@@ -306,15 +321,26 @@ async fn image_readiness(
         status.phase,
         None | Some(BuildPhase::Created) | Some(BuildPhase::AwaitingInstall)
     );
+    let installer_vm = status
+        .installer_vm
+        .as_ref()
+        .map(|vm| format!("{} ({})", vm.name, vm.id));
     let Some(image) = &status.image else {
         return Ok(ImageReadiness {
             state: status
                 .phase
+                .as_ref()
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_else(|| "not created".to_string()),
-            detail: status.detail,
+            detail: match &installer_vm {
+                Some(vm) => format!("{} -- installation VM {vm}", status.detail),
+                None => status.detail,
+            },
             ready: false,
-            needs_create: true,
+            // Only a profile with no build record at all: `profile create`
+            // refuses one that already has an installation VM.
+            needs_create: status.phase.is_none(),
+            installer_vm,
             never_built,
         });
     };
@@ -325,6 +351,9 @@ async fn image_readiness(
     };
     Ok(ImageReadiness {
         state: match (exists, status.rebuild_needed) {
+            // Built here and gone from the backend since: not something the
+            // user has yet to do, something that has to be rebuilt.
+            (false, _) if !never_built => "missing",
             (false, _) => "not built",
             (true, true) => "rebuild needed",
             (true, false) => "ready",
@@ -332,11 +361,17 @@ async fn image_readiness(
         .to_string(),
         detail: if exists {
             status.detail
-        } else {
+        } else if never_built {
             format!("{} is not ready", status.detail)
+        } else {
+            format!(
+                "{} -- the {} backend no longer has it",
+                status.detail, status.backend
+            )
         },
         ready: exists && !status.rebuild_needed,
         needs_create: false,
+        installer_vm,
         // A Tart profile always has an image *name*, so "not built" here
         // can equally mean "never built" or "built and then deleted"; the
         // build record is what tells them apart.

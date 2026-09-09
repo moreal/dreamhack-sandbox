@@ -379,20 +379,41 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
     // 5. Is there an image to launch from?
     checks.push(profile_image_check(ctx, &profile).await);
 
-    // 6. Room for this profile's disk, not the flat 20 GiB floor.
-    checks.push(match crate::infra::disk_free_bytes(&ctx.dirs.root) {
-        Ok(free) => {
-            let free_gib = free as f64 / (1024.0 * 1024.0 * 1024.0);
-            let needed = profile.resources.disk_gib as f64;
+    // 6. Room for this profile's guest, judged exactly the way `profile
+    //    create` judges it -- same volume, same floor, same reasoning
+    //    (task-7-b2b-report.md D6). Before this, `doctor` measured
+    //    `$WARGAME_HOME` against the profile's *nominal* disk and reported a
+    //    hard failure for a profile `profile create` accepts with a warning,
+    //    with the "lower resources.disk_gib" advice that fix deliberately
+    //    removed.
+    checks.push(match crate::app::profile_build::free_space_for(ctx, vm.as_ref()) {
+        Ok((storage, free)) => {
+            let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            let free_gib = gib(free);
+            let nominal = profile.resources.disk_gib;
+            let floor = crate::app::profile_build::MIN_FREE_GIB;
+            let enough = free_gib >= floor as f64;
             Check {
                 name: format!("disk-space:{name}"),
-                status: CheckStatus::from_ok(free_gib >= needed),
-                detail: format!(
-                    "{free_gib:.1} GiB free at {}, profile asks for {needed:.0} GiB",
-                    ctx.dirs.root.display()
-                ),
-                hint: (free_gib < needed).then(|| {
-                    "Free up disk space, or lower resources.disk_gib in the profile".to_string()
+                status: CheckStatus::from_ok(enough),
+                detail: if !enough {
+                    format!(
+                        "{free_gib:.1} GiB free on the volume that holds {}, and an OS install needs at least {floor} GiB there",
+                        storage.display()
+                    )
+                } else if free_gib < nominal as f64 {
+                    format!(
+                        "{free_gib:.1} GiB free on the volume that holds {}, less than this profile's {nominal} GiB disk -- allowed, because a guest disk is sparse and grows as it is used, but the guest fails once the volume fills",
+                        storage.display()
+                    )
+                } else {
+                    format!(
+                        "{free_gib:.1} GiB free on the volume that holds {}, for a {nominal} GiB guest disk",
+                        storage.display()
+                    )
+                },
+                hint: (!enough).then(|| {
+                    "Free space on that volume. A guest disk grows as it is used, so lowering resources.disk_gib will not help until it has room.".to_string()
                 }),
             }
         }
@@ -465,12 +486,17 @@ async fn profile_image_check(ctx: &AppContext, profile: &Profile) -> Check {
             overview.backend_label(),
             image.detail
         ),
-        (!image.ready).then(|| {
-            if image.needs_create {
-                format!("wargame profile create {name} --iso <path>   # then: wargame profile build {name}")
-            } else {
-                format!("wargame profile build {name}")
-            }
+        (!image.ready).then(|| match (&image.installer_vm, image.needs_create) {
+            // D9: this profile *has* its installation VM and the OS in it is
+            // not finished. `profile create` would refuse with a source
+            // conflict, so it is the one command not to suggest.
+            (Some(vm), _) if image.never_built => format!(
+                "wargame profile console {name}   # finish installing the OS in {vm}, then: wargame profile build {name}"
+            ),
+            (_, true) => format!(
+                "wargame profile create {name} --iso <path>   # then: wargame profile build {name}"
+            ),
+            _ => format!("wargame profile build {name}"),
         }),
     )
 }
@@ -658,6 +684,99 @@ mod tests {
         );
     }
 
+    /// **D6.** `profile create` and `doctor --profile` have to agree.
+    /// `doctor` measured `$WARGAME_HOME` against the profile's *nominal*
+    /// disk, so it reported a hard failure for a profile `profile create`
+    /// accepts with a warning -- and repeated the "lower resources.disk_gib"
+    /// advice that fix removed (task-7-b2b-report.md D6).
+    #[tokio::test]
+    async fn the_profile_disk_check_measures_the_backends_volume_against_the_same_floor() {
+        let profile = utm_profile(); // asks for 80 GiB
+        let vm = Arc::new(FakeVmProvider::with_backend("utm"));
+        vm.set_storage_dir("/Users/x/Library/Containers/com.utmapp.UTM/Data/Documents");
+        let mut ctx = fixture_with_vm(vm);
+        ctx.profiles = ProfileStore::new(vec![profile.clone()], tmp_path());
+
+        // Less than the profile's disk, more than the floor: allowed, and
+        // said so -- exactly what `profile create` does.
+        ctx.disk = Arc::new(FixedDisk(20 * 1024 * 1024 * 1024));
+        let row = doctor_profile(&ctx, "kali-x86_64")
+            .await
+            .into_iter()
+            .find(|c| c.name == "disk-space:kali-x86_64")
+            .expect("a per-profile disk row");
+        assert_eq!(row.status, CheckStatus::Pass, "{row:?}");
+        assert!(row.detail.contains("com.utmapp.UTM"), "{row:?}");
+        assert!(row.hint.is_none(), "{row:?}");
+
+        // Below the floor an install cannot work at all.
+        ctx.disk = Arc::new(FixedDisk(4 * 1024 * 1024 * 1024));
+        let row = doctor_profile(&ctx, "kali-x86_64")
+            .await
+            .into_iter()
+            .find(|c| c.name == "disk-space:kali-x86_64")
+            .expect("a per-profile disk row");
+        assert_eq!(row.status, CheckStatus::Fail, "{row:?}");
+        assert!(row.detail.contains("at least 8 GiB"), "{row:?}");
+        // The advice B2a removed must not come back.
+        assert!(
+            !row.hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("lower resources.disk_gib in the profile"),
+            "{row:?}"
+        );
+    }
+
+    /// **D9.** A profile whose installation VM exists and whose OS install
+    /// is unfinished was told to run `wargame profile create`, the one
+    /// command that refuses it (task-7-b2b-report.md D9).
+    #[tokio::test]
+    async fn an_unfinished_install_points_at_the_console_not_at_profile_create() {
+        use crate::domain::{BuildPhase, BuildRecord, BuildSource, VmRef};
+
+        let profile = utm_profile();
+        let mut ctx = fixture_with_vm(Arc::new(FakeVmProvider::with_backend("utm")));
+        ctx.profiles = ProfileStore::new(vec![profile.clone()], tmp_path());
+
+        let mut record = BuildRecord::new(
+            &profile,
+            "utm",
+            BuildSource::Iso {
+                path: "/tmp/kali.iso".into(),
+                sha256: None,
+                verified_sha256: false,
+            },
+        );
+        record.installer_vm = Some(VmRef {
+            backend: "utm".to_string(),
+            id: "6F78EF1A-5B93-4AFF-AAA1-775BE6C666BC".to_string(),
+            name: "wg-build-kali-x86_64".to_string(),
+        });
+        record.set_phase(BuildPhase::AwaitingInstall);
+        ctx.builds.save(&record).await.unwrap();
+
+        let row = doctor_profile(&ctx, "kali-x86_64")
+            .await
+            .into_iter()
+            .find(|c| c.name == "profile-image:kali-x86_64")
+            .expect("an image row");
+        // Still "not set up", not a broken host.
+        assert_eq!(row.status, CheckStatus::NotSetUp, "{row:?}");
+        let hint = row.hint.clone().unwrap_or_default();
+        assert!(!hint.contains("profile create"), "{hint}");
+        assert!(
+            hint.contains("wargame profile console kali-x86_64"),
+            "{hint}"
+        );
+        assert!(hint.contains("wg-build-kali-x86_64"), "{hint}");
+        assert!(
+            hint.contains("6F78EF1A-5B93-4AFF-AAA1-775BE6C666BC"),
+            "{hint}"
+        );
+        assert!(hint.contains("wargame profile build kali-x86_64"), "{hint}");
+    }
+
     /// ...but a build that *was* started and whose image is not there is a
     /// real problem, and stays one. Nothing is hidden.
     #[tokio::test]
@@ -691,6 +810,16 @@ mod tests {
             .find(|c| c.name == "profile-image:kali-x86_64")
             .unwrap();
         assert_eq!(row.status, CheckStatus::Fail, "{row:?}");
+        // D7: and it says the backend no longer has it, with the one
+        // command that fixes it -- never `profile create`, which would
+        // refuse.
+        assert!(row.detail.contains("no longer has it"), "{row:?}");
+        assert_eq!(
+            row.hint.as_deref(),
+            Some("wargame profile build kali-x86_64")
+        );
+        let overview = crate::app::profiles::overview(&ctx, &profile).await;
+        assert_eq!(overview.image_state(), Some("missing"));
     }
 
     /// Two wired backends must not collapse into one `network:isolated`
@@ -727,6 +856,16 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "duplicate rows in {names:?}");
+    }
+
+    /// A volume with a fixed amount of room, so a disk check's verdict is
+    /// the test's to choose.
+    struct FixedDisk(u64);
+
+    impl crate::ports::DiskSpace for FixedDisk {
+        fn free_bytes(&self, _path: &std::path::Path) -> crate::error::Result<u64> {
+            Ok(self.0)
+        }
     }
 
     fn utm_profile() -> crate::domain::Profile {

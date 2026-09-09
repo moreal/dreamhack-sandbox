@@ -38,6 +38,9 @@ pub struct FakeVmProvider {
     isolated_network: Mutex<Option<bool>>,
     orphan_on_stop: Mutex<Option<u32>>,
     storage_dir: Mutex<Option<PathBuf>>,
+    /// Whether this backend can reveal a running VM's window without
+    /// restarting it (UTM can; Tart's headless run has no window).
+    shows_console: Mutex<bool>,
 }
 
 impl FakeVmProvider {
@@ -73,6 +76,7 @@ impl FakeVmProvider {
             isolated_network: Mutex::new(None),
             orphan_on_stop: Mutex::new(None),
             storage_dir: Mutex::new(None),
+            shows_console: Mutex::new(false),
         }
     }
 
@@ -126,6 +130,12 @@ impl FakeVmProvider {
 
     /// Where this backend claims it stores VM disks, so a free-space check
     /// can be seen measuring the right volume.
+    /// Makes this fake behave like UTM: a running VM's window is already
+    /// open, so `show_console` reveals it and the guest is never restarted.
+    pub fn set_shows_console(&self, shows: bool) {
+        *self.shows_console.lock().unwrap() = shows;
+    }
+
     pub fn set_storage_dir(&self, dir: impl Into<PathBuf>) {
         *self.storage_dir.lock().unwrap() = Some(dir.into());
     }
@@ -304,6 +314,11 @@ impl VmProvider for FakeVmProvider {
 
     fn storage_dir(&self) -> Option<PathBuf> {
         self.storage_dir.lock().unwrap().clone()
+    }
+
+    async fn show_console(&self, vm: &VmRef) -> Result<bool> {
+        self.record(&format!("show_console:{}", vm.name));
+        Ok(*self.shows_console.lock().unwrap())
     }
 
     fn console(&self, vm: &VmRef) -> ConsoleDescriptor {

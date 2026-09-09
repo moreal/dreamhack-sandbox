@@ -1077,13 +1077,8 @@ async fn the_provider_reports_a_published_image_as_existing() {
     record.set_phase(BuildPhase::Ready);
     builds.save(&record).await.unwrap();
 
-    let provider = UtmProvider::new(
-        Arc::new(FakeRunner::new()) as Arc<dyn ProcessRunner>,
-        UtmConfig::default(),
-    )
-    .with_image_catalog(Arc::new(RecordImageCatalog::new(
-        builds as Arc<dyn BuildRecordRepository>,
-    )));
+    let registry = Registry::with(&[(IMAGE_ID, "stopped", "wg-build-image-kali-custom")]);
+    let provider = catalog_provider(&registry, builds.clone());
 
     assert!(provider
         .image_exists(&ImageRef(IMAGE_ID.to_string()))
@@ -1093,6 +1088,54 @@ async fn the_provider_reports_a_published_image_as_existing() {
         .image_exists(&ImageRef("NOT-BUILT".to_string()))
         .await
         .unwrap());
+}
+
+/// **D7.** The build record naming an image is not the same as UTM having
+/// it. After the images were deleted in UTM, `profiles` and `doctor` both
+/// still said `ready` and `launch` accepted it (task-7-b2b-report.md D7;
+/// spec.md §6's "외부에서 VM 삭제 → missing 반영"). Tart asks its backend;
+/// UTM asks its own now.
+#[tokio::test]
+async fn an_image_the_record_names_but_utm_no_longer_has_is_not_ready() {
+    let builds = Arc::new(MemoryBuildRepo::new());
+    let profile = kali_profile();
+    let mut record = record_with_installer(&profile);
+    record.image = Some(PublishedImage::new(IMAGE_ID, "wg-build-image-kali-custom"));
+    record.set_phase(BuildPhase::Ready);
+    builds.save(&record).await.unwrap();
+
+    // Everything the record says is still true; UTM simply does not have
+    // the VM any more.
+    let registry = Registry::with(&[(INSTALLER_ID, "stopped", "wg-build-kali-custom")]);
+    let provider = catalog_provider(&registry, builds.clone());
+
+    assert!(!provider
+        .image_exists(&ImageRef(IMAGE_ID.to_string()))
+        .await
+        .unwrap());
+}
+
+/// A `UtmProvider` whose `utmctl list` answers from `registry` and whose
+/// image catalog is `builds`.
+fn catalog_provider(registry: &Registry, builds: Arc<MemoryBuildRepo>) -> UtmProvider {
+    let reg = registry.clone();
+    let fake = Arc::new(FakeRunner::new());
+    fake.set_which("utmctl", PathBuf::from("/opt/homebrew/bin/utmctl"));
+    fake.set_responder(move |cmd: &Cmd| {
+        if cmd.program.ends_with("utmctl") {
+            return Ok(match cmd.args.first().map(String::as_str).unwrap_or("") {
+                "version" => ok("4.7.5\n"),
+                "list" => ok(&reg.table()),
+                _ => ok(""),
+            });
+        }
+        Ok(ok(""))
+    });
+    UtmProvider::new(fake as Arc<dyn ProcessRunner>, UtmConfig::default()).with_image_catalog(
+        Arc::new(RecordImageCatalog::new(
+            builds as Arc<dyn BuildRecordRepository>,
+        )),
+    )
 }
 
 #[tokio::test]
