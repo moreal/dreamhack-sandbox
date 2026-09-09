@@ -261,6 +261,13 @@ impl ProfileOverview {
     }
 
     /// The same, for a table cell that has to print something.
+    ///
+    /// `"unknown"` is the honest answer when the backend could not be asked
+    /// at all -- a denied Automation grant, a UTM that will not launch. It
+    /// is deliberately not `"missing"`: the image may be sitting there
+    /// untouched, and telling the user to rebuild it would be worse than
+    /// telling them nothing. [`ProfileOverview::image_error`] carries what
+    /// the backend actually said.
     pub fn image_label(&self) -> &str {
         self.image_state().unwrap_or("unknown")
     }
@@ -345,9 +352,35 @@ async fn image_readiness(
         });
     };
     // A name is not an image: ask the backend whether it is actually there.
-    let exists = match ctx.backends.get(status.backend.as_str()) {
-        Ok(vm) => vm.image_exists(image).await.unwrap_or(false),
+    //
+    // **"No" and "I cannot tell you" are different answers.** A denied
+    // Automation grant, or a UTM that will not launch, used to be swallowed
+    // into `false` -- which read as `missing` and told the user to rebuild
+    // an image that was sitting there untouched. An unreadable backend is
+    // reported as such instead: the state word becomes `unknown`, the
+    // detail carries what the backend said, and the hint sends the user to
+    // `doctor` rather than to a destructive rebuild.
+    let backend = match ctx.backends.get(status.backend.as_str()) {
+        Ok(vm) => vm,
         Err(e) => return Err((e.to_string(), e.hint())),
+    };
+    let exists = match backend.image_exists(image).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            let name = status.backend;
+            return Err((
+                format!(
+                    "could not ask the {name} backend whether {} is still there: {e}",
+                    status.detail
+                ),
+                Some(match e.hint() {
+                    Some(hint) => {
+                        format!("{hint}\nwargame doctor   # what the {name} backend reports")
+                    }
+                    None => format!("wargame doctor   # what the {name} backend reports"),
+                }),
+            ));
+        }
     };
     Ok(ImageReadiness {
         state: match (exists, status.rebuild_needed) {

@@ -684,6 +684,73 @@ mod tests {
         );
     }
 
+    /// A backend that **cannot answer** is not a backend that said "no".
+    /// `image_exists` returning `Err` (a denied Automation grant, a UTM that
+    /// will not launch) used to be folded into `false`, which read as
+    /// `missing` and told the user to rebuild an image that was sitting
+    /// there untouched. Both branches are pinned here.
+    #[tokio::test]
+    async fn a_backend_that_cannot_answer_reads_unknown_and_never_missing() {
+        use crate::domain::{BuildPhase, BuildRecord, BuildSource, PublishedImage};
+
+        let profile = utm_profile();
+        let vm = Arc::new(FakeVmProvider::with_backend("utm"));
+        let mut ctx = fixture_with_vm(vm.clone());
+        ctx.profiles = ProfileStore::new(vec![profile.clone()], tmp_path());
+
+        let mut record = BuildRecord::new(
+            &profile,
+            "utm",
+            BuildSource::Iso {
+                path: "/tmp/kali.iso".into(),
+                sha256: None,
+                verified_sha256: false,
+            },
+        );
+        record.image = Some(PublishedImage::new("uuid-1", "wg-build-kali"));
+        record.set_phase(BuildPhase::Ready);
+        ctx.builds.save(&record).await.unwrap();
+
+        // 1. The backend answers, and says no: that really is `missing`.
+        let overview = crate::app::profiles::overview(&ctx, &profile).await;
+        assert_eq!(overview.image_state(), Some("missing"));
+
+        // 2. The backend cannot answer at all.
+        vm.set_fail_on("image_exists");
+        let overview = crate::app::profiles::overview(&ctx, &profile).await;
+        assert_eq!(
+            overview.image_state(),
+            None,
+            "an unreadable backend must not produce a state word of its own"
+        );
+        assert_eq!(overview.image_label(), "unknown");
+        let (detail, hint) = overview.image_error().expect("the backend's own error");
+        assert!(detail.contains("could not ask the utm backend"), "{detail}");
+        assert!(detail.contains("wg-build-kali"), "{detail}");
+        assert!(!detail.contains("no longer has it"), "{detail}");
+        let hint = hint.unwrap_or_default();
+        assert!(hint.contains("wargame doctor"), "{hint}");
+        assert!(!hint.contains("profile build"), "{hint}");
+
+        let row = doctor_profile(&ctx, "kali-x86_64")
+            .await
+            .into_iter()
+            .find(|c| c.name == "profile-image:kali-x86_64")
+            .expect("an image row");
+        assert_eq!(row.status, CheckStatus::Fail, "{row:?}");
+        assert!(
+            row.detail.contains("could not ask the utm backend"),
+            "{row:?}"
+        );
+        assert!(
+            row.hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("wargame doctor"),
+            "{row:?}"
+        );
+    }
+
     /// **D6.** `profile create` and `doctor --profile` have to agree.
     /// `doctor` measured `$WARGAME_HOME` against the profile's *nominal*
     /// disk, so it reported a hard failure for a profile `profile create`

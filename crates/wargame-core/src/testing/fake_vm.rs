@@ -128,14 +128,14 @@ impl FakeVmProvider {
         *self.orphan_on_stop.lock().unwrap() = Some(pid);
     }
 
-    /// Where this backend claims it stores VM disks, so a free-space check
-    /// can be seen measuring the right volume.
     /// Makes this fake behave like UTM: a running VM's window is already
     /// open, so `show_console` reveals it and the guest is never restarted.
     pub fn set_shows_console(&self, shows: bool) {
         *self.shows_console.lock().unwrap() = shows;
     }
 
+    /// Where this backend claims it stores VM disks, so a free-space check
+    /// can be seen measuring the right volume.
     pub fn set_storage_dir(&self, dir: impl Into<PathBuf>) {
         *self.storage_dir.lock().unwrap() = Some(dir.into());
     }
@@ -195,6 +195,14 @@ impl VmProvider for FakeVmProvider {
 
     async fn image_exists(&self, image: &ImageRef) -> Result<bool> {
         self.record("image_exists");
+        if self.should_fail("image_exists") {
+            // What a denied Automation grant looks like from here: the
+            // backend cannot answer, which is not the same as "no".
+            return Err(crate::error::WargameError::AutomationDenied {
+                app: "UTM".to_string(),
+                detail: "fake image_exists failure".to_string(),
+            });
+        }
         Ok(self.images.lock().unwrap().iter().any(|i| i == &image.0))
     }
 

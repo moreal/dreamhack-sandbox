@@ -193,7 +193,7 @@ pub struct MakeVmParams<'a> {
 // which is where `POSIX file` has to be evaluated (T5: inside the block UTM
 // resolves the path in its own sandbox and fails with -1728).
 //
-// **The loop variable is only ever read, never acted on.**
+// **The loop variable is not used at all except by the match itself.**
 // `repeat with vm in (virtual machines)` binds `vm` to a reference *into*
 // the collection. UTM applies `delete` to the whole collection through it:
 // one `delete vm` deleted every virtual machine on the host and still
@@ -202,7 +202,15 @@ pub struct MakeVmParams<'a> {
 // that produces the not-found sentinel and nothing more; every verb and
 // every `update configuration` addresses
 // `(first virtual machine whose id is vmId)` -- the single-object specifier
-// Task 3 verified -- which can only ever name one VM.
+// Task 3 verified -- which can only ever name one VM. The configuration
+// *reads* that feed those writes use it too, so a body never mixes the two
+// ways of naming the same machine; the form is the one the B2c live checks
+// ran (`configuration of (first virtual machine whose id is vmId)`).
+//
+// The one exception is [`STATUS_BODY`], which reads two properties off the
+// loop variable and acts on nothing. That is the same read the match itself
+// performs (`id of vm`), it is what every real run has exercised, and there
+// is no verb for a collection reference to swallow.
 
 const STATUS_BODY: &str = r#"return (status of vm as text) & tab & (backend of vm as text)"#;
 
@@ -244,7 +252,7 @@ const HARDWARE_PROLOGUE: &str = r#"set memMib to (item 2 of argv) as integer
 // the profile resolved to. UTM will silently ignore `true` on a
 // mismatched architecture (T6), which is why the caller refuses that
 // combination before ever getting here.
-const HARDWARE_BODY: &str = r#"set c to configuration of vm
+const HARDWARE_BODY: &str = r#"set c to configuration of (first virtual machine whose id is vmId)
 				set memory of c to memMib
 				set cpu cores of c to cores
 				set hypervisor of c to hyp
@@ -255,7 +263,7 @@ const NETWORK_PROLOGUE: &str = r#"set netMode to item 2 of argv"#;
 // Only `host` (our `isolated`) and `shared` (our `nat`) are reachable:
 // `emulated` is libslirp, which is not isolated, and `bridged` puts the
 // guest on the LAN (§5).
-const NETWORK_BODY: &str = r#"set c to configuration of vm
+const NETWORK_BODY: &str = r#"set c to configuration of (first virtual machine whose id is vmId)
 				set n to index of item 1 of network interfaces of c
 				if netMode is "host" then
 					set item 1 of network interfaces of c to {index:n, mode:host}
@@ -279,7 +287,7 @@ const MAC_PROLOGUE: &str = r#"set macAddr to item 2 of argv"#;
 // The index is read back rather than assumed: the sdef says it "is invalid
 // after updating the configuration and must be reset to the current
 // position", and UTM's first interface answers 0, not 1.
-const MAC_BODY: &str = r#"set c to configuration of vm
+const MAC_BODY: &str = r#"set c to configuration of (first virtual machine whose id is vmId)
 				set n to index of item 1 of network interfaces of c
 				set item 1 of network interfaces of c to {index:n, address:macAddr}
 				update configuration of (first virtual machine whose id is vmId) with c
@@ -289,13 +297,13 @@ const DISPLAY_PROLOGUE: &str = r#"set hw to item 2 of argv"#;
 // A VM made by `make` has no display at all, and then the only console is
 // the serial ptty (§3). An unknown hardware name is silently replaced by
 // the default (T11), so the caller validates the name.
-const DISPLAY_BODY: &str = r#"set c to configuration of vm
+const DISPLAY_BODY: &str = r#"set c to configuration of (first virtual machine whose id is vmId)
 				set displays of c to {{hardware:hw}}
 				update configuration of (first virtual machine whose id is vmId) with c
 				return "ok""#;
 
 const ATTACH_ISO_PROLOGUE: &str = r#"set isoFile to POSIX file (item 2 of argv)"#;
-const ATTACH_ISO_BODY: &str = r#"set c to configuration of vm
+const ATTACH_ISO_BODY: &str = r#"set c to configuration of (first virtual machine whose id is vmId)
 				set drives of c to (drives of c) & {{removable:true, source:isoFile}}
 				update configuration of (first virtual machine whose id is vmId) with c
 				return "ok""#;
@@ -303,7 +311,7 @@ const ATTACH_ISO_BODY: &str = r#"set c to configuration of vm
 // Replacing an ISO must echo the drive's own id back, or UTM adds a drive
 // instead of replacing one (§2).
 const REPLACE_ISO_PROLOGUE: &str = r#"set isoFile to POSIX file (item 2 of argv)"#;
-const REPLACE_ISO_BODY: &str = r#"set c to configuration of vm
+const REPLACE_ISO_BODY: &str = r#"set c to configuration of (first virtual machine whose id is vmId)
 				set i to id of item 1 of drives of c
 				set item 1 of drives of c to {id:i, source:isoFile}
 				update configuration of (first virtual machine whose id is vmId) with c
@@ -342,7 +350,7 @@ pub const NO_SURVIVING_DRIVE: &str = "wargame-utm:no-surviving-drive";
 // survivors are counted in the loop rather than with `count of`, which UTM
 // answers 0 for (T5) -- `kept` is a plain list and would count correctly,
 // but counting as we go needs no such distinction.
-const EJECT_MEDIA_BODY: &str = r#"set c to configuration of vm
+const EJECT_MEDIA_BODY: &str = r#"set c to configuration of (first virtual machine whose id is vmId)
 				set kept to {}
 				set gone to 0
 				set keptCount to 0
@@ -1217,34 +1225,137 @@ mod tests {
         );
     }
 
-    /// Every AppleScript this crate can run, so an audit is exhaustive by
-    /// construction rather than by memory: a new `*_BODY` that is not listed
-    /// here fails [`every_script_is_audited`].
-    fn every_script() -> Vec<(&'static str, String)> {
+    /// This file's own source. The audit below reads it so "every script"
+    /// means every script that exists, not every script somebody remembered
+    /// to add to a list.
+    const SOURCE: &str = include_str!("automation.rs");
+
+    /// Every AppleScript this crate can run, as
+    /// `(audit name, the constant that supplies it, the rendered script)`.
+    ///
+    /// The constant's name is carried so [`every_script_is_audited`] can
+    /// prove this list is complete against [`SOURCE`]; a new template that
+    /// is not added here fails that test rather than silently escaping both
+    /// audits.
+    fn every_script() -> Vec<(&'static str, &'static str, String)> {
         vec![
-            ("status", vm_script("", STATUS_BODY)),
-            ("start", vm_script("", START_BODY)),
-            ("stop", vm_script(STOP_PROLOGUE, STOP_BODY)),
-            ("delete", vm_script("", DELETE_BODY)),
-            ("duplicate", vm_script(DUPLICATE_PROLOGUE, DUPLICATE_BODY)),
-            ("hardware", vm_script(HARDWARE_PROLOGUE, HARDWARE_BODY)),
-            ("network", vm_script(NETWORK_PROLOGUE, NETWORK_BODY)),
-            ("mac", vm_script(MAC_PROLOGUE, MAC_BODY)),
-            ("display", vm_script(DISPLAY_PROLOGUE, DISPLAY_BODY)),
+            ("status", "STATUS_BODY", vm_script("", STATUS_BODY)),
+            ("start", "START_BODY", vm_script("", START_BODY)),
+            ("stop", "STOP_BODY", vm_script(STOP_PROLOGUE, STOP_BODY)),
+            ("delete", "DELETE_BODY", vm_script("", DELETE_BODY)),
+            (
+                "duplicate",
+                "DUPLICATE_BODY",
+                vm_script(DUPLICATE_PROLOGUE, DUPLICATE_BODY),
+            ),
+            (
+                "hardware",
+                "HARDWARE_BODY",
+                vm_script(HARDWARE_PROLOGUE, HARDWARE_BODY),
+            ),
+            (
+                "network",
+                "NETWORK_BODY",
+                vm_script(NETWORK_PROLOGUE, NETWORK_BODY),
+            ),
+            ("mac", "MAC_BODY", vm_script(MAC_PROLOGUE, MAC_BODY)),
+            (
+                "display",
+                "DISPLAY_BODY",
+                vm_script(DISPLAY_PROLOGUE, DISPLAY_BODY),
+            ),
             (
                 "attach-iso",
+                "ATTACH_ISO_BODY",
                 vm_script(ATTACH_ISO_PROLOGUE, ATTACH_ISO_BODY),
             ),
             (
                 "replace-iso",
+                "REPLACE_ISO_BODY",
                 vm_script(REPLACE_ISO_PROLOGUE, REPLACE_ISO_BODY),
             ),
-            ("eject", vm_script("", EJECT_MEDIA_BODY)),
-            ("make-with-iso", MAKE_WITH_ISO.to_string()),
-            ("make-without-iso", MAKE_WITHOUT_ISO.to_string()),
-            ("app-version", APP_VERSION_SCRIPT.to_string()),
+            ("eject", "EJECT_MEDIA_BODY", vm_script("", EJECT_MEDIA_BODY)),
+            ("make-with-iso", "MAKE_WITH_ISO", MAKE_WITH_ISO.to_string()),
+            (
+                "make-without-iso",
+                "MAKE_WITHOUT_ISO",
+                MAKE_WITHOUT_ISO.to_string(),
+            ),
+            (
+                "app-version",
+                "APP_VERSION_SCRIPT",
+                APP_VERSION_SCRIPT.to_string(),
+            ),
         ]
     }
+
+    /// Every `&str` constant in this file that holds AppleScript, read out
+    /// of the source rather than remembered: the `*_BODY` templates, the two
+    /// `MAKE_*` scripts and `APP_VERSION_SCRIPT`. `*_PROLOGUE` constants are
+    /// not scripts on their own -- each is rendered into a body's script by
+    /// [`vm_script`], and reaches the audit that way.
+    fn declared_scripts() -> Vec<String> {
+        SOURCE
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("const "))
+            .filter_map(|rest| rest.split(':').next())
+            .map(str::trim)
+            .filter(|name| {
+                name.ends_with("_BODY") || name.ends_with("_SCRIPT") || name.starts_with("MAKE_")
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// [`every_script`] covers **every** script constant this file declares.
+    ///
+    /// Without this the two audits below are only as good as the list, and a
+    /// new template -- the next `suspend`, the next `export` -- would be
+    /// exempt from the rule that cost this host its whole UTM library.
+    #[test]
+    fn every_script_is_audited() {
+        let audited: Vec<&str> = every_script().iter().map(|(_, c, _)| *c).collect();
+        let declared = declared_scripts();
+        assert!(
+            declared.len() >= 15,
+            "the source scan found only {declared:?}; it is not reading this file"
+        );
+        for name in &declared {
+            assert!(
+                audited.contains(&name.as_str()),
+                "{name} is an AppleScript template that `every_script()` does not list, so                  nothing checks it for the D1 loop-reference defect. Add it."
+            );
+        }
+    }
+
+    /// Whether `script` applies `verb` to the `repeat` loop's variable.
+    ///
+    /// Tokenised rather than matched as a substring, so `delete  vm` (two
+    /// spaces), `delete\tvm` and `delete (vm)` are caught as readily as
+    /// `delete vm`.
+    fn applies_to_loop_variable(script: &str, verb: &str) -> bool {
+        let tokens: Vec<&str> = script.split_whitespace().collect();
+        tokens
+            .windows(2)
+            .any(|pair| pair[0] == verb && pair[1].trim_matches(|c| c == '(' || c == ')') == "vm")
+            || script.contains(&format!("{verb} (contents of vm)"))
+    }
+
+    /// Every verb that could ever be handed a VM. Wider than the dictionary
+    /// on purpose: `suspend`/`resume` have no adapter body yet, `export` and
+    /// `import` are the two verbs a later task is most likely to add, and a
+    /// verb that does not appear cannot be applied wrongly either.
+    const VM_VERBS: [&str; 9] = [
+        "start",
+        "stop",
+        "suspend",
+        "resume",
+        "delete",
+        "duplicate",
+        "export",
+        "import",
+        "share",
+    ];
 
     /// **D1, the data-loss defect.** `repeat with vm in (virtual machines)`
     /// binds `vm` to a reference *into* the collection, and UTM applies
@@ -1260,20 +1371,43 @@ mod tests {
     /// no fake `osascript` can reproduce what UTM does with a collection.
     #[test]
     fn no_script_applies_a_verb_to_the_loop_reference() {
-        for (name, script) in every_script() {
-            for verb in ["start", "stop", "suspend", "delete", "duplicate"] {
-                for tail in [" vm\n", " vm ", " vm\t", " vm\r"] {
-                    let needle = format!("{verb}{tail}");
-                    assert!(
-                        !script.contains(&needle),
-                        "the {name} script applies `{verb}` to the loop reference: {script}"
-                    );
-                }
+        for (name, _, script) in every_script() {
+            for verb in VM_VERBS {
+                assert!(
+                    !applies_to_loop_variable(&script, verb),
+                    "the {name} script applies `{verb}` to the loop reference: {script}"
+                );
             }
+            // The same rule for the configuration write, whitespace and all.
+            let tokens: Vec<&str> = script.split_whitespace().collect();
             assert!(
-                !script.contains("update configuration of vm"),
+                !tokens
+                    .windows(4)
+                    .any(|w| w == ["update", "configuration", "of", "vm"]),
                 "the {name} script writes a configuration through the loop reference: {script}"
             );
+        }
+    }
+
+    /// The tokeniser really does catch the shapes a substring match missed.
+    #[test]
+    fn the_loop_reference_audit_sees_odd_whitespace_and_parentheses() {
+        for bad in [
+            "delete vm\n",
+            "delete  vm\n",
+            "delete\tvm\n",
+            "delete (vm)\n",
+            "delete (contents of vm)\n",
+        ] {
+            assert!(applies_to_loop_variable(bad, "delete"), "{bad:?}");
+        }
+        for good in [
+            "delete (first virtual machine whose id is vmId)\n",
+            "if (id of vm) is vmId then\n",
+            "repeat with vm in (virtual machines)\n",
+            "return (status of vm as text)\n",
+        ] {
+            assert!(!applies_to_loop_variable(good, "delete"), "{good:?}");
         }
     }
 
@@ -1281,7 +1415,7 @@ mod tests {
     /// so through the by-id specifier Task 3 verified for `duplicate`.
     #[test]
     fn every_acting_script_addresses_the_vm_by_id() {
-        for (name, script) in every_script() {
+        for (name, _, script) in every_script() {
             if !script.contains("repeat with vm in (virtual machines)") {
                 continue;
             }

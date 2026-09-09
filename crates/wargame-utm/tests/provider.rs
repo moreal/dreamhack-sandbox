@@ -546,6 +546,45 @@ async fn create_gives_the_clone_a_fresh_locally_administered_mac() {
     );
 }
 
+/// A copy UTM registered and this app could not finish configuring is not
+/// a session's VM: it would come up on the source's network with the
+/// source's resources, and no record names it yet. It is deleted again --
+/// which is only safe now that `delete` addresses one machine by id.
+#[tokio::test]
+async fn a_clone_that_cannot_be_configured_is_deleted_again() {
+    let new_id = "11111111-2222-3333-4444-555555555555";
+    let before = LIST_MULTI.to_string();
+    let after = format!("{before}{new_id} stopped  wg-session-1\n");
+    let n = Arc::new(std::sync::Mutex::new(0usize));
+    let seen = n.clone();
+    let fake = runner(move |cmd| {
+        if utmctl_sub(cmd) == Some("list") {
+            let mut n = seen.lock().unwrap();
+            *n += 1;
+            return Some(ok(if *n == 1 { &before } else { &after }));
+        }
+        if is_osascript(cmd, "status of vm") {
+            return Some(ok("stopped\tqemu\n"));
+        }
+        // The session's hardware cannot be written.
+        is_osascript(cmd, "cpu cores").then(|| failure(1, ERR_MUST_BE_STOPPED))
+    });
+    let p = provider(fake.clone());
+
+    let err = p.create(&kali_x86_spec("wg-session-1")).await.unwrap_err();
+    assert!(err.to_string().contains("osascript"), "{err}");
+
+    let calls = fake.calls();
+    let delete = calls
+        .iter()
+        .find(|c| is_osascript(c, DELETE_SCRIPT))
+        .expect("the half-configured copy is deleted again");
+    assert_eq!(
+        delete.args[1], new_id,
+        "the copy is deleted, never the source"
+    );
+}
+
 /// The clone inherits the source's configuration, so the session's own
 /// execution mode is written explicitly: `emulate` must land as
 /// `hypervisor:false` even if the source VM was built virtualized.

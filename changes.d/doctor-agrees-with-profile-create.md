@@ -13,5 +13,11 @@
     whether the image is really there, so a UTM image you removed in UTM
     shows up before a launch fails on it.
 
+ -  When the backend cannot be asked at all — UTM has not been granted
+    permission to be automated, or will not start — the image reads
+    `unknown` rather than `missing`, and `wargame profiles` prints what the
+    backend said and points at `wargame doctor`. It no longer tells you to
+    rebuild an image that is sitting there untouched.
+
  -  When a launch fails, the next step offered is to look at what happened,
     not to delete the session. `wargame delete` is still there, second.

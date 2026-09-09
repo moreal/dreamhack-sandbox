@@ -326,21 +326,15 @@ impl ProfileImageBuilder for UtmImageBuilder {
         let name = self.image_vm_name(&req.profile.name);
         progress(format!("publishing {} -> {name}", vm.name));
 
-        // Whatever UTM registered is written down before this step does
-        // anything else with it, and before any error is raised: a
+        // The registrar is handed straight to the clone, which reports every
+        // VM UTM registered the moment the registry shows it -- before the
+        // copy's MAC is written and before any error is raised. A
         // `duplicate` that fails can still have registered a copy, and one
         // nothing knows about is one nothing will ever clean up (D5).
-        let mut created = Vec::new();
-        let copied = self
+        let image = self
             .utm
-            .clone_vm_reporting(&vm.id, &name, &mut created)
-            .await;
-        for vm in &created {
-            registrar
-                .image_created(&PublishedImage::new(vm.id.clone(), vm.name.clone()))
-                .await?;
-        }
-        let image = copied?;
+            .clone_vm_reporting(&vm.id, &name, registrar)
+            .await?;
         Ok(PublishedImage::new(image.id, image.name))
     }
 

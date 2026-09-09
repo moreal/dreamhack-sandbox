@@ -26,6 +26,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::time::{sleep, Instant};
 
+use wargame_core::domain::build::PublishedImage;
 use wargame_core::domain::{
     ExecutionMode, GuestArch, GuestOs, NetworkMode, ProviderCapabilities, ResolvedBackend,
     Resources, VmRef,
@@ -33,8 +34,8 @@ use wargame_core::domain::{
 use wargame_core::error::{Result, WargameError};
 use wargame_core::infra::process::ProcessRunner;
 use wargame_core::ports::{
-    BackendCheck, BackendStatus, ConsoleDescriptor, ImageRef, RuntimeInfo, StartOptions,
-    VmProvider, VmSpec, VmStatus,
+    BackendCheck, BackendStatus, ConsoleDescriptor, ImageRef, ImageRegistrar, RuntimeInfo,
+    StartOptions, VmProvider, VmSpec, VmStatus,
 };
 
 use crate::automation::{
@@ -178,15 +179,19 @@ impl UtmProvider {
     }
 
     /// Copies an existing VM, returning the copy's UUID.
+    ///
+    /// Nothing records the copy on this path, so a failure after UTM
+    /// registered it deletes it again rather than leaving it behind
+    /// ([`UtmProvider::clone_vm_reporting`] is the variant a build uses,
+    /// which writes it down instead).
     pub async fn clone_vm(&self, source_id: &str, new_name: &str) -> Result<VmRef> {
-        let mut created = Vec::new();
-        self.clone_vm_reporting(source_id, new_name, &mut created)
-            .await
+        self.clone_vm_reporting(source_id, new_name, &()).await
     }
 
-    /// [`UtmProvider::clone_vm`], pushing **every** VM UTM registered while
-    /// it ran into `created` -- including the one a *failed* `duplicate`
-    /// leaves behind.
+    /// [`UtmProvider::clone_vm`], telling `registrar` about **every** VM UTM
+    /// registered while it ran -- including the one a *failed* `duplicate`
+    /// leaves behind -- the moment the registry shows it and before anything
+    /// else is done to it.
     ///
     /// `duplicate` returns nothing at all (T2), so the new UUID is found by
     /// comparing the registry before and after -- by set difference, with
@@ -198,19 +203,22 @@ impl UtmProvider {
     /// * **A `duplicate` that fails can still register a VM.** UTM copies
     ///   the bundle, registers it, applies the new name and only then moves
     ///   it into place; a name that is already taken fails that last move
-    ///   with -2700 and leaves the registered copy behind. `created` is
-    ///   filled before the error is raised so the caller can write that VM
-    ///   down instead of leaking it (task-7-b2b-report.md D5).
+    ///   with -2700 and leaves the registered copy behind. The registrar is
+    ///   told before the error is raised, and before the MAC write below, so
+    ///   there is no window in which a registered VM has no record
+    ///   (task-7-b2b-report.md D5).
     /// * **A clone inherits the source's MAC address**, so two sessions
     ///   from one image answered to the same IP and an `scp` landed in the
     ///   wrong guest (D4). Every copy gets a fresh locally administered one
     ///   here, while it is still stopped -- the only state UTM writes a
-    ///   configuration in (T9).
+    ///   configuration in (T9). If *that* fails the copy is deleted again:
+    ///   a VM with the wrong hardware address is worse than no VM, and
+    ///   `delete` addresses one machine by id now.
     pub async fn clone_vm_reporting(
         &self,
         source_id: &str,
         new_name: &str,
-        created: &mut Vec<VmRef>,
+        registrar: &dyn ImageRegistrar,
     ) -> Result<VmRef> {
         let before = self.automation.list().await?;
         let Some(source) = before.iter().find(|vm| vm.id == source_id) else {
@@ -249,7 +257,14 @@ impl UtmProvider {
                 name: vm.name.clone(),
             })
             .collect();
-        created.extend(new.iter().cloned());
+        // Before the error, before the MAC write, before anything: a VM UTM
+        // has registered and nothing has written down is a VM nothing will
+        // ever clean up.
+        for vm in &new {
+            registrar
+                .image_created(&PublishedImage::new(vm.id.clone(), vm.name.clone()))
+                .await?;
+        }
         duplicated?;
 
         let copy = match new.as_slice() {
@@ -270,9 +285,21 @@ impl UtmProvider {
                     ))
                 })?,
         };
-        self.automation
+        if let Err(e) = self
+            .automation
             .set_mac_address(&copy.id, &random_mac())
-            .await?;
+            .await
+        {
+            // The copy exists and would come up as its source's twin. Take
+            // it away again; if even that fails, name it so it can be found.
+            return Err(match self.delete(&copy).await {
+                Ok(()) => e,
+                Err(cleanup) => WargameError::VmCreationFailed(format!(
+                    "{e}; and the copy {} ({}) could not be removed afterwards: {cleanup}",
+                    copy.name, copy.id
+                )),
+            });
+        }
         Ok(copy)
     }
 
@@ -336,6 +363,28 @@ impl UtmProvider {
     }
 
     // --- internals ---------------------------------------------------------
+
+    /// Everything a session decides about its own copy, written while it is
+    /// still stopped. Split out so `create` can undo the copy as a whole if
+    /// any of it fails.
+    async fn configure_clone(&self, vm: &VmRef, spec: &VmSpec, hypervisor: bool) -> Result<()> {
+        self.automation
+            .set_hardware(
+                &vm.id,
+                spec.resources.cpu,
+                spec.resources.memory_mib,
+                hypervisor,
+            )
+            .await?;
+        self.automation
+            .set_network_mode(&vm.id, network_mode(spec.network))
+            .await?;
+        // The clone may come from a VM the user built without a display;
+        // give it one so `wargame gui` and `profile console` have a window.
+        self.automation
+            .set_display(&vm.id, display_hardware(spec.execution.arch))
+            .await
+    }
 
     /// The registry entry for a VM this app is allowed to act on.
     ///
@@ -643,22 +692,20 @@ impl VmProvider for UtmProvider {
         // A clone inherits the source's configuration, so only what this
         // session decides is written -- while it is still stopped, which is
         // the only state `update configuration` accepts (T9).
-        self.automation
-            .set_hardware(
-                &vm.id,
-                spec.resources.cpu,
-                spec.resources.memory_mib,
-                hypervisor,
-            )
-            .await?;
-        self.automation
-            .set_network_mode(&vm.id, network_mode(spec.network))
-            .await?;
-        // The clone may come from a VM the user built without a display;
-        // give it one so `wargame gui` and `profile console` have a window.
-        self.automation
-            .set_display(&vm.id, display_hardware(spec.execution.arch))
-            .await?;
+        //
+        // A copy that could not be configured is not this session's VM: it
+        // would come up on the source's network with the source's
+        // resources, and no record names it yet. Take it away again rather
+        // than leaving it for a `prune` that may never come.
+        if let Err(e) = self.configure_clone(&vm, spec, hypervisor).await {
+            if let Err(cleanup) = self.delete(&vm).await {
+                return Err(WargameError::VmCreationFailed(format!(
+                    "{e}; and the half-configured copy {} ({}) could not be removed afterwards: {cleanup}",
+                    vm.name, vm.id
+                )));
+            }
+            return Err(e);
+        }
         // UTM's dictionary has no way to resize an existing drive
         // (`guest size` is write-only at creation, T5), so the disk stays
         // whatever the source image was built with.

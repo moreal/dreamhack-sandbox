@@ -355,9 +355,13 @@ struct ProfileJson<'a> {
     /// Why the profile does not resolve, when it does not.
     unsupported: Option<&'a str>,
     /// `"ready"`, `"rebuild needed"`, `"missing"`, `"not built"`, or the phase a
-    /// half-finished build stopped at. `null` when it could not be
-    /// determined.
+    /// half-finished build stopped at. `null` when the backend could not be
+    /// asked at all -- never `"missing"` for that, because the image may be
+    /// sitting there untouched; `image_error` then says why.
     image_state: Option<&'a str>,
+    /// What stopped the image state from being read, when it could not be.
+    /// `null` whenever `image_state` is set.
+    image_error: Option<&'a str>,
     default: bool,
 }
 
@@ -381,6 +385,7 @@ pub fn print_profiles(overviews: &[ProfileOverview], default_profile: &str, json
                 }),
                 unsupported: o.unsupported(),
                 image_state: o.image_state(),
+                image_error: o.image_error().map(|(detail, _)| detail),
                 default: o.profile.name == default_profile,
             })
             .collect();
@@ -418,6 +423,18 @@ pub fn print_profiles(overviews: &[ProfileOverview], default_profile: &str, json
     for o in overviews {
         if let Some(reason) = o.unsupported() {
             println!("! {}: {reason}", o.profile.name);
+        }
+        // An `unknown` cell is a backend that could not be asked, not an
+        // image that is not there. The table has no room for the reason, so
+        // it goes underneath -- silently printing `unknown` would leave the
+        // user with nothing to act on.
+        if o.unsupported().is_none() {
+            if let Some((detail, hint)) = o.image_error() {
+                println!("! {}: {detail}", o.profile.name);
+                if let Some(hint) = hint {
+                    println!("  Try: {}", hint.replace('\n', "\n       "));
+                }
+            }
         }
     }
     println!("Next: wargame profile build <name>   # once per profile; then wargame launch <ref> --profile <name>");

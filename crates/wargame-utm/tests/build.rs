@@ -203,19 +203,37 @@ fn next_image_id(copies: &Arc<Mutex<usize>>) -> String {
 
 /// A recording [`ImageRegistrar`]: what the publish step wrote down, in
 /// order.
+///
+/// When it is given the harness's call log it writes `registered:<id>` into
+/// it too, so a test can place the registration *among* the osascript calls
+/// rather than only after them -- which is the whole point of the contract:
+/// nothing may happen to a registered VM before it is written down.
 #[derive(Clone, Default)]
-struct Registered(Arc<Mutex<Vec<PublishedImage>>>);
+struct Registered {
+    images: Arc<Mutex<Vec<PublishedImage>>>,
+    calls: Option<Calls>,
+}
 
 impl Registered {
+    fn with_calls(calls: Calls) -> Self {
+        Registered {
+            images: Arc::new(Mutex::new(Vec::new())),
+            calls: Some(calls),
+        }
+    }
+
     fn all(&self) -> Vec<PublishedImage> {
-        self.0.lock().unwrap().clone()
+        self.images.lock().unwrap().clone()
     }
 }
 
 #[async_trait::async_trait]
 impl ImageRegistrar for Registered {
     async fn image_created(&self, image: &PublishedImage) -> wargame_core::error::Result<()> {
-        self.0.lock().unwrap().push(image.clone());
+        if let Some(calls) = &self.calls {
+            calls.push(format!("registered:{}", image.id));
+        }
+        self.images.lock().unwrap().push(image.clone());
         Ok(())
     }
 }
@@ -968,6 +986,63 @@ async fn a_publish_utm_refuses_still_records_the_vm_it_registered() {
     assert!(
         h.registry.names().contains(&seen[0].name),
         "the recorded VM is the one UTM actually registered"
+    );
+}
+
+/// **The registrar's contract.** `ImageRegistrar` promises the backend
+/// reports a VM it created "before it does anything else with it". The
+/// copy's MAC is written by the same call that makes the copy, so the
+/// report has to come from *inside* it -- between the registry diff that
+/// finds the new UUID and the `update configuration` that rewrites its
+/// hardware address. A crash in that window would otherwise leave an image
+/// VM no record names, which `prune` then skips forever.
+#[tokio::test]
+async fn the_registrar_hears_about_the_copy_before_its_mac_is_written() {
+    let h = harness(
+        Registry::with(&[(INSTALLER_ID, "stopped", "wg-build-kali-custom")]),
+        false,
+    );
+    let profile = kali_profile();
+    let record = record_with_installer(&profile);
+    let req = request(&profile, &record);
+    let vm = VmRef {
+        backend: "utm".to_string(),
+        id: INSTALLER_ID.to_string(),
+        name: "wg-build-kali-custom".to_string(),
+    };
+
+    let registered = Registered::with_calls(h.calls.clone());
+    let image = h
+        .builder
+        .publish(&req, &vm, &mut |_| {}, &registered)
+        .await
+        .unwrap();
+
+    let seen = registered.all();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].id, image.id);
+
+    let calls = h.calls.all();
+    let announced = h
+        .calls
+        .index_of(&format!("registered:{}", image.id))
+        .unwrap_or_else(|| panic!("the copy was never registered: {calls:?}"));
+    let mac = h
+        .calls
+        .index_of(&format!("osascript:mac:{}", image.id))
+        .unwrap_or_else(|| panic!("the copy never got its own MAC: {calls:?}"));
+    assert!(
+        announced < mac,
+        "the copy must be written down before its MAC is rewritten: {calls:?}"
+    );
+    // ...and before anything else touches it at all.
+    let after: Vec<&String> = calls.iter().skip(announced).collect();
+    assert!(
+        !after.iter().any(|c| c.starts_with("osascript:")
+            && c.ends_with(&image.id)
+            && *c != &format!("registered:{}", image.id)
+            && !c.starts_with("osascript:mac")),
+        "nothing but the MAC write may follow the registration: {after:?}"
     );
 }
 
