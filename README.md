@@ -451,8 +451,19 @@ construction against a fake process runner, and CLI tests run with
 `WARGAME_PROVIDER=fixture WARGAME_VM=fake` (no network, no VM). This is also
 what `nix flake check` runs.
 
-Two more layers exist for real hardware, both documented rather than run in
-CI:
+Four more layers exist for real hardware, documented rather than run in CI.
+None of them runs under a plain `cargo test`, `cargo test -- --ignored` or
+`nix flake check`: each needs an environment variable set on purpose, because
+each boots a real VM (spec.md §9, "실VM 검사는 opt-in이다").
+
+**The first OS installation is not in any of them.** Making a Kali or Windows
+guest from an ISO is a manual step — `wargame profile create <p> --iso <path>`,
+install the OS through `wargame profile console <p>`, `wargame profile eject
+<p>`, then `wargame profile build <p>` — and its evidence (what was clicked,
+what the guest ended up with) is recorded separately in
+`docs/utm-compatibility.md` and the task reports under `.superpowers/sdd/PLAN/`.
+The scripts below start where that leaves off: a profile whose image is already
+published.
 
 - **`scripts/e2e-smoke.sh [profile-name]`** — drives the *real* `wargame`
   binary against a *real* Tart VM (still with `WARGAME_PROVIDER=fixture`, so
@@ -467,6 +478,62 @@ CI:
   you've set up the Softnet sudoers rule from "What \"isolated\" networking
   means" above). Run it from inside `nix develop`, with the named profile
   already built once (`wargame profile build macos-minimal-arm64`).
+- **`scripts/e2e-multi-os.sh <profile> [challenge]`** — the same idea for
+  *any* backend and any guest OS, and the one to use for the UTM profiles:
+  it takes a profile whose image is already built and verifies everything
+  after `launch`. It fails fast, before creating anything, if `wargame
+  profiles` does not show that profile's image as `ready`, and points at
+  `profile create`/`profile build`. What it checks: the launch itself, the
+  session reaching `ready`, that the session recorded the backend, mode,
+  guest and network it was asked for, `uname -m` in the guest matching the
+  profile's architecture (which is what proves an `emulate` x86_64 guest
+  really is one), the `incoming/work/notes/output` workspace tree under the
+  profile's workspace root, every staged file's SHA-256 recomputed *in the
+  guest* against the host's staging hash, then `stop` → `resume` → SSH again
+  → `delete`, and finally that the profile's installation VM and image VM are
+  still listed, unchanged. It prints a per-stage timing table. Any check it
+  cannot perform prints `UNVERIFIED: <why>` and is listed again in the final
+  summary, so "passed" and "passed without checking the guest" never read the
+  same.
+
+  It defaults to `WARGAME_PROVIDER=fixture` (no Dreamhack account, no
+  download); set `WARGAME_PROVIDER=dreamhack` after `wargame auth login` and
+  pass a `dreamhack:<id>` ref to run the same checks against a real
+  challenge. Other knobs: `WARGAME_E2E_NETWORK` (default `nat`),
+  `WARGAME_E2E_SSH_WAIT` (default 300 s), `WARGAME_BIN` to drive an
+  already-built binary. Like `e2e-smoke.sh` it uses your **real**
+  `$WARGAME_HOME` and never deletes it — export `WARGAME_HOME` when the
+  profiles and build records you mean live somewhere else. Its cleanup trap
+  deletes only the sessions this run created; the installation VM and the
+  image VM are never stopped, modified or deleted.
+
+  ```sh
+  scripts/e2e-multi-os.sh kali-arm64             # Kali arm64, virtualize
+  scripts/e2e-multi-os.sh kali-x86_64            # Kali x86_64, emulate
+  scripts/e2e-multi-os.sh macos-re-arm64         # the existing Tart path
+  ```
+
+  The guest-side checks are POSIX-only. Against a Windows profile the
+  lifecycle stages still run and the guest checks report `UNVERIFIED` naming
+  `guest/bootstrap.ps1`, rather than pretending to have looked.
+- **`cargo test -p wargame-utm --test e2e -- --ignored`** — the UTM adapter
+  on its own, against a real UTM and a real published image: the recorded VMs
+  are listed and stopped, a clone of the published image starts, gets an
+  address from the QEMU guest agent, stops (through the T12 orphan check) and
+  is deleted, the installation VM and image VM survive unchanged, and a UUID
+  this app never created is `Missing` rather than something to delete. No
+  guest login is involved. It needs **both** `WARGAME_E2E=1` and
+  `WARGAME_E2E_UTM_PROFILE=<profile>`, and it skips — with a printed reason,
+  not a failure — when either is missing, or on a host with no UTM, which is
+  why it also compiles and passes on Linux:
+
+  ```sh
+  WARGAME_E2E=1 WARGAME_E2E_UTM_PROFILE=kali-arm64 \
+    cargo test -p wargame-utm --test e2e -- --ignored --nocapture
+  ```
+
+  The only VM it creates is `wg-build-e2e-<pid>`, and it deletes it however
+  the test ends.
 - **`cargo test -p wargame-tart --test e2e -- --ignored`** — the same M0
   proof (MVP.md §36) driven directly against `wargame-tart`, with real
   password authentication against a freshly cloned vanilla image (no
@@ -506,7 +573,9 @@ crates/
   wargame-cli/         CLI (clap) + TUI (ratatui) composition root
 profiles/              built-in profile YAMLs + their provisioning scripts
 guest/                 bootstrap.sh / bootstrap.ps1, run inside the guest only
-scripts/e2e-smoke.sh   manual real-VM smoke test (see Testing)
+scripts/               manual real-VM verification (see Testing):
+  e2e-smoke.sh          macOS/Tart smoke test
+  e2e-multi-os.sh       any profile, launch onwards (Kali, Windows, macOS)
 ```
 
 `wargame-dreamhack`, `wargame-tart` and `wargame-utm` each depend only on
