@@ -187,38 +187,52 @@ pub struct MakeVmParams<'a> {
 
 // --- AppleScript templates -------------------------------------------------
 //
-// Each `*_BODY` runs inside `tell application "UTM"` with `vm` bound to the
-// VM whose id is `item 1 of argv`; each `*_PROLOGUE` binds the remaining
-// arguments *before* that block, which is where `POSIX file` has to be
-// evaluated (T5: inside the block UTM resolves the path in its own sandbox
-// and fails with -1728).
+// Each `*_BODY` runs inside `tell application "UTM"`, in the branch of a
+// `repeat with vm in (virtual machines)` loop where `id of vm` matched;
+// each `*_PROLOGUE` binds the remaining arguments *before* that block,
+// which is where `POSIX file` has to be evaluated (T5: inside the block UTM
+// resolves the path in its own sandbox and fails with -1728).
+//
+// **The loop variable is only ever read, never acted on.**
+// `repeat with vm in (virtual machines)` binds `vm` to a reference *into*
+// the collection. UTM applies `delete` to the whole collection through it:
+// one `delete vm` deleted every virtual machine on the host and still
+// answered `"ok"` (task-7-b2b-report.md D1), and `duplicate` refuses the
+// same reference with -10014 (Task 3). So the loop is the existence check
+// that produces the not-found sentinel and nothing more; every verb and
+// every `update configuration` addresses
+// `(first virtual machine whose id is vmId)` -- the single-object specifier
+// Task 3 verified -- which can only ever name one VM.
 
 const STATUS_BODY: &str = r#"return (status of vm as text) & tab & (backend of vm as text)"#;
 
-const START_BODY: &str = r#"start vm
+const START_BODY: &str = r#"start (first virtual machine whose id is vmId)
 				return "ok""#;
 
 const STOP_PROLOGUE: &str = r#"set stopMethod to item 2 of argv"#;
 const STOP_BODY: &str = r#"if stopMethod is "kill" then
-					stop vm by kill
+					stop (first virtual machine whose id is vmId) by kill
 				else
-					stop vm by force
+					stop (first virtual machine whose id is vmId) by force
 				end if
 				return "ok""#;
 
-const DELETE_BODY: &str = r#"delete vm
+// **The one that destroyed a host.** `delete vm` on the loop reference is
+// what emptied UTM in task-7-b2b-report.md D1; addressed by id it removes
+// exactly the VM whose UUID was passed, and a running one raises -2700
+// without touching anything else.
+const DELETE_BODY: &str = r#"delete (first virtual machine whose id is vmId)
 				return "ok""#;
 
 const DUPLICATE_PROLOGUE: &str = r#"set newName to item 2 of argv"#;
 // `duplicate` returns nothing at all (T2), so the caller finds the new UUID
 // by comparing the registry before and after.
 //
-// Unlike every other verb here, `duplicate` cannot take the loop's own
-// reference: `duplicate vm` (and `duplicate (contents of vm)`) fails with
+// `duplicate` was the first verb here to need a single-object specifier:
+// `duplicate vm` (and `duplicate (contents of vm)`) fails outright with
 // `Handler only handles single objects. (-10014)`, verified on UTM 4.7.5.
-// It needs a single-object specifier, so the loop stays as the existence
-// check -- which is what produces the not-found sentinel -- and the copy
-// itself addresses the VM by `whose id is`, still never by name (T3).
+// Every other verb now uses the same shape, because the ones that did not
+// refuse silently acted on the collection instead (D1).
 const DUPLICATE_BODY: &str = r#"duplicate (first virtual machine whose id is vmId) with properties {configuration:{name:newName}}
 				return "ok""#;
 
@@ -234,7 +248,7 @@ const HARDWARE_BODY: &str = r#"set c to configuration of vm
 				set memory of c to memMib
 				set cpu cores of c to cores
 				set hypervisor of c to hyp
-				update configuration of vm with c
+				update configuration of (first virtual machine whose id is vmId) with c
 				return "ok""#;
 
 const NETWORK_PROLOGUE: &str = r#"set netMode to item 2 of argv"#;
@@ -248,7 +262,27 @@ const NETWORK_BODY: &str = r#"set c to configuration of vm
 				else
 					set item 1 of network interfaces of c to {index:n, mode:shared}
 				end if
-				update configuration of vm with c
+				update configuration of (first virtual machine whose id is vmId) with c
+				return "ok""#;
+
+const MAC_PROLOGUE: &str = r#"set macAddr to item 2 of argv"#;
+// D4: `duplicate` copies the source's network interface verbatim, MAC
+// address included, so every clone of an image came up with the *same*
+// hardware address -- two sessions on one host-only segment answered to one
+// IP, and an `scp` landed in the wrong guest (task-7-b2b-report.md D4).
+// UTM's `qemu network configuration` has a writable `address`
+// ("MAC address (formatted as XX:XX:XX:XX:XX:XX, if empty a random address
+// will be genertaed)" -- utm-4.7.5.sdef), and writing a partial record for
+// the interface leaves its `mode`, `hardware` and port forwards alone
+// (verified: docs/utm-compatibility.md §2).
+//
+// The index is read back rather than assumed: the sdef says it "is invalid
+// after updating the configuration and must be reset to the current
+// position", and UTM's first interface answers 0, not 1.
+const MAC_BODY: &str = r#"set c to configuration of vm
+				set n to index of item 1 of network interfaces of c
+				set item 1 of network interfaces of c to {index:n, address:macAddr}
+				update configuration of (first virtual machine whose id is vmId) with c
 				return "ok""#;
 
 const DISPLAY_PROLOGUE: &str = r#"set hw to item 2 of argv"#;
@@ -257,13 +291,13 @@ const DISPLAY_PROLOGUE: &str = r#"set hw to item 2 of argv"#;
 // the default (T11), so the caller validates the name.
 const DISPLAY_BODY: &str = r#"set c to configuration of vm
 				set displays of c to {{hardware:hw}}
-				update configuration of vm with c
+				update configuration of (first virtual machine whose id is vmId) with c
 				return "ok""#;
 
 const ATTACH_ISO_PROLOGUE: &str = r#"set isoFile to POSIX file (item 2 of argv)"#;
 const ATTACH_ISO_BODY: &str = r#"set c to configuration of vm
 				set drives of c to (drives of c) & {{removable:true, source:isoFile}}
-				update configuration of vm with c
+				update configuration of (first virtual machine whose id is vmId) with c
 				return "ok""#;
 
 // Replacing an ISO must echo the drive's own id back, or UTM adds a drive
@@ -272,7 +306,7 @@ const REPLACE_ISO_PROLOGUE: &str = r#"set isoFile to POSIX file (item 2 of argv)
 const REPLACE_ISO_BODY: &str = r#"set c to configuration of vm
 				set i to id of item 1 of drives of c
 				set item 1 of drives of c to {id:i, source:isoFile}
-				update configuration of vm with c
+				update configuration of (first virtual machine whose id is vmId) with c
 				return "ok""#;
 
 /// What the eject script answers when writing the drive list back would
@@ -325,7 +359,7 @@ const EJECT_MEDIA_BODY: &str = r#"set c to configuration of vm
 						return "wargame-utm:no-surviving-drive"
 					end if
 					set drives of c to kept
-					update configuration of vm with c
+					update configuration of (first virtual machine whose id is vmId) with c
 				end if
 				return (gone as text)"#;
 
@@ -792,6 +826,16 @@ impl Automation {
             .await
     }
 
+    /// Writes the first network interface's MAC address.
+    ///
+    /// Every clone needs one of its own: `duplicate` copies the source's
+    /// (D4). The VM must be stopped, like every other configuration write
+    /// (T9).
+    pub async fn set_mac_address(&self, id: &str, mac: &str) -> Result<()> {
+        self.run_on_vm(id, &vm_script(MAC_PROLOGUE, MAC_BODY), &[mac])
+            .await
+    }
+
     /// Gives the VM exactly one display, so UTM opens a window for it (§3).
     pub async fn set_display(&self, id: &str, hardware: &str) -> Result<()> {
         self.run_on_vm(id, &vm_script(DISPLAY_PROLOGUE, DISPLAY_BODY), &[hardware])
@@ -848,10 +892,19 @@ impl Automation {
             })
     }
 
-    /// The guest's address, via the QEMU guest agent. `Ok(None)` means the
-    /// agent has not answered yet -- the normal state before provisioning
-    /// installs it -- and carries the reason UTM gave.
-    pub async fn guest_ip(&self, id: &str) -> Result<std::result::Result<IpAddr, String>> {
+    /// Every address the QEMU guest agent reports that something could
+    /// actually connect to, IPv4 first. `Err(reason)` means the agent has
+    /// not answered at all -- the normal state before provisioning installs
+    /// it -- and carries the reason UTM gave.
+    ///
+    /// **All of them, not the best one.** The caller has to tell "the guest
+    /// has no address yet" apart from "the guest has an IPv6 address and its
+    /// DHCPv4 lease has not arrived yet", because only the second is worth
+    /// waiting through and neither is worth handing to `scp` (D3).
+    pub async fn guest_addresses(
+        &self,
+        id: &str,
+    ) -> Result<std::result::Result<Vec<IpAddr>, String>> {
         self.ensure_app_running().await?;
         let utmctl = self.utmctl_path()?;
         let out = self
@@ -869,23 +922,20 @@ impl Automation {
         }
         // IPv4 first, then anything else routable (§5's guest address
         // discovery); link-local and loopback are of no use to ssh.
-        let addresses: Vec<IpAddr> = out
+        let mut addresses: Vec<IpAddr> = out
             .stdout
             .lines()
             .filter_map(|line| IpAddr::from_str(line.trim()).ok())
             .filter(|ip| !ip.is_loopback() && !is_link_local(ip))
             .collect();
-        match addresses
-            .iter()
-            .find(|ip| ip.is_ipv4())
-            .or_else(|| addresses.first())
-        {
-            Some(ip) => Ok(Ok(*ip)),
-            None => Ok(Err(format!(
+        addresses.sort_by_key(|ip| !ip.is_ipv4());
+        if addresses.is_empty() {
+            return Ok(Err(format!(
                 "the guest agent reported no usable address ({})",
                 out.stdout.trim().replace('\n', ", ")
-            ))),
+            )));
         }
+        Ok(Ok(addresses))
     }
 
     /// T12: a `qemu-*-softmmu` process whose argv `-uuid` is this VM's id,
@@ -1152,7 +1202,7 @@ mod tests {
             .find("set drives of c to kept")
             .expect("the drive-list write");
         let update = script
-            .find("update configuration of vm with c")
+            .find("update configuration of (first virtual machine whose id is vmId) with c")
             .expect("the configuration write");
         assert!(guard < refusal, "{script}");
         assert!(
@@ -1165,6 +1215,85 @@ mod tests {
             script.contains("set end of kept to {id:(id of d)}"),
             "{script}"
         );
+    }
+
+    /// Every AppleScript this crate can run, so an audit is exhaustive by
+    /// construction rather than by memory: a new `*_BODY` that is not listed
+    /// here fails [`every_script_is_audited`].
+    fn every_script() -> Vec<(&'static str, String)> {
+        vec![
+            ("status", vm_script("", STATUS_BODY)),
+            ("start", vm_script("", START_BODY)),
+            ("stop", vm_script(STOP_PROLOGUE, STOP_BODY)),
+            ("delete", vm_script("", DELETE_BODY)),
+            ("duplicate", vm_script(DUPLICATE_PROLOGUE, DUPLICATE_BODY)),
+            ("hardware", vm_script(HARDWARE_PROLOGUE, HARDWARE_BODY)),
+            ("network", vm_script(NETWORK_PROLOGUE, NETWORK_BODY)),
+            ("mac", vm_script(MAC_PROLOGUE, MAC_BODY)),
+            ("display", vm_script(DISPLAY_PROLOGUE, DISPLAY_BODY)),
+            (
+                "attach-iso",
+                vm_script(ATTACH_ISO_PROLOGUE, ATTACH_ISO_BODY),
+            ),
+            (
+                "replace-iso",
+                vm_script(REPLACE_ISO_PROLOGUE, REPLACE_ISO_BODY),
+            ),
+            ("eject", vm_script("", EJECT_MEDIA_BODY)),
+            ("make-with-iso", MAKE_WITH_ISO.to_string()),
+            ("make-without-iso", MAKE_WITHOUT_ISO.to_string()),
+            ("app-version", APP_VERSION_SCRIPT.to_string()),
+        ]
+    }
+
+    /// **D1, the data-loss defect.** `repeat with vm in (virtual machines)`
+    /// binds `vm` to a reference *into* the collection, and UTM applies
+    /// `delete` to the whole collection: one `delete vm` removed every
+    /// virtual machine on the host and still answered `"ok"`
+    /// (task-7-b2b-report.md D1). `duplicate` refuses the same reference
+    /// outright (-10014, Task 3).
+    ///
+    /// So no verb -- and no configuration write -- may ever be applied to
+    /// the loop variable. The loop is the existence check that produces
+    /// [`VM_NOT_FOUND`] and nothing else; everything that acts addresses
+    /// the single-object specifier. Asserted on the script text, because
+    /// no fake `osascript` can reproduce what UTM does with a collection.
+    #[test]
+    fn no_script_applies_a_verb_to_the_loop_reference() {
+        for (name, script) in every_script() {
+            for verb in ["start", "stop", "suspend", "delete", "duplicate"] {
+                for tail in [" vm\n", " vm ", " vm\t", " vm\r"] {
+                    let needle = format!("{verb}{tail}");
+                    assert!(
+                        !script.contains(&needle),
+                        "the {name} script applies `{verb}` to the loop reference: {script}"
+                    );
+                }
+            }
+            assert!(
+                !script.contains("update configuration of vm"),
+                "the {name} script writes a configuration through the loop reference: {script}"
+            );
+        }
+    }
+
+    /// The other half of the same rule: every script that acts on a VM does
+    /// so through the by-id specifier Task 3 verified for `duplicate`.
+    #[test]
+    fn every_acting_script_addresses_the_vm_by_id() {
+        for (name, script) in every_script() {
+            if !script.contains("repeat with vm in (virtual machines)") {
+                continue;
+            }
+            // `status` only reads properties; everything else acts.
+            if name == "status" {
+                continue;
+            }
+            assert!(
+                script.contains("(first virtual machine whose id is vmId)"),
+                "the {name} script has no by-id specifier: {script}"
+            );
+        }
     }
 
     /// T4: `protocol:TCP` collides with the `serial interface` enumerator.

@@ -144,6 +144,8 @@ the report quotes it.
 | File | Command | Exit |
 |---|---|---|
 | `utmctl-ip-address-three-lines.txt` | `utmctl ip-address 91195127-B639-471B-B5CF-9EC732973E4D` on the installed Kali arm64 guest — the guest agent answers with **three** lines: IPv4, a global (ULA) IPv6 and a link-local `fe80::`. A caller must pick, never read line 1 blindly. | 0 |
+| `utmctl-ip-address-ipv6-only.txt` | `utmctl ip-address` on the x86_64 Kali guest **13 s before its DHCPv4 lease** (task-7-b2b-report.md D3, `logs/17`, 11:55:02) — a routable ULA and a link-local address, no IPv4. Taking the ULA here is what handed `scp` a bare IPv6 literal. | 0 |
+| `utmctl-ip-address-ipv4-joined.txt` | The very next poll of the same guest (11:55:15): the IPv4 lease has joined the two IPv6 addresses. The pair is the two-poll sequence the readiness gate has to wait through. | 0 |
 | `utmctl-error-609-app-not-running.stderr.txt` | `utmctl start <uuid>` issued straight after a `stop`, with UTM not yet back (trap T8). Written to **stderr with exit 0**, and the VM does not start; the `open -a UTM` + poll-`utmctl version` handshake clears it. | **0** |
 
 ## Boot evidence

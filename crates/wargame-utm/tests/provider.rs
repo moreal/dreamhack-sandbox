@@ -39,9 +39,28 @@ const ERR_MUST_BE_STOPPED: &str = include_str!("fixtures/applescript-error-vm-mu
 /// The three lines `utmctl ip-address` really answers with, once a guest
 /// agent is running (phase A, D8): IPv4, a global IPv6, a link-local one.
 const IP_THREE_LINES: &str = include_str!("fixtures/utmctl-ip-address-three-lines.txt");
+/// The x86_64 guest 13 s before its DHCPv4 lease: a routable ULA and a
+/// link-local address, no IPv4 (D3).
+const IP_IPV6_ONLY: &str = include_str!("fixtures/utmctl-ip-address-ipv6-only.txt");
+/// The very next poll of that guest, with the IPv4 lease joined (D3).
+const IP_IPV4_JOINED: &str = include_str!("fixtures/utmctl-ip-address-ipv4-joined.txt");
 /// T8: `utmctl start` right after a stop, with UTM not back yet -- exit 0,
 /// `-609` on stderr, and the VM does not start.
 const ERR_609: &str = include_str!("fixtures/utmctl-error-609-app-not-running.stderr.txt");
+
+/// The three id-addressed verb scripts, recognised by the verb applied to
+/// the **single-object specifier**. Never `"<verb> vm"`: applying a verb to
+/// `repeat with vm in (virtual machines)`'s loop reference is what made one
+/// `delete` empty a whole UTM library (task-7-b2b-report.md D1), and
+/// `automation.rs`'s `no_script_applies_a_verb_to_the_loop_reference`
+/// forbids that shape outright.
+const START_SCRIPT: &str = "start (first virtual machine";
+const STOP_SCRIPT: &str = "stop (first virtual machine";
+const DELETE_SCRIPT: &str = "delete (first virtual machine";
+/// The two scripts that both touch `network interfaces of c`, told apart by
+/// the argument each one binds: the network-mode write and the MAC write.
+const NETWORK_SCRIPT: &str = "set netMode to";
+const MAC_SCRIPT: &str = "address:macAddr";
 
 /// The first UUID in `utmctl-list-multi.txt` (`wargame-t1-x86`).
 const X86_ID: &str = "A8E9F979-A198-433A-B2DE-74A6D7302D2F";
@@ -455,7 +474,7 @@ async fn create_clones_the_source_vm_and_returns_the_new_uuid() {
     assert_eq!(duplicate.args[1], X86_ID);
     assert_eq!(duplicate.args[2], "wg-session-1");
     // Resources, network and a display are applied to the *new* UUID.
-    for marker in ["cpu cores", "network interfaces", "displays of c"] {
+    for marker in ["cpu cores", NETWORK_SCRIPT, "displays of c", MAC_SCRIPT] {
         let call = calls
             .iter()
             .find(|c| is_osascript(c, marker))
@@ -465,9 +484,66 @@ async fn create_clones_the_source_vm_and_returns_the_new_uuid() {
     // Isolated -> UTM `host` (§5), never `emulated` or `bridged`.
     let network = calls
         .iter()
-        .find(|c| is_osascript(c, "network interfaces"))
+        .find(|c| is_osascript(c, NETWORK_SCRIPT))
         .unwrap();
     assert_eq!(network.args[2], "host");
+}
+
+/// **D4.** `duplicate` copies the source's network interface verbatim, MAC
+/// address included, so both sessions launched from one image came up on
+/// the same host-only segment with the same address -- and an `scp`
+/// addressed to it landed in the other session's guest
+/// (task-7-b2b-report.md D4). Every copy gets its own address, written
+/// while it is still stopped.
+#[tokio::test]
+async fn create_gives_the_clone_a_fresh_locally_administered_mac() {
+    let new_id = "11111111-2222-3333-4444-555555555555";
+    let before = LIST_MULTI.to_string();
+    let after = format!("{before}{new_id} stopped  wg-session-1\n");
+    let n = Arc::new(std::sync::Mutex::new(0usize));
+    let seen = n.clone();
+    let fake = runner(move |cmd| {
+        if utmctl_sub(cmd) == Some("list") {
+            let mut n = seen.lock().unwrap();
+            *n += 1;
+            return Some(ok(if *n == 1 { &before } else { &after }));
+        }
+        None
+    });
+    let p = provider(fake.clone());
+    p.create(&kali_x86_spec("wg-session-1")).await.unwrap();
+
+    let calls = fake.calls();
+    let mac_call = calls
+        .iter()
+        .find(|c| is_osascript(c, MAC_SCRIPT))
+        .expect("the copy is given its own MAC address");
+    assert_eq!(
+        mac_call.args[1], new_id,
+        "written to the copy, not the source"
+    );
+    let mac = &mac_call.args[2];
+    // The address travels as argv data, never inside the script text.
+    assert!(
+        !script_of(mac_call).contains(mac.as_str()),
+        "the MAC must be an argument, not interpolated into the script"
+    );
+    let first = u8::from_str_radix(&mac[..2], 16).expect("hex octets");
+    assert_eq!(
+        first & 0b11,
+        0b10,
+        "locally administered and unicast: {mac}"
+    );
+    assert_eq!(mac.len(), 17, "UTM's XX:XX:XX:XX:XX:XX form: {mac}");
+
+    // ...and it is written before the VM could ever be started.
+    let mac_index = calls.iter().position(|c| is_osascript(c, MAC_SCRIPT));
+    let start_index = calls.iter().position(|c| is_osascript(c, START_SCRIPT));
+    assert!(mac_index.is_some());
+    assert!(
+        start_index.is_none() || mac_index < start_index,
+        "the MAC is written while the copy is still stopped"
+    );
 }
 
 /// The clone inherits the source's configuration, so the session's own
@@ -537,7 +613,7 @@ async fn create_maps_nat_to_utms_shared_mode() {
     let calls = fake.calls();
     let network = calls
         .iter()
-        .find(|c| is_osascript(c, "network interfaces"))
+        .find(|c| is_osascript(c, NETWORK_SCRIPT))
         .unwrap();
     assert_eq!(network.args[2], "shared");
 }
@@ -636,10 +712,10 @@ async fn start_applies_the_network_mode_then_starts_without_hide_or_attach() {
     let calls = fake.calls();
     let network = calls
         .iter()
-        .find(|c| is_osascript(c, "network interfaces"))
+        .find(|c| is_osascript(c, NETWORK_SCRIPT))
         .expect("the network mode is enforced before every start");
     assert_eq!(network.args[2], "host");
-    assert!(calls.iter().any(|c| is_osascript(c, "start vm")));
+    assert!(calls.iter().any(|c| is_osascript(c, START_SCRIPT)));
     // T7: `--hide` is broken; §3: `--attach` streams nothing.
     for call in &calls {
         assert!(!call.args.iter().any(|a| a == "--hide"), "{call:?}");
@@ -742,12 +818,28 @@ async fn wait_ip_never_takes_the_first_line_and_never_a_link_local_one() {
     assert_eq!(ip, IpAddr::from_str("192.168.64.27").unwrap());
 }
 
+/// **D3.** On these guests the SLAAC ULA appears ~13 s before the DHCPv4
+/// lease. The gate used to take the first routable address it saw, so the
+/// build went on with an IPv6 literal -- `ssh` accepts one, and the first
+/// `scp` then died on `user@fd14:...:299:/path`, after the whole boot
+/// (task-7-b2b-report.md D2/D3). The two polls here are the two captured
+/// live, in order.
 #[tokio::test]
-async fn wait_ip_falls_back_to_a_routable_ipv6_when_there_is_no_ipv4() {
+async fn wait_ip_keeps_polling_until_the_ipv4_lease_joins_the_ipv6_one() {
+    let polls = Arc::new(std::sync::Mutex::new(0usize));
+    let seen = polls.clone();
     let p = UtmProvider::new(
-        runner(|cmd| {
-            (utmctl_sub(cmd) == Some("ip-address"))
-                .then(|| ok("fe80::3176:9ad0:835c:65b9\nfd14:a432:91d3:c29f:e585:fc6f:d6b4:3529\n"))
+        runner(move |cmd| {
+            if utmctl_sub(cmd) != Some("ip-address") {
+                return None;
+            }
+            let mut n = seen.lock().unwrap();
+            *n += 1;
+            Some(ok(if *n == 1 {
+                IP_IPV6_ONLY
+            } else {
+                IP_IPV4_JOINED
+            }))
         }) as Arc<dyn ProcessRunner>,
         fast_config(),
     );
@@ -755,9 +847,39 @@ async fn wait_ip_falls_back_to_a_routable_ipv6_when_there_is_no_ipv4() {
         .wait_ip(&vm_ref(X86_ID, "wg-x"), Duration::from_secs(20))
         .await
         .unwrap();
+    assert_eq!(ip, IpAddr::from_str("192.168.64.29").unwrap());
     assert_eq!(
-        ip,
-        IpAddr::from_str("fd14:a432:91d3:c29f:e585:fc6f:d6b4:3529").unwrap()
+        *polls.lock().unwrap(),
+        2,
+        "the IPv6-only poll must not have been accepted"
+    );
+}
+
+/// And when the whole boot timeout goes by with nothing but IPv6, the
+/// failure says so rather than handing an unusable literal onwards.
+#[tokio::test]
+async fn wait_ip_fails_after_the_timeout_when_the_guest_only_ever_reports_ipv6() {
+    let p = UtmProvider::new(
+        runner(|cmd| (utmctl_sub(cmd) == Some("ip-address")).then(|| ok(IP_IPV6_ONLY)))
+            as Arc<dyn ProcessRunner>,
+        fast_config(),
+    );
+    let err = p
+        .wait_ip(&vm_ref(X86_ID, "wg-x"), Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("IPv6"),
+        "the message must say IPv6-only was seen: {message}"
+    );
+    assert!(
+        message.contains("IPv4"),
+        "and that IPv4 is what is required: {message}"
+    );
+    assert!(
+        message.contains("fd14:a432:91d3:c29f:53c1:5b8f:5d2b:299"),
+        "and name the address it did see: {message}"
     );
 }
 
@@ -793,7 +915,7 @@ async fn a_609_from_a_cold_app_is_re_handshaked_and_retried_once() {
         if is_osascript(cmd, "status of vm") {
             return Some(ok("stopped\tqemu\n"));
         }
-        if !is_osascript(cmd, "start vm") {
+        if !is_osascript(cmd, START_SCRIPT) {
             return None;
         }
         let mut n = seen.lock().unwrap();
@@ -877,14 +999,14 @@ async fn stop_polls_status_until_stopped_rather_than_trusting_the_verb() {
     let calls = fake.calls();
     let stop = calls
         .iter()
-        .find(|c| is_osascript(c, "stop vm"))
+        .find(|c| is_osascript(c, STOP_SCRIPT))
         .expect("a stop call");
     assert_eq!(stop.args[1], X86_ID);
     assert_eq!(stop.args[2], "force", "the first attempt is graceful");
     assert!(
         !calls
             .iter()
-            .any(|c| is_osascript(c, "stop vm") && c.args[2] == "kill"),
+            .any(|c| is_osascript(c, STOP_SCRIPT) && c.args[2] == "kill"),
         "a VM that stops on its own must not be killed"
     );
     assert!(*polls.lock().unwrap() >= 4);
@@ -901,7 +1023,7 @@ async fn stop_escalates_to_kill_only_after_the_graceful_timeout() {
         if utmctl_sub(cmd) == Some("list") {
             return Some(ok(&listing));
         }
-        if is_osascript(cmd, "stop vm") && cmd.args[2] == "kill" {
+        if is_osascript(cmd, STOP_SCRIPT) && cmd.args[2] == "kill" {
             *was_killed.lock().unwrap() = true;
             return Some(ok("ok"));
         }
@@ -975,7 +1097,7 @@ async fn stop_of_a_missing_vm_is_a_no_op() {
     });
     let p = provider(fake.clone());
     p.stop(&vm_ref(UNKNOWN_ID, "wg-gone")).await.unwrap();
-    assert!(!fake.calls().iter().any(|c| is_osascript(c, "stop vm")));
+    assert!(!fake.calls().iter().any(|c| is_osascript(c, STOP_SCRIPT)));
 }
 
 /// A paused VM refuses `stop` ("The virtual machine is not running", exit 0)
@@ -1004,8 +1126,8 @@ async fn stop_resumes_a_paused_vm_before_stopping_it() {
 
     p.stop(&vm_ref(X86_ID, "wg-x")).await.unwrap();
     let calls = fake.calls();
-    let start_index = calls.iter().position(|c| is_osascript(c, "start vm"));
-    let stop_index = calls.iter().position(|c| is_osascript(c, "stop vm"));
+    let start_index = calls.iter().position(|c| is_osascript(c, START_SCRIPT));
+    let stop_index = calls.iter().position(|c| is_osascript(c, STOP_SCRIPT));
     assert!(start_index.is_some(), "a paused VM is resumed first");
     assert!(start_index < stop_index, "{calls:?}");
 }
@@ -1031,7 +1153,7 @@ async fn delete_refuses_a_vm_outside_the_apps_namespace() {
         !fake
             .calls()
             .iter()
-            .any(|c| is_osascript(c, "delete vm") || utmctl_sub(c) == Some("delete")),
+            .any(|c| is_osascript(c, DELETE_SCRIPT) || utmctl_sub(c) == Some("delete")),
         "no delete may be issued: {:?}",
         fake.calls()
     );
@@ -1045,7 +1167,7 @@ async fn stop_refuses_a_vm_outside_the_apps_namespace() {
     let p = provider(fake.clone());
     let err = p.stop(&vm_ref(X86_ID, "wargame-t1-x86")).await.unwrap_err();
     assert!(err.to_string().contains("wargame-t1-x86"), "{err}");
-    assert!(!fake.calls().iter().any(|c| is_osascript(c, "stop vm")));
+    assert!(!fake.calls().iter().any(|c| is_osascript(c, STOP_SCRIPT)));
 }
 
 #[tokio::test]
@@ -1053,7 +1175,7 @@ async fn delete_of_a_vm_already_gone_is_a_no_op() {
     let fake = runner(|cmd| (utmctl_sub(cmd) == Some("list")).then(|| ok(LIST_EMPTY)));
     let p = provider(fake.clone());
     p.delete(&vm_ref(UNKNOWN_ID, "wg-gone")).await.unwrap();
-    assert!(!fake.calls().iter().any(|c| is_osascript(c, "delete vm")));
+    assert!(!fake.calls().iter().any(|c| is_osascript(c, DELETE_SCRIPT)));
 }
 
 #[tokio::test]
@@ -1082,10 +1204,10 @@ async fn delete_stops_an_owned_running_vm_then_deletes_it_by_uuid() {
 
     p.delete(&vm_ref(X86_ID, "wg-session-1")).await.unwrap();
     let calls = fake.calls();
-    assert!(calls.iter().any(|c| is_osascript(c, "stop vm")));
+    assert!(calls.iter().any(|c| is_osascript(c, STOP_SCRIPT)));
     let delete = calls
         .iter()
-        .find(|c| is_osascript(c, "delete vm"))
+        .find(|c| is_osascript(c, DELETE_SCRIPT))
         .expect("a delete call");
     assert_eq!(delete.args[1], X86_ID, "delete is addressed by UUID");
 }
@@ -1112,7 +1234,7 @@ async fn a_start_that_failed_on_a_locked_image_is_reported_as_a_failure() {
         if is_osascript(cmd, "status of vm") {
             return Some(ok("stopped\tqemu\n"));
         }
-        is_osascript(cmd, "start vm").then(|| failure(1, ERR_ORPHAN_LOCK))
+        is_osascript(cmd, START_SCRIPT).then(|| failure(1, ERR_ORPHAN_LOCK))
     }));
     let err = p
         .start(
@@ -1133,7 +1255,7 @@ async fn a_configuration_write_on_a_running_vm_surfaces_the_2700_error() {
         if is_osascript(cmd, "status of vm") {
             return Some(ok("stopped\tqemu\n"));
         }
-        is_osascript(cmd, "network interfaces").then(|| failure(1, ERR_MUST_BE_STOPPED))
+        is_osascript(cmd, NETWORK_SCRIPT).then(|| failure(1, ERR_MUST_BE_STOPPED))
     }));
     let err = p
         .start(&vm_ref(X86_ID, "wg-x"), &start_opts(NetworkMode::Isolated))
@@ -1349,7 +1471,7 @@ async fn eject_writes_the_drives_back_without_the_removable_ones() {
         "the drives list is written back: {script}"
     );
     assert!(
-        script.contains("update configuration of vm with c"),
+        script.contains("update configuration of (first virtual machine whose id is vmId) with c"),
         "the write needs `update configuration`: {script}"
     );
     assert!(
@@ -1570,7 +1692,7 @@ async fn start_fails_when_the_vm_vanishes_before_its_network_is_applied() {
         if is_osascript(cmd, "status of vm") {
             return Some(ok("stopped\tqemu\n"));
         }
-        is_osascript(cmd, "network interfaces").then(|| ok("wargame-utm:vm-not-found\n"))
+        is_osascript(cmd, NETWORK_SCRIPT).then(|| ok("wargame-utm:vm-not-found\n"))
     });
     let p = provider(fake.clone());
 
@@ -1580,7 +1702,7 @@ async fn start_fails_when_the_vm_vanishes_before_its_network_is_applied() {
         .unwrap_err();
     assert!(matches!(err, WargameError::VmNotFound(_)), "{err:?}");
     assert!(
-        !fake.calls().iter().any(|c| is_osascript(c, "start vm")),
+        !fake.calls().iter().any(|c| is_osascript(c, START_SCRIPT)),
         "the VM must not be started after the network write was lost"
     );
 }
@@ -1597,7 +1719,7 @@ async fn delete_errors_when_the_delete_script_finds_nothing() {
         if is_osascript(cmd, "status of vm") {
             return Some(ok("stopped\tqemu\n"));
         }
-        is_osascript(cmd, "delete vm").then(|| ok("wargame-utm:vm-not-found\n"))
+        is_osascript(cmd, DELETE_SCRIPT).then(|| ok("wargame-utm:vm-not-found\n"))
     });
     let p = provider(fake);
     let err = p.delete(&vm_ref(X86_ID, "wg-x")).await.unwrap_err();

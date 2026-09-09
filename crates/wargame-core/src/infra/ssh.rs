@@ -13,6 +13,7 @@
 //! base64 `-EncodedCommand` instead, so no POSIX quoting ever reaches a
 //! Windows guest.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::Arc;
@@ -115,6 +116,22 @@ impl SshGuestTransport {
 
     fn target(&self, endpoint: &GuestEndpoint) -> String {
         format!("{}@{}", endpoint.user, endpoint.host)
+    }
+
+    /// `user@host` for a **file transfer**, where an IPv6 literal has to be
+    /// bracketed.
+    ///
+    /// `scp`/`sftp` split their argument on the first colon to find
+    /// `host:path`, so `kali@fd14:a432:...:299:/tmp/x` is read as host
+    /// `kali@fd14` and path `a432:...` -- which fails as
+    /// `Could not resolve hostname fd14` after the guest has booted and the
+    /// user has waited (task-7-b2b-report.md D2). `ssh` needs no brackets
+    /// and gets none, so its argv is unchanged.
+    fn copy_target(&self, endpoint: &GuestEndpoint) -> String {
+        match endpoint.host {
+            IpAddr::V6(addr) => format!("{}@[{addr}]", endpoint.user),
+            IpAddr::V4(_) => self.target(endpoint),
+        }
     }
 
     /// The remote command for `argv`, i.e. everything after `user@host`.
@@ -317,7 +334,7 @@ impl GuestTransport for SshGuestTransport {
         let mut args = self.base_args(endpoint, "-P");
         args.push("-r".to_string());
         args.push(src.display().to_string());
-        args.push(format!("{}:{}", self.target(endpoint), dest));
+        args.push(format!("{}:{}", self.copy_target(endpoint), dest));
 
         let cmd = Cmd::new("scp", args);
         let out = self.runner.run(&cmd).await?;
@@ -481,6 +498,60 @@ mod tests {
         assert!(calls[0]
             .args
             .contains(&"admin@10.0.0.5:~/wargame/incoming/".to_string()));
+    }
+
+    /// **D2.** `scp` finds `host:path` by splitting on the first colon, so
+    /// an unbracketed IPv6 literal is read as host `kali@fd14` -- the
+    /// failure that killed every build and launch that got an IPv6 address
+    /// first (task-7-b2b-report.md D2). `ssh` accepts a bare literal and is
+    /// left alone.
+    #[tokio::test]
+    async fn copy_in_brackets_an_ipv6_literal_and_leaves_ipv4_byte_identical() {
+        let v6 = GuestEndpoint {
+            host: IpAddr::from_str("fd14:a432:91d3:c29f:53c1:5b8f:5d2b:299").unwrap(),
+            ..endpoint("kali")
+        };
+        let runner = Arc::new(FakeRunner::new());
+        let transport = SshGuestTransport::new(runner.clone(), PathBuf::from("/keys/id_ed25519"));
+        transport
+            .copy_in(
+                &v6,
+                &PathBuf::from("/tmp/asset.zip"),
+                "/home/kali/incoming/",
+            )
+            .await
+            .unwrap();
+        transport
+            .copy_in(
+                &endpoint("kali"),
+                &PathBuf::from("/tmp/asset.zip"),
+                "/home/kali/incoming/",
+            )
+            .await
+            .unwrap();
+
+        let calls = runner.calls();
+        assert_eq!(
+            calls[0].args.last().unwrap(),
+            "kali@[fd14:a432:91d3:c29f:53c1:5b8f:5d2b:299]:/home/kali/incoming/"
+        );
+        // The IPv4 destination is byte-for-byte what it always was.
+        assert_eq!(
+            calls[1].args.last().unwrap(),
+            "kali@10.0.0.5:/home/kali/incoming/"
+        );
+        // And `ssh` still gets the literal unbracketed -- it accepts one,
+        // and bracketing it there would change an argv nothing asked to
+        // change.
+        transport.exec(&v6, &["uname".to_string()]).await.unwrap();
+        let calls = runner.calls();
+        let ssh = calls.last().unwrap();
+        assert_eq!(ssh.program, "ssh");
+        assert!(
+            ssh.args
+                .contains(&"kali@fd14:a432:91d3:c29f:53c1:5b8f:5d2b:299".to_string()),
+            "{ssh:?}"
+        );
     }
 
     #[tokio::test]

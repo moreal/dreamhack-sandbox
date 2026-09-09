@@ -178,11 +178,40 @@ impl UtmProvider {
     }
 
     /// Copies an existing VM, returning the copy's UUID.
+    pub async fn clone_vm(&self, source_id: &str, new_name: &str) -> Result<VmRef> {
+        let mut created = Vec::new();
+        self.clone_vm_reporting(source_id, new_name, &mut created)
+            .await
+    }
+
+    /// [`UtmProvider::clone_vm`], pushing **every** VM UTM registered while
+    /// it ran into `created` -- including the one a *failed* `duplicate`
+    /// leaves behind.
     ///
     /// `duplicate` returns nothing at all (T2), so the new UUID is found by
     /// comparing the registry before and after -- by set difference, with
     /// the name only as a tie-breaker, because names are not unique (T3).
-    pub async fn clone_vm(&self, source_id: &str, new_name: &str) -> Result<VmRef> {
+    ///
+    /// Two things the plain before/after diff had to learn from the real-VM
+    /// run:
+    ///
+    /// * **A `duplicate` that fails can still register a VM.** UTM copies
+    ///   the bundle, registers it, applies the new name and only then moves
+    ///   it into place; a name that is already taken fails that last move
+    ///   with -2700 and leaves the registered copy behind. `created` is
+    ///   filled before the error is raised so the caller can write that VM
+    ///   down instead of leaking it (task-7-b2b-report.md D5).
+    /// * **A clone inherits the source's MAC address**, so two sessions
+    ///   from one image answered to the same IP and an `scp` landed in the
+    ///   wrong guest (D4). Every copy gets a fresh locally administered one
+    ///   here, while it is still stopped -- the only state UTM writes a
+    ///   configuration in (T9).
+    pub async fn clone_vm_reporting(
+        &self,
+        source_id: &str,
+        new_name: &str,
+        created: &mut Vec<VmRef>,
+    ) -> Result<VmRef> {
         let before = self.automation.list().await?;
         let Some(source) = before.iter().find(|vm| vm.id == source_id) else {
             return Err(WargameError::VmCreationFailed(format!(
@@ -197,15 +226,34 @@ impl UtmProvider {
                 source.name, source_id, source.status
             )));
         }
-        self.automation.duplicate(source_id, new_name).await?;
+        // The name is the bundle name on disk, so a copy cannot be given one
+        // another VM already carries. UTM's own refusal names the *staging*
+        // bundle (`<source> 2.utm`) rather than the name that actually
+        // clashed, which is why this is checked here instead.
+        if let Some(taken) = before.iter().find(|vm| vm.name == new_name) {
+            return Err(WargameError::VmCreationFailed(format!(
+                "UTM already has a virtual machine named {new_name:?} ({}), and it names each VM's bundle after it, so a copy cannot be created under that name",
+                taken.id
+            )));
+        }
+
+        let duplicated = self.automation.duplicate(source_id, new_name).await;
 
         let after = self.automation.list().await?;
-        let new: Vec<&UtmVm> = after
+        let new: Vec<VmRef> = after
             .iter()
             .filter(|vm| !before.iter().any(|old| old.id == vm.id))
+            .map(|vm| VmRef {
+                backend: "utm".to_string(),
+                id: vm.id.clone(),
+                name: vm.name.clone(),
+            })
             .collect();
-        let created = match new.as_slice() {
-            [only] => *only,
+        created.extend(new.iter().cloned());
+        duplicated?;
+
+        let copy = match new.as_slice() {
+            [only] => only.clone(),
             [] => {
                 return Err(WargameError::VmCreationFailed(format!(
                     "UTM registered no new virtual machine after duplicating {source_id} as {new_name:?}"
@@ -214,7 +262,7 @@ impl UtmProvider {
             many => many
                 .iter()
                 .find(|vm| vm.name == new_name)
-                .copied()
+                .cloned()
                 .ok_or_else(|| {
                     WargameError::VmCreationFailed(format!(
                         "UTM registered {} new virtual machines while duplicating {source_id} as {new_name:?}; none of them carries that name",
@@ -222,11 +270,10 @@ impl UtmProvider {
                     ))
                 })?,
         };
-        Ok(VmRef {
-            backend: "utm".to_string(),
-            id: created.id.clone(),
-            name: created.name.clone(),
-        })
+        self.automation
+            .set_mac_address(&copy.id, &random_mac())
+            .await?;
+        Ok(copy)
     }
 
     /// Adds a second removable drive backed by `iso` -- the Windows
@@ -348,6 +395,23 @@ impl UtmProvider {
             ),
         })
     }
+}
+
+/// A fresh MAC address for a copy, in UTM's `XX:XX:XX:XX:XX:XX` form.
+///
+/// Locally administered and unicast: bit 1 of the first octet set (the
+/// address is not out of any vendor's OUI, so it can never collide with
+/// real hardware), bit 0 clear (it addresses one interface, not a group).
+/// The other 46 bits are random, which is the same shape UTM's own
+/// generator produces for a VM made from scratch.
+fn random_mac() -> String {
+    let mut bytes: [u8; 6] = rand::random();
+    bytes[0] = (bytes[0] | 0b0000_0010) & 0b1111_1110;
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// UTM's `hypervisor` flag for an architecture/mode pair, or a refusal.
@@ -637,12 +701,35 @@ impl VmProvider for UtmProvider {
         Ok(RuntimeInfo { pid: None })
     }
 
+    /// Waits for an **IPv4** address, and for nothing else.
+    ///
+    /// D3: these guests get a SLAAC ULA about 13 s before their DHCPv4
+    /// lease. Returning that ULA passed the readiness gate and then killed
+    /// the first `scp` of the build -- `ssh` takes a bare IPv6 literal,
+    /// `scp` reads the first colon as its `host:path` separator. The
+    /// address is bracketed for `scp` now (D2), but the guest's IPv4
+    /// address is still what the session records, shows and connects on, so
+    /// the wait is for that: an IPv6-only answer means "not there yet" and
+    /// polling continues until the boot timeout.
     async fn wait_ip(&self, vm: &VmRef, timeout: Duration) -> Result<IpAddr> {
         let deadline = Instant::now() + timeout;
         let mut last_reason;
         loop {
-            match self.automation.guest_ip(&vm.id).await? {
-                Ok(ip) => return Ok(ip),
+            match self.automation.guest_addresses(&vm.id).await? {
+                Ok(addresses) => match addresses.iter().find(|ip| ip.is_ipv4()) {
+                    Some(ip) => return Ok(*ip),
+                    None => {
+                        last_reason = format!(
+                            "the guest agent reports only IPv6 ({}), and an IPv4 address is what this session connects on -- the DHCPv4 lease has not arrived yet",
+                            addresses
+                                .iter()
+                                .map(|ip| ip.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        tracing::debug!(vm = %vm.id, reason = %last_reason, "still waiting for IPv4");
+                    }
+                },
                 Err(reason) => last_reason = reason,
             }
             if Instant::now() >= deadline {
@@ -807,6 +894,29 @@ impl VmProvider for UtmProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D4: `duplicate` copies the source's MAC, so every clone of an image
+    /// came up as the same host. A generated one has to be locally
+    /// administered (bit 1 set) and unicast (bit 0 clear), or it can
+    /// collide with real hardware or be treated as a multicast address.
+    #[test]
+    fn a_generated_mac_is_locally_administered_and_unicast() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let mac = random_mac();
+            let octets: Vec<u8> = mac
+                .split(':')
+                .map(|o| u8::from_str_radix(o, 16).expect("two hex digits"))
+                .collect();
+            assert_eq!(octets.len(), 6, "{mac}");
+            assert_eq!(mac.len(), 17, "UTM's XX:XX:XX:XX:XX:XX form: {mac}");
+            assert_eq!(octets[0] & 0b0000_0010, 0b0000_0010, "not local: {mac}");
+            assert_eq!(octets[0] & 0b0000_0001, 0, "not unicast: {mac}");
+            assert_eq!(mac, mac.to_uppercase(), "{mac}");
+            seen.insert(mac);
+        }
+        assert!(seen.len() > 60, "the addresses must differ: {seen:?}");
+    }
 
     #[test]
     fn hypervisor_is_on_only_for_a_virtualized_arm64_guest() {

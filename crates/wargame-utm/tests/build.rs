@@ -137,10 +137,13 @@ fn verb_of(script: &str) -> &'static str {
     for (marker, verb) in [
         ("make new virtual machine", "make"),
         ("duplicate (first virtual machine", "duplicate"),
-        ("delete vm", "delete"),
-        ("start vm", "start"),
-        ("stop vm", "stop"),
+        ("delete (first virtual machine", "delete"),
+        ("start (first virtual machine", "start"),
+        ("stop (first virtual machine", "stop"),
         ("status of vm", "status"),
+        // The MAC write also touches `network interfaces of c`, so its
+        // own argument is matched first.
+        ("address:macAddr", "mac"),
         ("network interfaces of c", "network"),
         ("set displays of c", "display"),
         ("set hypervisor of c", "hardware"),

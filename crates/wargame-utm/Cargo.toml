@@ -11,6 +11,7 @@ wargame-core.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

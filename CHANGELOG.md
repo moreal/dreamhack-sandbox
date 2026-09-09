@@ -141,6 +141,17 @@ To be released.
     instead of everything on the host. Useful when one profile misbehaves and
     the rest are fine.
 
+ -  **A guest is no longer declared reachable before it has an IPv4 address.**
+    Linux guests pick up an IPv6 address about ten seconds before their IPv4
+    lease arrives, and wargame used to take whichever came first — so
+    `wargame launch` and `wargame profile build` went ahead, and then died
+    copying the first file into the guest, after the whole boot. They now
+    keep waiting, within the same boot timeout, and say plainly when the
+    timeout runs out with only IPv6 in sight.
+
+ -  Copying files to a guest reached over IPv6 works too: the address is now
+    bracketed the way `scp` requires.
+
  -  A profile whose `guest.user` is not a usable account name is now refused
     when it is read, naming the profile and the field. That name is pasted
     into the sudoers line `wargame profile create` asks you to run as root
@@ -155,6 +166,27 @@ To be released.
     records a digest for everything it copies over and the guest recomputes
     each one before anything is unpacked, so a truncated or corrupted
     transfer is caught in the guest rather than silently solved around.
+
+ -  **Deleting a UTM session, profile or image now removes only the virtual
+    machine you named.** It removed *every* virtual machine UTM had — yours
+    included, whether or not wargame created it — and still reported success.
+    `wargame delete`, `wargame prune`, `wargame profile delete` and a
+    rebuild's cleanup of the image it replaced were all affected. If you ran
+    any of them against a UTM profile on an earlier build, check UTM: what it
+    deleted is gone from disk and cannot be recovered from here.
+
+ -  Every other UTM operation — starting, stopping, changing a VM's hardware,
+    network or display, attaching or ejecting an installer disc, taking a
+    copy — now addresses one virtual machine by its identifier as well, so
+    none of them can act on your whole library either.
+
+ -  **Every copy of a UTM virtual machine now gets its own network address.**
+    Copies inherited the original's MAC address, so two sessions launched
+    from the same built image came up as the same machine on the same
+    network: they answered to one IP, and a file copied into one could land
+    in the other. Each copy — a session's VM, a published image, an
+    installation VM adopted from a VM you already had — now gets a fresh,
+    locally administered address before it is ever started.
 
  -  The installation VM a profile is built from now has verbs of its own.
     `wargame stop` and `wargame delete` only ever worked on challenge
