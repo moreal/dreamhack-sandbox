@@ -126,6 +126,18 @@ pub struct UtmVm {
     pub name: String,
 }
 
+/// What [`Automation::eject_removable_drives`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ejected {
+    /// This many removable drives were detached; `0` means there were none.
+    Detached(usize),
+    /// **Nothing was written.** Every drive the VM has is removable, so
+    /// writing the list back would have left it with no drives at all --
+    /// which, on a VM adopted with `--from-vm`, is the user's installed
+    /// system.
+    EveryDriveRemovable,
+}
+
 /// A `qemu-*-softmmu` process still carrying a VM's `-uuid` after it was
 /// stopped (T12).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,34 +275,55 @@ const REPLACE_ISO_BODY: &str = r#"set c to configuration of vm
 				update configuration of vm with c
 				return "ok""#;
 
+/// What the eject script answers when writing the drive list back would
+/// leave the VM with **no drives at all** -- every drive it has reports
+/// `removable: true`. Nothing is written in that case.
+pub const NO_SURVIVING_DRIVE: &str = "wargame-utm:no-surviving-drive";
+
 // Detaching the installer CD. UTM's dictionary has no "remove a drive"
 // verb, so the drive *list* is written back without the removable entries
 // -- the same `update configuration of drives` mechanism §2 verified for
 // appending and replacing one, and the sequence the first real install had
 // to run by hand (task-7-phase-a-report.md §3).
 //
-// Two rules the readback proved:
+// Three rules, two from the readback and one from what this write could
+// destroy:
 //
 // * a surviving drive must echo its own `id` back (`{id:(id of d)}`), or
 //   UTM treats the record as a *new* drive and adds one;
 // * `update configuration` needs a `stopped` VM (T9), which the caller
 //   checks -- so the write only happens when something is actually removable
-//   and the whole thing is a no-op otherwise.
+//   and the whole thing is a no-op otherwise;
+// * **at least one drive must survive.** `removable` is a property of the
+//   drive, set when it was created and not changeable afterwards, and a VM
+//   adopted with `profile create --from-vm` can perfectly well have its
+//   boot disk flagged removable. Writing `{}` back would detach the user's
+//   installed system, irreversibly and silently. So the write is guarded by
+//   a counter of the drives that would remain, and a VM where nothing would
+//   remain is refused with [`NO_SURVIVING_DRIVE`] rather than written to.
 //
-// `kept` and `gone` are deliberately ordinary names: a local whose name
-// collides with an AppleScript parameter name fails to compile with
-// `-2741 Expected expression but found parameter name` (D6).
+// `kept`, `gone` and `keptCount` are deliberately ordinary names: a local
+// whose name collides with an AppleScript parameter name fails to compile
+// with `-2741 Expected expression but found parameter name` (D6). The
+// survivors are counted in the loop rather than with `count of`, which UTM
+// answers 0 for (T5) -- `kept` is a plain list and would count correctly,
+// but counting as we go needs no such distinction.
 const EJECT_MEDIA_BODY: &str = r#"set c to configuration of vm
 				set kept to {}
 				set gone to 0
+				set keptCount to 0
 				repeat with d in (drives of c)
 					if (removable of d) is false then
 						set end of kept to {id:(id of d)}
+						set keptCount to keptCount + 1
 					else
 						set gone to gone + 1
 					end if
 				end repeat
 				if gone > 0 then
+					if keptCount is 0 then
+						return "wargame-utm:no-surviving-drive"
+					end if
 					set drives of c to kept
 					update configuration of vm with c
 				end if
@@ -787,18 +820,26 @@ impl Automation {
     }
 
     /// Detaches every removable drive (the installer CD) by writing the
-    /// drive list back without them, and answers how many were removed.
-    /// Zero is a success: an eject is idempotent.
+    /// drive list back without them.
+    ///
+    /// [`Ejected::Detached(0)`](Ejected::Detached) is a success: an eject is
+    /// idempotent. [`Ejected::EveryDriveRemovable`] means the write was
+    /// refused because nothing would have survived it -- see
+    /// [`NO_SURVIVING_DRIVE`].
     ///
     /// The VM must be `stopped` (T9); the caller checks that, because the
     /// answer to "it is running" is a recovery step, not a retry.
-    pub async fn eject_removable_drives(&self, id: &str) -> Result<usize> {
+    pub async fn eject_removable_drives(&self, id: &str) -> Result<Ejected> {
         let out = self
             .run_on_vm_for(id, &vm_script("", EJECT_MEDIA_BODY), &[])
             .await?;
         let answer = out.trim();
+        if answer == NO_SURVIVING_DRIVE {
+            return Ok(Ejected::EveryDriveRemovable);
+        }
         answer
             .parse::<usize>()
+            .map(Ejected::Detached)
             .map_err(|_| WargameError::ProviderChanged {
                 provider: "utm".to_string(),
                 what: format!(
@@ -1092,6 +1133,38 @@ mod tests {
         assert!(!script.contains("duplicate vm "));
         assert!(!script.contains("virtual machine named"));
         assert!(script.contains(VM_NOT_FOUND));
+    }
+
+    /// The one write in this crate that could destroy a user's OS install:
+    /// it must be impossible to reach with an empty drive list. Asserted on
+    /// the script text, because that is where the decision is made -- no
+    /// fake `osascript` can execute the branch.
+    #[test]
+    fn the_eject_script_never_writes_a_drive_list_with_no_survivor() {
+        let script = vm_script("", EJECT_MEDIA_BODY);
+        let guard = script
+            .find("if keptCount is 0 then")
+            .expect("a guard on the number of surviving drives");
+        let refusal = script
+            .find(&format!("return \"{NO_SURVIVING_DRIVE}\""))
+            .expect("the refusal sentinel");
+        let write = script
+            .find("set drives of c to kept")
+            .expect("the drive-list write");
+        let update = script
+            .find("update configuration of vm with c")
+            .expect("the configuration write");
+        assert!(guard < refusal, "{script}");
+        assert!(
+            refusal < write && refusal < update,
+            "the refusal has to return before either write: {script}"
+        );
+        // And the survivor is still echoed back by its own id, or UTM adds
+        // a drive instead of keeping one.
+        assert!(
+            script.contains("set end of kept to {id:(id of d)}"),
+            "{script}"
+        );
     }
 
     /// T4: `protocol:TCP` collides with the `serial interface` enumerator.

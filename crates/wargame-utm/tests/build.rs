@@ -165,6 +165,9 @@ struct Harness {
     /// script answers with this and empties it, so a second eject really
     /// does report "nothing attached".
     removable: Arc<Mutex<usize>>,
+    /// Overrides what the eject script answers, for the branch where every
+    /// drive is removable and the script refuses to write.
+    eject_answer: Arc<Mutex<Option<String>>>,
 }
 
 /// A runner that plays the scripted registry back. `guest_ip` answers with
@@ -179,6 +182,8 @@ fn harness(registry: Registry, no_guest_agent: bool) -> Harness {
     // one removable drive.
     let removable = Arc::new(Mutex::new(1usize));
     let drives = removable.clone();
+    let eject_answer: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let eject_override = eject_answer.clone();
     fake.set_responder(move |cmd: &Cmd| {
         if cmd.program.ends_with("utmctl") {
             let sub = cmd.args.first().map(String::as_str).unwrap_or("");
@@ -229,6 +234,9 @@ fn harness(registry: Registry, no_guest_agent: bool) -> Harness {
                     ok("ok\n")
                 }
                 "eject" => {
+                    if let Some(answer) = eject_override.lock().unwrap().clone() {
+                        return Ok(ok(&answer));
+                    }
                     let mut left = drives.lock().unwrap();
                     let removed = *left;
                     *left = 0;
@@ -272,6 +280,7 @@ fn harness(registry: Registry, no_guest_agent: bool) -> Harness {
         calls,
         transport,
         removable,
+        eject_answer,
     }
 }
 
@@ -670,6 +679,45 @@ async fn ejecting_a_running_installation_vm_is_blocked_not_a_failure() {
     }
     assert!(!h.calls.contains("osascript:eject"), "{:?}", h.calls.all());
     assert_eq!(*h.removable.lock().unwrap(), 1);
+}
+
+/// The destructive branch, refused. `removable` is fixed when a drive is
+/// created, so a VM adopted with `--from-vm` can have its boot disk flagged
+/// removable; writing the list back without it would detach the user's
+/// installed system. The script returns its refusal sentinel instead, the
+/// build **carries on**, and the reason travels with the outcome.
+#[tokio::test]
+async fn a_build_continues_when_every_drive_is_removable_and_nothing_is_detached() {
+    let h = harness(
+        Registry::with(&[(INSTALLER_ID, "stopped", "wg-build-kali-custom")]),
+        false,
+    );
+    *h.eject_answer.lock().unwrap() = Some("wargame-utm:no-surviving-drive\n".to_string());
+    let profile = kali_profile();
+    let record = record_with_installer(&profile);
+    let req = request(&profile, &record);
+
+    let mut messages = Vec::new();
+    let outcome = run_build_flow(&h.builder, &req, &mut |m| messages.push(m), &())
+        .await
+        .unwrap_or_else(|e| panic!("the build must not fail over this: {}", e.error));
+
+    match &outcome.media {
+        EjectOutcome::EveryDriveRemovable(reason) => {
+            assert!(reason.contains("removable"), "{reason}");
+            assert!(
+                reason.contains("Nothing was changed"),
+                "it has to say nothing happened: {reason}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        messages.iter().any(|m| m.contains("refusing to detach")),
+        "{messages:?}"
+    );
+    // The build still ran to a published image.
+    assert_eq!(outcome.image.id, IMAGE_ID);
 }
 
 #[tokio::test]

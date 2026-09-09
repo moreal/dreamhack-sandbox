@@ -459,10 +459,17 @@ async fn dispatch_profile(ctx: &AppContext, action: ProfileCommand) -> Result<i3
                     report.vm.name
                 ),
                 // `profile eject` refuses a backend with no installation
-                // media before it gets here, and a blocked eject is an
-                // error -- neither can reach this arm.
-                EjectOutcome::NotApplicable | EjectOutcome::Blocked(_) => {
-                    println!("{} has no installer disc attached.", report.vm.name)
+                // media before it gets here, and the two "not done" outcomes
+                // come back as errors -- so none of these should be
+                // reachable. Say what actually happened if one ever is,
+                // rather than claiming the disc was never there.
+                EjectOutcome::NotApplicable => println!(
+                    "{} is on a backend with no installer media to take out; nothing was changed.",
+                    report.vm.name
+                ),
+                EjectOutcome::Blocked(reason) | EjectOutcome::EveryDriveRemovable(reason) => {
+                    println!("Nothing was changed: {reason}");
+                    return Ok(1);
                 }
             }
             println!("Next: wargame profile build {name}");
@@ -497,7 +504,12 @@ async fn dispatch_profile(ctx: &AppContext, action: ProfileCommand) -> Result<i3
                     "  and the build record of {name}. The OS installed in that VM goes with it."
                 );
             }
-            if !confirm_or_abort(force, &format!("Delete the VMs of {name}?")) {
+            let question = if plan.vms.is_empty() {
+                format!("Remove the build record of {name}?")
+            } else {
+                format!("Delete the VMs of {name}?")
+            };
+            if !confirm_or_abort(force, &question, "--force") {
                 println!("Nothing was deleted.");
                 return Ok(1);
             }
@@ -591,28 +603,16 @@ fn prompt_line(prompt: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-/// NAT confirmation (MVP §18): without `--yes`, warns and asks
-/// `Continue? [y/N]` on the TTY; with no TTY to answer on, refuses rather
-/// than hanging or silently proceeding.
+/// NAT confirmation (MVP §18): without `--yes`, warns and asks before
+/// connecting a guest straight to the network.
 fn confirm_nat_or_abort(yes: bool) -> bool {
-    if yes {
-        return true;
+    if !yes {
+        println!(
+            "Warning: NAT networking connects this VM directly to your network, \
+             rather than isolating it (MVP.md §18)."
+        );
     }
-    println!(
-        "Warning: NAT networking connects this VM directly to your network, \
-         rather than isolating it (MVP.md §18)."
-    );
-    print!("Continue? [y/N] ");
-    let _ = std::io::stdout().flush();
-
-    if !std::io::stdin().is_terminal() {
-        return false;
-    }
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    confirm_or_abort(yes, "Continue?", "--yes")
 }
 
 /// The word for a VM's state in a message.
@@ -624,16 +624,17 @@ fn status_word(status: wargame_core::ports::VmStatus) -> &'static str {
     }
 }
 
-/// `question [y/N]` on the TTY, skipped by `--force`. With no TTY to answer
-/// on it refuses, rather than hanging or destroying something unasked.
-fn confirm_or_abort(force: bool, question: &str) -> bool {
-    if force {
+/// `question [y/N]` on the TTY, skipped when `skip` is set (by the flag
+/// `flag` names). With no TTY to answer on it refuses, rather than hanging
+/// or doing something irreversible unasked.
+fn confirm_or_abort(skip: bool, question: &str, flag: &str) -> bool {
+    if skip {
         return true;
     }
     print!("{question} [y/N] ");
     let _ = std::io::stdout().flush();
     if !std::io::stdin().is_terminal() {
-        println!("\nNot a terminal: re-run with --force if that is what you meant.");
+        println!("\nNot a terminal: re-run with {flag} if that is what you meant.");
         return false;
     }
     let mut line = String::new();

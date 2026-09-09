@@ -389,6 +389,69 @@ async fn ejecting_a_running_installation_vm_names_profile_stop() {
     );
 }
 
+/// Stopping the VM would not help: `removable` is fixed when a drive is
+/// created, so the only way out is by hand in UTM. The hint must not send
+/// the user to `profile stop`.
+#[tokio::test]
+async fn ejecting_a_vm_whose_every_drive_is_removable_is_an_error_that_does_not_say_stop() {
+    let f = fixture();
+    f.with_built_profile().await;
+    f.utm_builder
+        .set_eject(Ok(EjectOutcome::EveryDriveRemovable(
+            "every drive of wg-build-kali-arm64 is marked removable".to_string(),
+        )));
+
+    let err = profile_vm::eject(&f.ctx, "kali-arm64", &mut |_| {})
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    let hint = err.hint().unwrap_or_default();
+    assert!(message.contains("marked removable"), "{message}");
+    assert!(
+        !hint.contains("profile stop"),
+        "stopping it changes nothing: {hint}"
+    );
+    assert!(hint.contains("UTM"), "{hint}");
+    assert_eq!(
+        f.record("kali-arm64").await.unwrap().installer_media,
+        InstallerMedia::Attached,
+        "nothing was detached, so nothing may be recorded as detached"
+    );
+}
+
+/// These verbs act on what the *record* owns, so a profile whose backend was
+/// edited afterwards is refused rather than routed to a backend that never
+/// made anything.
+#[tokio::test]
+async fn a_record_from_another_backend_is_refused_by_every_verb() {
+    for verb in ["eject", "stop", "delete"] {
+        let f = fixture();
+        let mut record = f.with_built_profile().await;
+        record.backend = "tart".to_string();
+        f.builds.save(&record).await.unwrap();
+
+        let err = match verb {
+            "eject" => profile_vm::eject(&f.ctx, "kali-arm64", &mut |_| {})
+                .await
+                .unwrap_err(),
+            "stop" => profile_vm::stop(&f.ctx, "kali-arm64").await.unwrap_err(),
+            _ => profile_vm::delete(&f.ctx, "kali-arm64").await.unwrap_err(),
+        };
+        let message = err.to_string();
+        assert!(message.contains("tart"), "{verb}: {message}");
+        assert!(message.contains("utm"), "{verb}: {message}");
+        assert!(f.utm_builder.ejected().is_empty(), "{verb}");
+        assert!(
+            !f.utm_vms
+                .calls()
+                .iter()
+                .any(|c| c == "delete" || c == "stop"),
+            "{verb}: {:?}",
+            f.utm_vms.calls()
+        );
+    }
+}
+
 #[tokio::test]
 async fn ejecting_a_profile_nobody_created_names_profile_create() {
     let f = fixture();

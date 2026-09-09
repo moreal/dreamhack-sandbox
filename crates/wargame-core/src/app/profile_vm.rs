@@ -138,15 +138,32 @@ pub async fn eject(
     let vm = installer_vm(&profile, &record)?;
 
     let outcome = builder.eject_installer_media(&vm, progress).await?;
-    if let EjectOutcome::Blocked(reason) = &outcome {
-        return Err(refuse_with_hint(
-            &profile.name,
-            format!("its installer media is still attached -- {reason}"),
-            format!(
-                "wargame profile stop {0}   # then: wargame profile eject {0}",
-                profile.name
-            ),
-        ));
+    match &outcome {
+        EjectOutcome::Blocked(reason) => {
+            return Err(refuse_with_hint(
+                &profile.name,
+                format!("its installer media is still attached -- {reason}"),
+                format!(
+                    "wargame profile stop {0}   # then: wargame profile eject {0}",
+                    profile.name
+                ),
+            ))
+        }
+        // Stopping the VM does not help here, so the hint must not say so:
+        // `removable` is fixed when a drive is created, and the only way out
+        // is to take the drive out in UTM by hand.
+        EjectOutcome::EveryDriveRemovable(reason) => {
+            return Err(refuse_with_hint(
+                &profile.name,
+                format!("nothing was detached -- {reason}"),
+                format!(
+                    "Open {} in UTM and remove the installer drive there (Settings > Drives). wargame will not write a drive list that leaves a VM with no drive at all, and a drive's `removable` flag cannot be changed after it is created.",
+                    vm.name
+                ),
+            ))
+        }
+        EjectOutcome::Detached(_) | EjectOutcome::NothingAttached | EjectOutcome::NotApplicable => {
+        }
     }
     if outcome.is_detached() && record.installer_media != InstallerMedia::Detached {
         record.installer_media = InstallerMedia::Detached;
@@ -268,8 +285,14 @@ async fn installer_profile(
 ) -> Result<(Profile, Arc<dyn ProfileImageBuilder>, BuildRecord)> {
     let profile = ctx.profiles.get(profile_name)?;
     let execution = resolve_backend(&profile)?;
-    let builder = ctx.builders.get(execution.backend.as_str())?;
-    if !builder.uses_installer_vm() {
+    // A backend that never has an installation VM is refused from the
+    // profile alone, before a record is even looked for: that answer does
+    // not depend on anything having been created.
+    if !ctx
+        .builders
+        .get(execution.backend.as_str())?
+        .uses_installer_vm()
+    {
         return Err(refuse(
             &profile.name,
             format!(
@@ -283,6 +306,20 @@ async fn installer_profile(
         .load(&profile.name)
         .await?
         .ok_or_else(|| no_installation_vm(&profile.name))?;
+    // From here the **record** decides, exactly as it does for the VMs
+    // themselves: it is what owns them, and a profile whose `vm.backend`
+    // was edited after the record was written must not send these verbs to
+    // a backend that never made anything.
+    if record.backend != execution.backend.as_str() {
+        return Err(refuse(
+            &profile.name,
+            format!(
+                "its build record was made for the {} backend but the profile now resolves to {}. `profile {verb}` acts on what the record owns; re-point the profile back, or make a new one (`wargame profile init <template> --name <new>`)",
+                record.backend, execution.backend
+            ),
+        ));
+    }
+    let builder = ctx.builders.get(&record.backend)?;
     Ok((profile, builder, record))
 }
 

@@ -2259,6 +2259,7 @@ name = "wargame-utm"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "tempfile",
  "tokio",
  "tracing",
  "wargame-core",

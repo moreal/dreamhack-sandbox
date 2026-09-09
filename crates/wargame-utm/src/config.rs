@@ -31,7 +31,13 @@ pub const UTM_VM_DIRECTORY: &str = "Library/Containers/com.utmapp.UTM/Data/Docum
 /// [`UTM_VM_DIRECTORY`] as an absolute path, when it exists on this host --
 /// it does not until UTM has run once.
 pub fn utm_vm_directory() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("HOME")?).join(UTM_VM_DIRECTORY);
+    utm_vm_directory_in(&PathBuf::from(std::env::var_os("HOME")?))
+}
+
+/// [`utm_vm_directory`] against a given home directory. Split out so it can
+/// be exercised without depending on the machine the test runs on.
+pub fn utm_vm_directory_in(home: &std::path::Path) -> Option<PathBuf> {
+    let dir = home.join(UTM_VM_DIRECTORY);
     dir.is_dir().then_some(dir)
 }
 

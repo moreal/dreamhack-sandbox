@@ -37,7 +37,9 @@ use wargame_core::ports::{
     VmProvider, VmSpec, VmStatus,
 };
 
-use crate::automation::{Automation, MakeVmParams, OrphanQemu, StopMethod, UtmStatus, UtmVm};
+use crate::automation::{
+    Automation, Ejected, MakeVmParams, OrphanQemu, StopMethod, UtmStatus, UtmVm,
+};
 use crate::config::{
     architecture, display_hardware, meets_minimum, network_mode, parse_version, UtmConfig,
     ISOLATED_NETWORK_DETAIL, MIN_UTM_VERSION, VERIFIED_UTM_VERSION,
@@ -247,10 +249,13 @@ impl UtmProvider {
     /// system that was installed, and a copy taken of that VM inherits the
     /// CD (task-7-phase-a-report.md §5 D3).
     ///
+    /// A VM whose drives are *all* removable is refused rather than
+    /// emptied: see [`Ejected::EveryDriveRemovable`].
+    ///
     /// The VM must be **stopped**: `update configuration` is refused
     /// otherwise (T9), and the recovery for that is to stop it, not to
     /// retry.
-    pub async fn eject_removable_drives(&self, vm: &VmRef) -> Result<usize> {
+    pub async fn eject_removable_drives(&self, vm: &VmRef) -> Result<Ejected> {
         let Some(entry) = self.owned_vm(vm).await? else {
             return Err(WargameError::VmNotFound(format!(
                 "UTM has no virtual machine with id {} ({})",

@@ -12,10 +12,13 @@ pub mod config;
 pub mod console;
 pub mod provider;
 
-pub use automation::{Automation, MakeVmParams, OrphanQemu, StopMethod, UtmStatus, UtmVm};
+pub use automation::{
+    Automation, Ejected, MakeVmParams, OrphanQemu, StopMethod, UtmStatus, UtmVm, NO_SURVIVING_DRIVE,
+};
 pub use build::{RecordImageCatalog, UtmImageBuilder};
 pub use config::{
-    architecture, display_hardware, network_mode, utm_vm_directory, UtmConfig, BUNDLED_UTMCTL,
-    ISOLATED_NETWORK_DETAIL, MIN_UTM_VERSION, UTM_APP, UTM_VM_DIRECTORY, VERIFIED_UTM_VERSION,
+    architecture, display_hardware, network_mode, utm_vm_directory, utm_vm_directory_in, UtmConfig,
+    BUNDLED_UTMCTL, ISOLATED_NETWORK_DETAIL, MIN_UTM_VERSION, UTM_APP, UTM_VM_DIRECTORY,
+    VERIFIED_UTM_VERSION,
 };
 pub use provider::{ImageCatalog, NoBuildRecords, UtmProvider};

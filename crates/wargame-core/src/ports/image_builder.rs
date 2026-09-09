@@ -99,6 +99,12 @@ pub enum EjectOutcome {
     /// to be written, and it was not. Never an error on its own: the build
     /// carries on and says what it skipped.
     Blocked(String),
+    /// **Refused**, and why: every drive this VM has is removable, so
+    /// detaching them would leave it with nothing at all -- which, on a VM
+    /// adopted from one the user already had, is their installed system.
+    /// Nothing was written. Like [`EjectOutcome::Blocked`] this does not
+    /// fail a build; unlike it, no amount of stopping the VM changes it.
+    EveryDriveRemovable(String),
 }
 
 impl EjectOutcome {

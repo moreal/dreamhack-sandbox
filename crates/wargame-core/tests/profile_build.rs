@@ -914,7 +914,7 @@ async fn create_refuses_only_when_the_volume_is_below_the_working_floor() {
     let message = err.to_string();
     assert!(message.contains("4.0 GiB"), "what is free: {message}");
     assert!(
-        message.contains("8"),
+        message.contains("8 GiB"),
         "and the floor it is under: {message}"
     );
 
@@ -2033,6 +2033,72 @@ async fn a_blocked_eject_does_not_stop_the_build_and_does_not_claim_the_media_is
     assert!(
         messages.iter().any(|m| m.contains("started")),
         "the user has to be told why it was skipped: {messages:?}"
+    );
+}
+
+/// Refusing to detach is not a build failure either, and -- unlike a
+/// blocked eject -- no amount of stopping the VM changes it. The build runs
+/// to completion and the record keeps saying the media is attached, because
+/// it is.
+#[tokio::test]
+async fn a_build_continues_when_no_drive_would_survive_the_eject() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    f.utm.set_eject(EjectOutcome::EveryDriveRemovable(
+        "every drive of wg-build-kali-arm64 is marked removable".to_string(),
+    ));
+
+    let mut messages = Vec::new();
+    let record = profile_build::build(&f.ctx, "kali-arm64", &mut |m| messages.push(m))
+        .await
+        .expect("a refusal to detach must not fail the build");
+    assert_eq!(record.phase, BuildPhase::Ready);
+    assert_eq!(record.installer_media, InstallerMedia::Attached);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("refusing to detach") && m.contains("marked removable")),
+        "the reason has to reach the user: {messages:?}"
+    );
+}
+
+/// A VM adopted with `--from-vm` was installed by the user and wargame put
+/// no media in it: whatever removable drives it has are theirs. Nothing is
+/// detached from it at all -- the guard in the script is the second line of
+/// defence, not the first.
+#[tokio::test]
+async fn a_build_from_an_adopted_vm_ejects_nothing_at_all() {
+    let f = fixture();
+    profile_build::create(
+        &f.ctx,
+        "kali-arm64",
+        CreateSource::FromVm {
+            uuid: "C2222222-3333-4444-5555-666666666666".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut messages = Vec::new();
+    let record = profile_build::build(&f.ctx, "kali-arm64", &mut |m| messages.push(m))
+        .await
+        .unwrap();
+    assert!(
+        !f.utm
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("eject_installer_media")),
+        "{:?}",
+        f.utm.calls()
+    );
+    assert_eq!(record.installer_media, InstallerMedia::Unknown);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("cloned from a VM you already had")),
+        "{messages:?}"
     );
 }
 

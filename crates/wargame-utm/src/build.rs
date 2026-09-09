@@ -32,6 +32,7 @@ use wargame_core::ports::{
     VmStatus,
 };
 
+use crate::automation::Ejected;
 use crate::provider::ImageCatalog;
 use crate::UtmProvider;
 
@@ -162,8 +163,12 @@ impl ProfileImageBuilder for UtmImageBuilder {
             VmStatus::Stopped => {
                 progress(format!("detaching the installer media from {}", vm.name));
                 Ok(match self.utm.eject_removable_drives(vm).await? {
-                    0 => EjectOutcome::NothingAttached,
-                    removed => EjectOutcome::Detached(removed),
+                    Ejected::Detached(0) => EjectOutcome::NothingAttached,
+                    Ejected::Detached(removed) => EjectOutcome::Detached(removed),
+                    Ejected::EveryDriveRemovable => EjectOutcome::EveryDriveRemovable(format!(
+                        "every drive of {} ({}) is marked removable, so detaching them would leave it with no drive at all -- and on a VM adopted from one you already had, that is your installed system. Nothing was changed",
+                        vm.name, vm.id
+                    )),
                 })
             }
         }

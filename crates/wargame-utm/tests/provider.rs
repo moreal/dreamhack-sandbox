@@ -23,7 +23,7 @@ use wargame_core::ports::{
 };
 use wargame_core::testing::FakeRunner;
 
-use wargame_utm::{Automation, StopMethod, UtmConfig, UtmProvider, BUNDLED_UTMCTL};
+use wargame_utm::{Automation, Ejected, StopMethod, UtmConfig, UtmProvider, BUNDLED_UTMCTL};
 
 // --- fixtures (real output, byte-exact) ------------------------------------
 
@@ -1330,7 +1330,7 @@ async fn eject_writes_the_drives_back_without_the_removable_ones() {
         .eject_removable_drives(&vm_ref(X86_ID, "wg-x"))
         .await
         .unwrap();
-    assert_eq!(removed, 1);
+    assert_eq!(removed, Ejected::Detached(1));
 
     let calls = fake.calls();
     let call = calls
@@ -1373,12 +1373,54 @@ async fn ejecting_a_vm_with_no_removable_drive_removes_nothing_and_succeeds() {
         p.eject_removable_drives(&vm_ref(X86_ID, "wg-x"))
             .await
             .unwrap(),
-        0
+        Ejected::Detached(0)
     );
 }
 
 /// T9: `update configuration` is accepted only while the VM is `stopped`,
 /// so the drive list is never written to a live one.
+/// The one write in this crate that could destroy a user's OS install. A
+/// VM adopted with `--from-vm` can have its boot disk flagged removable
+/// (`removable` is fixed when a drive is created), and "detach every
+/// removable drive" would then empty it. The script refuses instead, and
+/// the refusal reaches the caller as its own outcome rather than as "0
+/// drives detached".
+#[tokio::test]
+async fn eject_refuses_when_no_drive_would_survive_it() {
+    let fake = runner(|cmd| {
+        if utmctl_sub(cmd) == Some("list") {
+            return Some(ok(&owned_list(X86_ID, "stopped", "wg-x")));
+        }
+        is_osascript(cmd, "removable of d").then(|| ok("wargame-utm:no-surviving-drive\n"))
+    });
+    let p = provider(fake.clone());
+
+    assert_eq!(
+        p.eject_removable_drives(&vm_ref(X86_ID, "wg-x"))
+            .await
+            .unwrap(),
+        Ejected::EveryDriveRemovable,
+        "it must not be reported as a successful eject of nothing"
+    );
+
+    // The script is the only thing that decides whether to write, so the
+    // guard is asserted on its text (see automation.rs's own unit test);
+    // here, what matters is that nothing *else* went out to write a
+    // configuration afterwards.
+    let writes: Vec<String> = fake
+        .calls()
+        .iter()
+        .map(script_of)
+        .filter(|script| script.contains("update configuration"))
+        .collect();
+    assert_eq!(
+        writes.len(),
+        1,
+        "only the eject script itself, which takes its own refusal branch"
+    );
+    assert!(writes[0].contains("if keptCount is 0 then"));
+}
+
 #[tokio::test]
 async fn eject_refuses_a_vm_that_is_not_stopped() {
     for status in ["started", "paused", "stopping"] {
@@ -1431,32 +1473,29 @@ async fn eject_of_a_vm_utm_no_longer_knows_is_an_error() {
 
 /// D1: the qcow2 does not go anywhere near `$WARGAME_HOME`. UTM is
 /// sandboxed and writes its bundles into its own container, so that is the
-/// volume a free-space check has to measure.
+/// volume a free-space check has to measure -- and only once it exists,
+/// because it does not until UTM has run at least once.
 #[test]
-fn the_storage_directory_is_utms_own_sandbox_container() {
+fn the_storage_directory_is_utms_own_sandbox_container_when_it_exists() {
     assert_eq!(
         wargame_utm::UTM_VM_DIRECTORY,
         "Library/Containers/com.utmapp.UTM/Data/Documents"
     );
-    let p = provider(runner(|_| None));
-    // On a host where UTM has never run the directory does not exist, and
-    // the honest answer is "unknown" rather than a path that is not there.
-    match p.storage_dir() {
-        Some(dir) => {
-            assert!(dir.is_dir(), "{}", dir.display());
-            assert!(
-                dir.ends_with(wargame_utm::UTM_VM_DIRECTORY),
-                "{}",
-                dir.display()
-            );
-        }
-        None => assert!(!std::path::Path::new(&format!(
-            "{}/{}",
-            std::env::var("HOME").unwrap_or_default(),
-            wargame_utm::UTM_VM_DIRECTORY
-        ))
-        .is_dir()),
-    }
+    // Against a home of this test's own making, so the answer does not
+    // depend on whether the machine running it has UTM installed.
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(
+        wargame_utm::utm_vm_directory_in(home.path()),
+        None,
+        "a home where UTM has never run has no container yet"
+    );
+
+    let container = home.path().join(wargame_utm::UTM_VM_DIRECTORY);
+    std::fs::create_dir_all(&container).unwrap();
+    assert_eq!(
+        wargame_utm::utm_vm_directory_in(home.path()),
+        Some(container)
+    );
 }
 
 #[tokio::test]

@@ -1141,7 +1141,20 @@ pub async fn run_build_flow(
     // is still attached boots the CD, so the build would wait out its whole
     // boot timeout and the image it published would carry the CD too
     // (task-7-phase-a-report.md §5 D3). Idempotent, so a rebuild is free.
-    let media = eject_installer_media(builder, req, &vm, progress).await?;
+    //
+    // Except on a VM this app never put media into. `profile create
+    // --from-vm` copies a VM the *user* installed: whatever removable
+    // drives it has are theirs, put there for their own reasons, and
+    // "detach every removable drive" is not something to do to it uninvited.
+    let media = if matches!(req.record.source, BuildSource::UtmVm { .. }) {
+        progress(format!(
+            "{} was cloned from a VM you already had, so wargame attached no installer media to it and detaches nothing",
+            vm.name
+        ));
+        EjectOutcome::NotApplicable
+    } else {
+        eject_installer_media(builder, req, &vm, progress).await?
+    };
 
     // From here every failure cleans up after itself before propagating.
     let outcome = build_from(builder, req, &vm, progress, observer).await;
@@ -1262,6 +1275,12 @@ async fn eject_installer_media(
         EjectOutcome::Blocked(reason) => progress(format!(
             "leaving the installer media attached: {reason}. Stop it and build again -- `wargame profile stop {0}` then `wargame profile build {0}` -- if this build cannot reach the guest.",
             req.profile.name
+        )),
+        // Not a failure, and not something stopping the VM would fix: the
+        // build carries on and the reason is on the record's own terms
+        // (nothing is claimed to have been detached).
+        EjectOutcome::EveryDriveRemovable(reason) => progress(format!(
+            "refusing to detach anything: {reason}. Take the installer drive out by hand in UTM if the guest boots it instead of its own disk."
         )),
         EjectOutcome::NotApplicable => {}
     }
