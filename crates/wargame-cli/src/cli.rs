@@ -255,10 +255,38 @@ pub enum ProfileCommand {
         #[arg(long, value_name = "HEX", requires = "iso", conflicts_with = "from_vm")]
         sha256: Option<String>,
     },
-    /// Open the installation VM's console (UTM profiles), to install the OS by hand.
+    /// Start the installation VM (UTM profiles) and open its console, to install the OS by hand.
+    ///
+    /// The VM keeps running after the window opens; `wargame profile stop <name>` stops it.
     Console {
         /// Profile name; see `wargame profiles`.
         name: String,
+    },
+    /// Take the installer disc out of a profile's installation VM.
+    ///
+    /// Run it once the OS is installed: with the disc still in, the machine boots the
+    /// installer again instead of the system on its disk. `profile build` does this for
+    /// you before every build, and doing it twice is harmless. The VM must be stopped.
+    Eject {
+        /// Profile name; see `wargame profiles`.
+        name: String,
+    },
+    /// Stop a profile's installation VM.
+    Stop {
+        /// Profile name; see `wargame profiles`.
+        name: String,
+    },
+    /// Delete a profile's installation VM, the images its builds published, and its build record.
+    ///
+    /// Only the VMs this profile's build record owns are removed, and only while they are
+    /// stopped. The OS install lives in the installation VM, so this cannot be undone.
+    #[command(visible_alias = "rm")]
+    Delete {
+        /// Profile name; see `wargame profiles`.
+        name: String,
+        /// Do not ask for confirmation.
+        #[arg(long, short = 'f')]
+        force: bool,
     },
     /// Build (or rebuild) a profile's reusable image. Slow (tens of minutes) the first time.
     Build {
@@ -354,6 +382,35 @@ mod tests {
             "abc"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn the_installation_vm_has_eject_stop_and_delete_verbs() {
+        assert!(matches!(
+            Cli::parse_from(["wargame", "profile", "eject", "kali"]).command,
+            Some(Command::Profile {
+                action: ProfileCommand::Eject { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["wargame", "profile", "stop", "kali"]).command,
+            Some(Command::Profile {
+                action: ProfileCommand::Stop { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["wargame", "profile", "rm", "kali", "--force"]).command,
+            Some(Command::Profile {
+                action: ProfileCommand::Delete { force: true, .. }
+            })
+        ));
+        // Each of them needs a profile name: there is no "the last one".
+        for verb in ["eject", "stop", "delete"] {
+            assert!(
+                Cli::try_parse_from(["wargame", "profile", verb]).is_err(),
+                "{verb}"
+            );
+        }
     }
 
     #[test]

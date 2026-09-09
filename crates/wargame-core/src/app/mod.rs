@@ -10,6 +10,7 @@ pub mod doctor;
 pub mod launch;
 pub mod lifecycle;
 pub mod profile_build;
+pub mod profile_vm;
 pub mod profiles;
 pub mod search;
 
@@ -33,9 +34,10 @@ pub use lifecycle::{
 };
 pub use profile_build::{
     build as build_profile_image, console as open_profile_console, create as create_profile_vm,
-    image_status, init as init_profile, launch_image, BuilderRegistry, CreateOutcome, CreateSource,
-    InitOutcome, ProfileImageStatus,
+    image_status, init as init_profile, launch_image, BuilderRegistry, ConsoleOutcome,
+    CreateOutcome, CreateSource, InitOutcome, ProfileImageStatus,
 };
+pub use profile_vm::{DeletePlan, DeleteReport, EjectReport, OwnedVm, StopReport, VmRole};
 pub use profiles::{
     overview as profile_overview, overviews as profile_overviews, ImageReadiness, ProfileOverview,
     ProfileStore,

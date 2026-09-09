@@ -54,7 +54,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// sends the user to the provisioning log, which is exactly where the answer
 /// is *not* when a profile is fine and the command simply does not apply to
 /// it (spec.md §6 wants the recovery step, not a wrong one).
-fn refuse(profile: &str, reason: impl std::fmt::Display) -> WargameError {
+pub(super) fn refuse(profile: &str, reason: impl std::fmt::Display) -> WargameError {
     WargameError::Other(format!("profile {profile}: {reason}"))
 }
 
@@ -586,8 +586,17 @@ fn privilege_guidance(profile: &Profile) -> Vec<String> {
 
 // --- profile console ------------------------------------------------------
 
+/// What [`console`] opened, and what to do with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleOutcome {
+    pub vm: VmRef,
+    /// Printed under the "opened" line: this verb *starts* the VM and
+    /// leaves it running, which nothing used to say (D4).
+    pub guidance: Vec<String>,
+}
+
 /// Opens the installation VM's window (spec.md §4's `profile console`).
-pub async fn console(ctx: &AppContext, profile_name: &str) -> Result<()> {
+pub async fn console(ctx: &AppContext, profile_name: &str) -> Result<ConsoleOutcome> {
     let profile = ctx.profiles.get(profile_name)?;
     let execution = resolve_backend(&profile)?;
     let builder = ctx.builders.get(execution.backend.as_str())?;
@@ -603,9 +612,34 @@ pub async fn console(ctx: &AppContext, profile_name: &str) -> Result<()> {
     let record = require_record(ctx, &profile).await?;
     let vm = record
         .installer_vm
-        .as_ref()
+        .clone()
         .ok_or_else(|| no_installer_vm(&profile.name))?;
-    builder.open_console(vm).await
+    builder.open_console(&vm).await?;
+    Ok(ConsoleOutcome {
+        guidance: console_guidance(&profile.name, &record),
+        vm,
+    })
+}
+
+/// What to say after the console window is up.
+///
+/// It has to say that the VM is now *running*, because it is: `profile
+/// console` starts it, and before this the CLI printed only "Opened",
+/// leaving the user with no wargame verb that could stop it again
+/// (task-7-phase-a-report.md §5 D4).
+fn console_guidance(profile: &str, record: &BuildRecord) -> Vec<String> {
+    let mut lines = vec![format!(
+        "The installation VM is now running, and stays up until you stop it: wargame profile stop {profile}"
+    )];
+    if record.installer_media != InstallerMedia::Detached {
+        lines.push(format!(
+            "Once the OS is installed, take the installer disc out -- otherwise the machine boots the installer again, not the system you just installed:  wargame profile eject {profile}"
+        ));
+    }
+    lines.push(format!(
+        "When the guest is ready (SSH, guest agent, the host key), build the image:  wargame profile build {profile}"
+    ));
+    lines
 }
 
 async fn require_record(ctx: &AppContext, profile: &Profile) -> Result<BuildRecord> {
@@ -615,7 +649,7 @@ async fn require_record(ctx: &AppContext, profile: &Profile) -> Result<BuildReco
         .ok_or_else(|| no_installer_vm(&profile.name))
 }
 
-fn no_installer_vm(profile: &str) -> WargameError {
+pub(super) fn no_installer_vm(profile: &str) -> WargameError {
     WargameError::ImageNotBuilt {
         profile: profile.to_string(),
         detail: "it has no installation VM yet".to_string(),

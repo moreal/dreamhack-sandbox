@@ -35,6 +35,7 @@ pub struct FakeVmProvider {
     capabilities: Mutex<ProviderCapabilities>,
     default_ip: IpAddr,
     isolated_network: Mutex<Option<bool>>,
+    orphan_on_stop: Mutex<Option<u32>>,
 }
 
 impl FakeVmProvider {
@@ -68,6 +69,7 @@ impl FakeVmProvider {
             }),
             default_ip: IpAddr::from_str("10.0.0.5").unwrap(),
             isolated_network: Mutex::new(None),
+            orphan_on_stop: Mutex::new(None),
         }
     }
 
@@ -97,9 +99,26 @@ impl FakeVmProvider {
         *self.isolated_network.lock().unwrap() = value;
     }
 
-    /// Steps: `"healthcheck"`, `"create"`, `"start"`, `"wait_ip"`.
+    /// Steps: `"healthcheck"`, `"create"`, `"start"`, `"wait_ip"`,
+    /// `"stop"`, `"delete"`.
     pub fn set_fail_on(&self, step: &'static str) {
         *self.fail_on.lock().unwrap() = Some(step);
+    }
+
+    /// Registers a VM this fake did not create, so a test can act on one
+    /// some other fake made -- a build record's installation VM, say.
+    pub fn set_vm(&self, name: impl Into<String>, status: VmStatus) {
+        self.vms
+            .lock()
+            .unwrap()
+            .insert(name.into(), VmEntry { status, ip: None });
+    }
+
+    /// Makes `stop` fail the way a backend does when a process it never
+    /// spawned is still holding the VM's files (UTM's trap T12), so a
+    /// caller can be checked for passing that through with its pid.
+    pub fn set_orphan_on_stop(&self, pid: u32) {
+        *self.orphan_on_stop.lock().unwrap() = Some(pid);
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -219,6 +238,21 @@ impl VmProvider for FakeVmProvider {
 
     async fn stop(&self, vm: &VmRef) -> Result<()> {
         self.record("stop");
+        if let Some(pid) = *self.orphan_on_stop.lock().unwrap() {
+            return Err(WargameError::OrphanProcess {
+                pid,
+                detail: format!(
+                    "{} is reported as stopped, but a backend process (pid {pid}) is still holding its files",
+                    vm.name
+                ),
+            });
+        }
+        if self.should_fail("stop") {
+            return Err(WargameError::CleanupFailed(format!(
+                "fake stop failure for {}",
+                vm.name
+            )));
+        }
         if let Some(entry) = self.vms.lock().unwrap().get_mut(&vm.name) {
             entry.status = VmStatus::Stopped;
         }
@@ -227,6 +261,12 @@ impl VmProvider for FakeVmProvider {
 
     async fn delete(&self, vm: &VmRef) -> Result<()> {
         self.record("delete");
+        if self.should_fail("delete") {
+            return Err(WargameError::CleanupFailed(format!(
+                "fake delete failure for {}",
+                vm.name
+            )));
+        }
         self.vms.lock().unwrap().remove(&vm.name);
         Ok(())
     }

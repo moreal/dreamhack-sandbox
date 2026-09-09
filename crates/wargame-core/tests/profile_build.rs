@@ -853,14 +853,47 @@ async fn console_opens_the_installer_vm_and_refuses_tart() {
     let outcome = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
         .await
         .unwrap();
-    profile_build::console(&f.ctx, "kali-arm64").await.unwrap();
+    let opened = profile_build::console(&f.ctx, "kali-arm64").await.unwrap();
     let id = outcome.record.installer_vm.unwrap().id;
     assert!(f.utm.calls().contains(&format!("open_console:{id}")));
+
+    // The console *starts* the VM, and it stays up afterwards -- the one
+    // thing the old wording never said, which is how phase A ended up
+    // stopping installation VMs with `utmctl` (D4).
+    let guidance = opened.guidance.join("\n");
+    assert!(
+        guidance.contains("running") || guidance.contains("started"),
+        "the console starts the VM and must say so: {guidance}"
+    );
+    assert!(
+        guidance.contains("wargame profile stop kali-arm64"),
+        "and how to stop it again: {guidance}"
+    );
+    assert!(
+        guidance.contains("wargame profile build kali-arm64"),
+        "and what comes next: {guidance}"
+    );
 
     let err = profile_build::console(&f.ctx, "macos-re-arm64")
         .await
         .unwrap_err();
     assert!(err.to_string().contains("installation VM"), "{err}");
+}
+
+/// Once the OS is installed the CD is what the machine boots, so the
+/// console has to name the verb that takes it out.
+#[tokio::test]
+async fn the_console_of_a_vm_that_still_has_its_installer_media_says_how_to_eject_it() {
+    let f = fixture();
+    profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let opened = profile_build::console(&f.ctx, "kali-arm64").await.unwrap();
+    let guidance = opened.guidance.join("\n");
+    assert!(
+        guidance.contains("wargame profile eject kali-arm64"),
+        "{guidance}"
+    );
 }
 
 // --- profile build --------------------------------------------------------

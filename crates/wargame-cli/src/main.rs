@@ -14,12 +14,13 @@ use clap::{CommandFactory, Parser};
 
 use wargame_core::app::{
     build_profile_image, create_profile_vm, delete, doctor, doctor_profile, init_profile, inspect,
-    keep, launch, list_sessions, open, open_gui, open_profile_console, profile_overviews, prune,
-    resolve_session, resume, search, ssh_command, stop, AppContext, CreateSource, LaunchEvent,
-    LaunchRequest, UnmanagedVm,
+    keep, launch, list_sessions, open, open_gui, open_profile_console, profile_overviews,
+    profile_vm, prune, resolve_session, resume, search, ssh_command, stop, AppContext,
+    CreateSource, LaunchEvent, LaunchRequest, UnmanagedVm,
 };
 use wargame_core::domain::{ChallengeRef, KeepPolicy, NetworkMode, SessionState};
 use wargame_core::error::{Result, WargameError};
+use wargame_core::ports::image_builder::EjectOutcome;
 use wargame_core::ports::{AuthState, SearchQuery, Secret};
 
 use cli::{AuthCommand, Cli, Command, ProfileCommand, SessionCommand};
@@ -436,10 +437,79 @@ async fn dispatch_profile(ctx: &AppContext, action: ProfileCommand) -> Result<i3
         }
 
         ProfileCommand::Console { name } => {
-            println!("Opening the installation VM for {name}…");
-            open_profile_console(ctx, &name).await?;
+            println!("Starting the installation VM for {name} and opening its window…");
+            let opened = open_profile_console(ctx, &name).await?;
+            println!("✓ {} ({}) is open.", opened.vm.name, opened.vm.id);
+            for line in &opened.guidance {
+                println!("  {line}");
+            }
+            Ok(0)
+        }
+
+        ProfileCommand::Eject { name } => {
+            let report = profile_vm::eject(ctx, &name, &mut |msg| println!("… {msg}")).await?;
+            match report.outcome {
+                EjectOutcome::Detached(n) => println!(
+                    "✓ took the installer disc out of {} ({n} removable drive{}). It now boots from its own disk.",
+                    report.vm.name,
+                    if n == 1 { "" } else { "s" }
+                ),
+                EjectOutcome::NothingAttached => println!(
+                    "{} has no installer disc attached; nothing to do.",
+                    report.vm.name
+                ),
+                // `profile eject` refuses a backend with no installation
+                // media before it gets here, and a blocked eject is an
+                // error -- neither can reach this arm.
+                EjectOutcome::NotApplicable | EjectOutcome::Blocked(_) => {
+                    println!("{} has no installer disc attached.", report.vm.name)
+                }
+            }
+            println!("Next: wargame profile build {name}");
+            Ok(0)
+        }
+
+        ProfileCommand::Stop { name } => {
+            let report = profile_vm::stop(ctx, &name).await?;
+            if report.was_running {
+                println!("✓ stopped {} ({}).", report.vm.name, report.vm.id);
+            } else {
+                println!(
+                    "{} ({}) is already {}; nothing to stop.",
+                    report.vm.name,
+                    report.vm.id,
+                    status_word(report.status)
+                );
+            }
+            Ok(0)
+        }
+
+        ProfileCommand::Delete { name, force } => {
+            let plan = profile_vm::plan_delete(ctx, &name).await?;
+            if plan.vms.is_empty() {
+                println!("Profile {name} owns no VMs; removing its build record.");
+            } else {
+                println!("This deletes, permanently:");
+                for owned in &plan.vms {
+                    println!("  {} [{}]", owned.describe(), status_word(owned.status));
+                }
+                println!(
+                    "  and the build record of {name}. The OS installed in that VM goes with it."
+                );
+            }
+            if !confirm_or_abort(force, &format!("Delete the VMs of {name}?")) {
+                println!("Nothing was deleted.");
+                return Ok(1);
+            }
+            let report = profile_vm::delete(ctx, &name).await?;
+            for owned in &report.deleted {
+                println!("deleted {}", owned.describe());
+            }
+            for owned in &report.already_gone {
+                println!("{} was already gone", owned.describe());
+            }
             println!(
-                "Opened. Install the OS and prepare SSH there, then: wargame profile build {name}"
+                "✓ profile {name} has no VMs left. Start again with: wargame profile create {name} --iso <path>"
             );
             Ok(0)
         }
@@ -536,6 +606,34 @@ fn confirm_nat_or_abort(yes: bool) -> bool {
     let _ = std::io::stdout().flush();
 
     if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// The word for a VM's state in a message.
+fn status_word(status: wargame_core::ports::VmStatus) -> &'static str {
+    match status {
+        wargame_core::ports::VmStatus::Running => "running",
+        wargame_core::ports::VmStatus::Stopped => "stopped",
+        wargame_core::ports::VmStatus::Missing => "already gone",
+    }
+}
+
+/// `question [y/N]` on the TTY, skipped by `--force`. With no TTY to answer
+/// on it refuses, rather than hanging or destroying something unasked.
+fn confirm_or_abort(force: bool, question: &str) -> bool {
+    if force {
+        return true;
+    }
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    if !std::io::stdin().is_terminal() {
+        println!("\nNot a terminal: re-run with --force if that is what you meant.");
         return false;
     }
     let mut line = String::new();

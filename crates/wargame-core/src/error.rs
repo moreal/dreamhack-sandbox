@@ -40,6 +40,13 @@ pub enum WargameError {
     },
     #[error("insufficient resources: {0}")]
     InsufficientResources(String),
+    /// A command that does not apply right now, together with the command
+    /// that makes it apply. Carries its own hint because the recovery is
+    /// specific to what was refused -- "stop it first", "build it first" --
+    /// and a per-variant default would send the user to the wrong place
+    /// (spec.md §6: 실패마다 다음 행동을 제시한다).
+    #[error("{detail}")]
+    Refused { detail: String, hint: String },
     #[error("VM backend {backend} unavailable: {reason}")]
     BackendUnavailable { backend: String, reason: String },
     #[error("VM creation failed: {0}")]
@@ -154,6 +161,7 @@ impl WargameError {
                 Some(format!("wargame profile build {profile}"))
             }
             WargameError::ImageNotBuilt { hint, .. } => Some(hint.clone()),
+            WargameError::Refused { hint, .. } => Some(hint.clone()),
             WargameError::AuthenticationRequired { .. } => {
                 Some("wargame auth login".to_string())
             }
