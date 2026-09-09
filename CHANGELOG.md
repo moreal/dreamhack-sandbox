@@ -29,9 +29,11 @@ To be released.
     boot the first time (30 minutes is the default patience, raise it with
     `[vm.utm].boot_timeout_secs`).
 
- -  The Kali and Windows profiles have not yet been driven end to end
-    against a fully installed guest. Treat them as ready to try, not as
-    proven.
+ -  Kali has been driven end to end against fully installed guests, on both
+    architectures: installed from the ISO, built into a reusable image,
+    launched with a challenge in it, stopped, resumed and deleted. The
+    **Windows** profile has not — nobody here had a Windows ISO — so treat
+    that one as ready to try, not as proven.
 
  -  Guests that Tart cannot host are now run through UTM. You never choose
     the virtualizer yourself: each profile names the guest it wants and
@@ -160,6 +162,13 @@ To be released.
     publishes under a name of its own, the build record is what identifies
     the image, and the image being replaced is deleted only once the record
     points at the new one.
+
+ -  **One exception, on macOS/Tart profiles only:** a Tart rebuild still
+    removes the old image before it makes the new one, so a build that fails
+    leaves that profile with no image and has to be run again. It says so
+    loudly — `wargame profiles` and `wargame doctor` show the profile as not
+    built, and `wargame launch` refuses — and your other profiles are
+    untouched. Kali and Windows profiles keep their previous image.
 
  -  A publish that fails no longer leaves a virtual machine behind that
     nothing knows about. Whatever UTM registered is written into the build

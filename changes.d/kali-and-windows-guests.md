@@ -11,6 +11,8 @@ priority: -50
     boot the first time (30 minutes is the default patience, raise it with
     `[vm.utm].boot_timeout_secs`).
 
- -  The Kali and Windows profiles have not yet been driven end to end
-    against a fully installed guest. Treat them as ready to try, not as
-    proven.
+ -  Kali has been driven end to end against fully installed guests, on both
+    architectures: installed from the ISO, built into a reusable image,
+    launched with a challenge in it, stopped, resumed and deleted. The
+    **Windows** profile has not — nobody here had a Windows ISO — so treat
+    that one as ready to try, not as proven.

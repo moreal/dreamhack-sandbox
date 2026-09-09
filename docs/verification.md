@@ -215,20 +215,27 @@ re-run; the tenth was a documentation decision and is unchanged by design
 
 ### Three items the re-run opened
 
-None is in the product; all three are recorded rather than fixed.
+None was in the product. Two are **fixed** in `bf10421`; the third is a watched anomaly.
 
 - **N1 — the gated UTM e2e suite cannot run in parallel, and nothing says so.** Under the default
-  four-thread harness against one UTM, three of four tests fail: UTM's AppleScript connection collapses
+  four-thread harness against one UTM, three of four tests failed: UTM's AppleScript connection collapses
   under concurrent `osascript` (`-609`), and `utm_never_deletes_a_vm_it_does_not_own`'s "the VM count
-  did not change" invariant is global, so another test's clone breaks it. With `--test-threads=1` three
-  of four pass. The invocation in the file's own module comment carries no `--test-threads=1`, so the
-  documented command fails on a healthy host (`task-7-rerun-report.md` N1, `logs/39`, `40`). **Open.**
-- **N2 — `utm_reports_the_recorded_vms_read_only` can never pass since the D7 fix.** The fixture builds
-  the provider without `.with_image_catalog(…)`, so `UtmProvider::images` is `NoBuildRecords`; the D7
-  change asks the record store first, which then always answers `false`, making the assertion
-  unsatisfiable. The fixture already loads the real `JsonBuildRepository` — it just never hands it to
+  did not change" invariant is global, so another test's clone broke it. With `--test-threads=1` three
+  of four passed. The invocation in the file's own module comment carried no `--test-threads=1`, so the
+  documented command failed on a healthy host (`task-7-rerun-report.md` N1, `logs/39`, `40`).
+  **CLOSED in `bf10421`:** every test in the file takes a process-wide `UTM_LOCK`, so the suite is
+  serial whatever `--test-threads` says, both count assertions are now id comparisons, and
+  `--test-threads=1` is in the documented command as a readability nicety rather than the only thing
+  keeping the run green. **Not re-run against a real UTM** — the fix is in the test harness, and this
+  branch's later work did not re-drive the gated suite.
+- **N2 — `utm_reports_the_recorded_vms_read_only` can never pass since the D7 fix.** The fixture built
+  the provider without `.with_image_catalog(…)`, so `UtmProvider::images` was `NoBuildRecords`; the D7
+  change asks the record store first, which then always answered `false`, making the assertion
+  unsatisfiable. The fixture already loaded the real `JsonBuildRepository` — it just never handed it to
   the provider. A permanently red opt-in test, not a product defect
-  (`task-7-rerun-report.md` N2). **Open.**
+  (`task-7-rerun-report.md` N2). **CLOSED in `bf10421`:** the fixture now hands the provider a
+  `RecordImageCatalog` over the same `$WARGAME_HOME` build records, which is the wiring the real
+  binary uses. **Not re-run against a real UTM** either.
 - **N3 — one non-reproducible stop of a running session at the first `gui`.** The command reported
   success and the session then went `pausing` → `stopped`, so the next `ssh` failed. **Five further
   `gui` calls did not reproduce it**, including one repeating the exact preceding sequence and three
@@ -254,8 +261,11 @@ not evidence:
 - `guest/bootstrap.ps1` and the PowerShell transport have **never executed against a Windows guest**
   (`task-5-report.md` concern; `task-7-e2e-report.md`). `scripts/e2e-multi-os.sh` reports its three
   guest-side checks as `UNVERIFIED` for a `powershell` guest rather than guessing.
-- `windows-x86_64.yaml` ships `tools.verify: []`, so the Windows cmdlet verify lines that Task 5's
-  parameter-binder fix targets have never been exercised either.
+- `windows-x86_64.yaml` has shipped five `tools.verify` lines since `67b54b0` (PowerShell version,
+  `sc.exe query sshd`, `python --version`, `git --version`, `7z i`), and **none of them has ever
+  run**: every one is a native executable precisely because a cmdlet would bind its quoted parameter
+  names as positional values, which is the trap Task 5's parameter-binder fix targets and which only
+  a real Windows guest can exercise.
 
 ## Bugs found by the real runs, and how each was fixed
 
@@ -449,16 +459,16 @@ number needs changing; what actually broke these paths was bugs 21/22, which no 
 | Both macOS profiles end to end on real Tart VMs, incl. the pre-branch session record (AC-01) | `copy_in`'s **IPv6 bracketing branch** (bug 21) — a unit test only, and now unreachable in practice: since the address gate waits for IPv4, no IPv6-only address ever reaches `scp` |
 | Kali arm64 and x86_64 installed from ISO twice, `profile build` six times, five publishes, `uname -m`, `hypervisor` off (AC-02, AC-03, AC-04) | `show_console`'s `false` branch — Tart's `gui`, which still stops and starts, is covered by the MVP record above, not by a multi-OS run |
 | `profile create --iso` and `--from-vm`, `profile console`, source preservation (AC-05) | `guest.user` validation, `doctor`'s three-way Pass/Fail/NotSetUp, the `unknown` image state (a backend that cannot answer) |
-| **`profile eject`'s write branch on both real installed guests** — the removable drive gone, the OS disk intact, the VM then booting from it — plus the no-op and read paths | Everything Windows: `guest/bootstrap.ps1`, the PowerShell transport, `-EncodedCommand`, the 3010 reboot path, `windows-x86_64.yaml`'s empty `tools.verify` |
+| **`profile eject`'s write branch on both real installed guests** — the removable drive gone, the OS disk intact, the VM then booting from it — plus the no-op and read paths | Everything Windows: `guest/bootstrap.ps1`, the PowerShell transport, `-EncodedCommand`, the 3010 reboot path, `windows-x86_64.yaml`'s five `tools.verify` lines (shipped since `67b54b0`, never executed) |
 | `delete`, `start`, `stop`, `duplicate`, `set_network_mode` each affecting exactly one VM, with a running bystander present (bug 20); a **real `wargame prune`** deleting exactly one orphan (AC-08) | The `prune` branches no real leftover produced — the rest of the 19 lifecycle tests on in-memory fakes |
 | A clone getting its own MAC — two concurrent sessions from one image, distinct MACs and leases, each guest holding only its own challenge (bug 23) | Tart's "previous image preserved on failure" exception (its `prepare` deletes the image before cloning) |
 | Rebuilding a profile that already has an image, four times, with the previous image deleted only afterwards (bug 24, AC-06, AC-09) | The `EveryDriveRemovable` eject refusal — no VM could be contrived with only removable drives |
-| The IPv4 wait actually waiting through a live IPv6-only window (bug 22); every `scp` landing on an IPv4 literal (bug 21) | `crates/wargame-utm/tests/e2e.rs`'s `utm_reports_the_recorded_vms_read_only` — permanently red on a fixture defect (N2) |
+| The IPv4 wait actually waiting through a live IPv6-only window (bug 22); every `scp` landing on an IPv4 literal (bug 21) | `crates/wargame-utm/tests/e2e.rs` since `bf10421` — N1's serialisation and N2's image-catalog wiring are fixed in the harness but the gated suite has not been re-run against a real UTM |
 | `gui` leaving a running guest's boot time unchanged, six times (bug 26) | — |
 | `doctor`'s disk row on the right volume; a record's image going `missing` when UTM loses it | — |
 | Guest-side isolation and NAT, from inside the guest (AC-10) | — |
 | Guest file hashes against host staging on both architectures, incl. a real Dreamhack asset (AC-07); archive-escape refusals in the guest (AC-11) | — |
-| `scripts/e2e-multi-os.sh` end to end, three green runs, "nothing was left unverified"; the gated UTM suite serially, 3 of 4 passing incl. the exactly-one-delete test | — |
+| `scripts/e2e-multi-os.sh` end to end, three green runs, "nothing was left unverified"; the gated UTM suite serially, 3 of 4 passing incl. the exactly-one-delete test (the 4th was N2, fixed in `bf10421` and not re-run) | — |
 | The gate: fmt, clippy, `cargo test --workspace`, `nix flake check`, `shellcheck`, `sacho check` (AC-12) | — |
 
 ## Explicitly unverified

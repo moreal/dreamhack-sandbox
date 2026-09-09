@@ -7,6 +7,13 @@
     the image, and the image being replaced is deleted only once the record
     points at the new one.
 
+ -  **One exception, on macOS/Tart profiles only:** a Tart rebuild still
+    removes the old image before it makes the new one, so a build that fails
+    leaves that profile with no image and has to be run again. It says so
+    loudly — `wargame profiles` and `wargame doctor` show the profile as not
+    built, and `wargame launch` refuses — and your other profiles are
+    untouched. Kali and Windows profiles keep their previous image.
+
  -  A publish that fails no longer leaves a virtual machine behind that
     nothing knows about. Whatever UTM registered is written into the build
     record first, so `wargame prune` leaves it alone and the next successful
