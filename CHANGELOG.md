@@ -195,6 +195,17 @@ To be released.
     each one before anything is unpacked, so a truncated or corrupted
     transfer is caught in the guest rather than silently solved around.
 
+ -  Changing the VM name prefix no longer puts your own installation VM and
+    built images out of reach. With a custom `[vm.utm].vm_prefix` and the
+    default build prefix, `wargame profile stop|eject|delete` — and the
+    build's own shutdown — refused to touch the VM they had just made,
+    saying it was not wargame's. Both prefixes now count as this app's.
+
+ -  A profile YAML written by hand is now checked for a usable
+    `metadata.name` when it is read, the same way `wargame profile init`
+    checks the name you give it. A name like `../x` used to be accepted and
+    then used as a directory name for that profile's build record and logs.
+
  -  **Deleting a UTM session, profile or image now removes only the virtual
     machine you named.** It removed *every* virtual machine UTM had — yours
     included, whether or not wargame created it — and still reported success.
@@ -337,6 +348,13 @@ To be released.
     already finished. The wording stops at what is actually known — the disc is
     out — rather than claiming the guest was checked; a profile whose disc is
     still in is still `awaiting-install`.
+
+ -  `wargame profiles --json` no longer prints the guest password from the
+    profile. It used to include the whole profile, password and all, so
+    anything that captured that output — a log, a pipe, a CI artifact —
+    captured the password with it. The password is still read from the
+    profile and still used to build the image; it is simply never written
+    out.
 
  -  `wargame prune` now deletes only the VMs this wargame home actually
     made and wrote down. A VM that merely starts with the same name prefix

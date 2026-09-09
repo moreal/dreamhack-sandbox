@@ -140,6 +140,33 @@ fn profiles_json_lists_every_builtin_profile_including_the_templates() {
     );
 }
 
+/// `profiles --json` flattens each profile onto stdout, and the shipped
+/// macOS profiles carry a `guest.password` the build uses. A secret that
+/// reaches stdout reaches every log and CI artifact that captures it, so it
+/// must not be in there at all.
+#[test]
+fn profiles_json_never_prints_the_guest_password() {
+    let home = tempfile::tempdir().unwrap();
+    let out = fixture_fake_cmd(home.path())
+        .args(["profiles", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let raw = stdout_of(&out);
+    assert!(!raw.contains("password"), "{raw}");
+
+    let profiles: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let macos = profiles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "macos-re-arm64")
+        .unwrap();
+    assert!(macos["guest"]["password"].is_null(), "{macos}");
+    // ... and the guest block is otherwise intact.
+    assert_eq!(macos["guest"]["user"], "admin");
+}
+
 /// spec.md §3 FR-1: every profile view names the guest OS and architecture,
 /// the *resolved* backend and execution mode, and the image state. `--json`
 /// carries the same answers the table does.

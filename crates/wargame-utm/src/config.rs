@@ -116,8 +116,15 @@ impl UtmConfig {
     }
 
     /// Whether `name` is inside this app's namespace.
+    ///
+    /// Either prefix counts. They nest by default ([`Self::build_prefix`]
+    /// starts with [`Self::vm_prefix`]), but the two are configured
+    /// independently: a user who sets `vm_prefix` alone would otherwise
+    /// leave every build VM -- the installation VM and the published images
+    /// -- outside the namespace, and `profile stop|eject|delete` and the
+    /// build's own shutdown would refuse to touch the VM they just made.
     pub fn owns_name(&self, name: &str) -> bool {
-        name.starts_with(&self.vm_prefix)
+        name.starts_with(&self.vm_prefix) || name.starts_with(&self.build_prefix)
     }
 }
 
@@ -231,5 +238,34 @@ mod tests {
         assert_ne!(cfg.build_prefix, cfg.vm_prefix);
         assert!(cfg.owns_name("wg-build-kali-custom"));
         assert!(cfg.owns_name("wg-build-image-kali-custom"));
+    }
+
+    /// The two prefixes are configured independently. Setting only
+    /// `vm_prefix` must not put this app's own build VMs out of reach of
+    /// `profile stop|eject|delete` and of the build's own shutdown.
+    #[test]
+    fn a_custom_session_prefix_still_owns_the_default_build_prefix() {
+        let cfg = UtmConfig {
+            vm_prefix: "mine-".to_string(),
+            ..UtmConfig::default()
+        };
+        assert!(cfg.owns_name("mine-dh-out-of-bound-a1b2c3"));
+        assert!(cfg.owns_name("wg-build-kali-custom"));
+        assert!(cfg.owns_name("wg-build-image-kali-custom"));
+        assert!(!cfg.owns_name("kindle-vm"));
+        assert!(!cfg.owns_name("Windows 11"));
+    }
+
+    /// ... and the other way round: a custom build prefix outside the
+    /// session one is owned too.
+    #[test]
+    fn a_build_prefix_outside_the_session_prefix_is_still_owned() {
+        let cfg = UtmConfig {
+            build_prefix: "wgb-".to_string(),
+            ..UtmConfig::default()
+        };
+        assert!(cfg.owns_name("wgb-kali-custom"));
+        assert!(cfg.owns_name("wg-dh-out-of-bound-a1b2c3"));
+        assert!(!cfg.owns_name("kindle-vm"));
     }
 }

@@ -399,8 +399,8 @@ impl UtmProvider {
         };
         if !self.cfg.owns_name(&entry.name) {
             return Err(WargameError::CleanupFailed(format!(
-                "refusing to touch UTM virtual machine {} ({:?}): its name is outside this app's {:?} prefix, so wargame did not create it",
-                entry.id, entry.name, self.cfg.vm_prefix
+                "refusing to touch UTM virtual machine {} ({:?}): its name is outside this app's {:?} and {:?} namespaces, so wargame did not create it",
+                entry.id, entry.name, self.cfg.vm_prefix, self.cfg.build_prefix
             )));
         }
         Ok(Some(entry))

@@ -138,15 +138,11 @@ pub struct InitOutcome {
 /// 과정에서 덮어쓰지 않는다").
 pub async fn init(ctx: &AppContext, template: &str, new_name: &str) -> Result<InitOutcome> {
     let new_name = new_name.trim();
-    if new_name.is_empty()
-        || !new_name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        return Err(refuse(
-            new_name,
-            "a profile name may only contain letters, digits, '-', '_' and '.'",
-        ));
+    // The same rule `Profile::from_yaml` holds a hand-written
+    // `metadata.name` to, so the two entry points cannot disagree about
+    // what a profile may be called.
+    if let Err(reason) = crate::domain::profile::validate_profile_name(new_name) {
+        return Err(refuse(new_name, reason));
     }
     if new_name == template {
         return Err(refuse(

@@ -116,6 +116,16 @@ pub struct GuestSpec {
     #[serde(default)]
     pub distribution: Option<String>,
     pub user: String,
+    /// The guest account's password, read from the profile YAML and used
+    /// only to drive the guest during a build.
+    ///
+    /// **Never serialized.** A [`Profile`] is written to stdout by
+    /// `wargame profiles --json`, and a secret that reaches stdout reaches
+    /// every log, pipe and CI artifact that captures it. Build records
+    /// exclude it for the same reason
+    /// ([`crate::domain::build::profile_hash`]); YAML is only ever read
+    /// into this field, never written from it.
+    #[serde(skip_serializing)]
     pub password: Option<String>,
 }
 
@@ -213,6 +223,39 @@ const EXPECTED_KIND: &str = "Profile";
 /// a VM the user made -- agree with it (spec.md §3 FR-5).
 pub const PROFILE_IMAGE_PREFIX: &str = "wargame-profile-";
 
+/// The characters a profile name may be made of: `[A-Za-z0-9._-]`.
+///
+/// The name is not just a label -- it becomes a path segment in
+/// `builds/<name>/`, `logs/provision-<name>.log`, `profiles/<name>.yaml`
+/// and a VM display name on the backend -- so a hand-written `metadata.name`
+/// of `../x` would write outside `$WARGAME_HOME`. `profile init` has always
+/// applied this rule to the name it is given; [`Profile::from_yaml`] applies
+/// the same one to the name it reads, so the two cannot disagree and a YAML
+/// dropped into the profiles directory by hand is held to it too.
+///
+/// A name of dots alone (`.`, `..`) passes the charset and is still a
+/// traversal, so it is refused by name.
+pub fn validate_profile_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("a profile name may not be empty".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(
+            "a profile name may only contain letters, digits, '-', '_' and '.'".to_string(),
+        );
+    }
+    if name.chars().all(|c| c == '.') {
+        return Err(
+            "a profile name may not be made of dots alone: it names a directory of its own"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Refuses a `guest.user` that would not survive being pasted into a
 /// command line.
 ///
@@ -265,6 +308,12 @@ impl Profile {
                     "unsupported kind {:?}, expected {EXPECTED_KIND:?}",
                     raw.kind
                 ),
+            });
+        }
+        if let Err(reason) = validate_profile_name(&raw.metadata.name) {
+            return Err(WargameError::InvalidProfile {
+                name: raw.metadata.name,
+                reason: format!("metadata.name is not usable: {reason}"),
             });
         }
         validate_guest_user(&raw.metadata.name, &raw.guest.user)?;
@@ -455,6 +504,60 @@ workspace:
             ExecutionMode::Virtualize
         );
         assert!(ExecutionMode::from_str("rosetta").is_err());
+    }
+
+    /// `metadata.name` becomes a path segment (`builds/<name>`,
+    /// `logs/provision-<name>.log`) and a VM display name, so a
+    /// hand-written YAML must be held to the same rule `profile init`
+    /// applies to the name it is given.
+    #[test]
+    fn a_name_that_would_escape_its_own_directory_is_refused() {
+        for bad in ["../x", "..", ".", "a/b", "a b", "kali$(id)", "", "네트워크"] {
+            let yaml = SAMPLE.replace("name: macos-re-arm64", &format!("name: {bad:?}"));
+            let err = Profile::from_yaml(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("metadata.name {bad:?} must be refused"));
+            let msg = err.to_string();
+            assert!(msg.contains("metadata.name"), "{bad:?}: {msg}");
+        }
+    }
+
+    /// Every name a user of this build already has must keep parsing: the
+    /// shipped templates and the verification home's profiles.
+    #[test]
+    fn the_shipped_and_existing_profile_names_still_pass() {
+        for good in [
+            "macos-minimal-arm64",
+            "macos-re-arm64",
+            "kali-arm64",
+            "kali-x86_64",
+            "windows-x86_64",
+            "t7-kali-arm64",
+            "t7-kali-x86_64",
+            "my.profile_2",
+        ] {
+            validate_profile_name(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+            let yaml = SAMPLE.replace("name: macos-re-arm64", &format!("name: {good:?}"));
+            let p = Profile::from_yaml(&yaml).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+            assert_eq!(p.name, good);
+        }
+    }
+
+    /// `profiles --json` flattens the whole profile onto stdout. The
+    /// guest password must not travel with it -- not into a terminal, a
+    /// log, or a CI artifact.
+    #[test]
+    fn the_guest_password_is_never_serialized() {
+        let p = Profile::from_yaml(SAMPLE).unwrap();
+        assert_eq!(
+            p.guest.password.as_deref(),
+            Some("admin"),
+            "the build still needs to read it"
+        );
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("password"), "{json}");
+        // The rest of the guest block is still there.
+        assert!(json.contains("\"user\":\"admin\""), "{json}");
     }
 
     #[test]
