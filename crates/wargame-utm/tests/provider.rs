@@ -244,16 +244,25 @@ fn utmctl_discovery_prefers_config_then_path_then_bundle() {
 }
 
 #[tokio::test]
-async fn healthcheck_reports_the_version_and_the_unverified_isolation_wording() {
+async fn healthcheck_reports_the_version_and_what_isolation_was_verified_by() {
     let p = provider(runner(|_| None));
     let status = p.healthcheck().await.unwrap();
     assert!(status.available);
     assert_eq!(status.version.as_deref(), Some("4.7.5"));
-    // isolated is usable (the mechanism is verified) but must never be
-    // reported as a plain "ok" (docs/utm-compatibility.md §5).
+    // isolated is usable and, since AC-10 was driven from inside a real
+    // Kali guest (task-7-b2b-report.md §9), verified on both halves --
+    // mechanism and guest. Still never a plain "ok": the row says what was
+    // checked and when (docs/utm-compatibility.md §5).
     assert_eq!(status.isolated_network, Some(true));
     assert_ne!(status.detail, "ok");
-    assert!(status.detail.contains("unverified"), "{}", status.detail);
+    assert!(status.detail.contains("verified"), "{}", status.detail);
+    assert!(
+        !status.detail.contains("unverified"),
+        "AC-10 was verified on a real guest: {}",
+        status.detail
+    );
+    assert!(status.detail.contains("2026-09-09"), "{}", status.detail);
+    assert!(status.detail.contains("vmnet-host"), "{}", status.detail);
 }
 
 #[tokio::test]

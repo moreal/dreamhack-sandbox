@@ -286,6 +286,12 @@ To be released.
     partway: nothing was swept under the rug. `doctor --json` says which is
     which in a new `status` field (`pass`, `fail` or `not-set-up`).
 
+ -  `wargame doctor` no longer says the UTM isolated network's guest side is
+    unverified. It has been checked from inside a real installed guest — no
+    default route, no DNS, no internet, the host's own network unreachable,
+    while the connection from your Mac to the guest kept working — and the
+    row now says what was checked and when instead.
+
  -  **`wargame gui` no longer reboots a running session.** On UTM the window
     is open from the moment the VM starts, but `gui` stopped and restarted
     the machine anyway — it came back with everything you were running in the

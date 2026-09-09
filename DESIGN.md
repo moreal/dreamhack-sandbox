@@ -31,7 +31,7 @@
 | Guest OS shape | One seam, `infra::GuestOps`: application services ask for "make these directories"/"run this script" and never test the guest OS themselves | spec.md §5 item 3 |
 | Wargame provider | Dreamhack JSON API (`/api/v1/wargame/...`), Django session-cookie auth | Verified live 2026-09-05/06; no HTML scraping |
 | Credential store | macOS Keychain via `/usr/bin/security -i` (stdin, never argv) | PRD §9 |
-| Isolated network | Tart: `tart run --net-host` (host-only vmnet via Softnet; needs a sudoers rule). UTM: network mode `host` (`-netdev vmnet-host`, no sudo, no helper) | Guest-side isolation is **verified for Tart**, **unverified for UTM** (§10) |
+| Isolated network | Tart: `tart run --net-host` (host-only vmnet via Softnet; needs a sudoers rule). UTM: network mode `host` (`-netdev vmnet-host`, no sudo, no helper) | Guest-side isolation is **verified for both**: Tart in `docs/verification.md`, UTM from inside a real Kali guest on 2026-09-09 (AC-10, §10) |
 | NAT network | Tart's default shared networking; UTM's `shared`. Image builds always run on NAT | Builds install packages; sessions default to isolated |
 | GUI console | Tart: stop the headless run, re-run with a window. UTM: `utmctl start <uuid>` (there is no working `attach`, and `--hide` is broken) | docs/utm-compatibility.md §3, T7 |
 | Reusable images | One build flow in core (`app::profile_build`), backend steps behind the `ProfileImageBuilder` port; one `BuildRecord` per profile under `$WARGAME_HOME/builds/` | spec.md §5 items 4–5 |
@@ -968,10 +968,13 @@ still appear with their hint, listed after the failures under "N not set up
 yet (nothing is wrong)". `doctor`'s exit code stays 0 deliberately — it is a
 report, and the rows now carry the distinction the exit code could not.
 
-The `network:isolated:utm` row never says a plain "ok": its detail is
-`mechanism verified (UTM host = vmnet-host, host gets .1 on the guest
-segment); guest isolation unverified`, because the mechanism is proven and
-the guest-side blocking is not (§10).
+The `network:isolated:utm` row never says a plain "ok": its detail names
+what was checked and when — `verified 2026-09-09 on an installed Kali
+guest: UTM host = vmnet-host (host gets .1 on the guest segment), and from
+inside the guest no default route, no DNS, no internet and no LAN, while
+host↔guest SSH works`. Both halves are proven: the mechanism from the
+configuration, and the guest-side blocking from inside a real guest
+(AC-10, `task-7-b2b-report.md` §9; §10).
 
 ---
 
@@ -1173,11 +1176,11 @@ Dreamhack download, `gui`, and the thirteen bugs those runs found — is
 - **Kali installs.** Both guests were installed for real through UTM: arm64 `virtualize` and x86_64 `emulate`, each with `kali`, passwordless sudo, SSH and the QEMU guest agent. Boot → SSH measured at ~25 s virtualized and ~48–68 s emulated, so the boot timeouts are not the risk; installation itself took ~1 h 20 m and ~10 h respectively. **AC-02 and AC-03 are supported by these runs** (x86_64 with the hypervisor off, arm64 virtualized).
 - **The UTM automation contract** in §1/§8: every row of `docs/utm-compatibility.md`'s operation matrix was executed on this host, its §7 records both Kali guests booting (`hypervisor:true` → `-accel hvf` on arm64, `hypervisor:false` → `-accel tcg` on x86_64), and the eject script's *read* path was re-confirmed against the two installed guests with a byte-identical drive readback before and after.
 - **AC-12 (the automated gate).** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `nix flake check` (build/fmt/clippy/tests) and `nix build` have been run green at each step of this branch, and plain `cargo test` reaches neither Tart nor UTM (§9), which is the "no UTM required" half of that criterion.
+- **Guest-side network isolation on UTM (AC-10).** Verified on 2026-09-09 from inside an installed Kali guest on `mode:host`: no default route, DNS dead, `curl 1.1.1.1` refused, the host's own LAN unreachable, while host↔guest SSH kept working; NAT, chosen explicitly, reached the internet. `doctor`'s `network:isolated:utm` row says what was checked and when rather than a plain "ok" (`task-7-b2b-report.md` §9).
 
 **Not verified at the time of writing**
 
 - **Windows, end to end.** No Windows ISO exists on this host, so `profile create` → manual install → `profile build` → `launch` for a Windows guest is **unverified**, and `guest/bootstrap.ps1` has never run in a real guest. Everything Windows-side is exercised only against fakes and script-text assertions.
-- **Guest-side network isolation on UTM.** UTM's `host` mode is `-netdev vmnet-host`, the same primitive Tart's verified isolated path uses, and that much is confirmed; whether the *guest* is actually cut off from the LAN and the internet needs an installed guest and has not been measured. `doctor` and `healthcheck` say exactly this rather than reporting "ok", and **AC-10 stays unverified for UTM** (it is verified for Tart in `docs/verification.md`).
 - **The eject's write branch.** The refusal and no-op paths are proven live; `set drives of c` + `update configuration` on a VM that *does* have a removable drive has not yet been executed by this code.
 - **AC-04 through AC-09 and AC-11 on the UTM guests** are in progress in the acceptance run: `profile build` end to end on both Kali guests, `--from-vm` cloning with the source preserved, a user script added and rebuilt, mixed-backend lifecycle after a config change, fault injection for the preservation rules, and the archive-escape/injection sample. Their *automated* halves are covered by §9's suites; the real-VM halves are not claimed here.
 

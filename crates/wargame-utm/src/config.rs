@@ -50,13 +50,18 @@ pub const MIN_UTM_VERSION: (u64, u64) = (4, 3);
 /// The only UTM release this adapter was verified against.
 pub const VERIFIED_UTM_VERSION: &str = "4.7.5";
 
-/// What `doctor` says about UTM's `isolated` network. UTM's `host` mode is
-/// `-netdev vmnet-host`, the same primitive Tart's isolated path uses, and
-/// that much is verified; whether the *guest* is actually cut off from the
-/// LAN and the internet needs an installed guest OS and is not
-/// (docs/utm-compatibility.md §5). Never report this as plain "ok".
+/// What `doctor` says about UTM's `isolated` network.
+///
+/// Both halves are now verified. UTM's `host` mode is `-netdev vmnet-host`,
+/// the same primitive Tart's isolated path uses; and on 2026-09-09 the
+/// guest side was checked from inside a real installed Kali guest on that
+/// mode -- no default route, DNS dead, `curl 1.1.1.1` refused, the host's
+/// own LAN unreachable, while host<->guest SSH kept working
+/// (`task-7-b2b-report.md` §9, AC-10; docs/utm-compatibility.md §5).
+/// Still not a plain "ok": the detail says what was checked, and on which
+/// UTM.
 pub const ISOLATED_NETWORK_DETAIL: &str =
-    "mechanism verified (UTM `host` = vmnet-host, host gets .1 on the guest segment); guest isolation unverified";
+    "verified 2026-09-09 on an installed Kali guest: UTM `host` = vmnet-host (host gets .1 on the guest segment), and from inside the guest no default route, no DNS, no internet and no LAN, while host<->guest SSH works";
 
 /// Static configuration for the UTM adapter, resolved from `[vm.utm]`.
 #[derive(Debug, Clone)]

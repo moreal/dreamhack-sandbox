@@ -821,7 +821,8 @@ argv for each is committed. Additional **verified** facts:
 
   So **macOS `vmnet` host mode gives the host `.1` on the guest's own segment**, which is the "host
   management connection" half of FR-6. The guest-side half (that the guest cannot reach the LAN or
-  the internet) is still **unverified** — see "Which mode is FR-6's `isolated`?" below.
+  the internet) was **unverified when this section was written and is verified since 2026-09-09**,
+  from inside an installed Kali guest — see "Which mode is FR-6's `isolated`?" below.
   Note that each mode switch left its previous vmnet bridge behind (`bridge100`–`bridge103` above
   are leftovers), so `doctor` must not treat "a vmnet bridge exists" as evidence of anything.
 - No sudo, no sudoers rule, no helper daemon: UTM's own `com.apple.vm.networking` entitlement
@@ -836,9 +837,15 @@ through `--net-host`/Softnet in the existing `isolated` path (`DESIGN.md` §1). 
 stack and reaches the internet; UTM's own Windows guide even notes libslirp's limitation that
 `ping` does not work, which implies the rest does. `shared` and `bridged` are plainly not isolated.
 
-**UNVERIFIED — guest-side isolation.** Whether the guest can be blocked from the LAN and the
-internet while the host still reaches it could not be proven on this host in this task, because
-there is no installed guest OS yet:
+**VERIFIED (2026-09-09) — guest-side isolation.** From inside an installed Kali guest on
+`mode:host`: no default route, `getent hosts` fails, `curl 1.1.1.1` → exit 7, `curl
+https://kali.download` cannot resolve, the host's own LAN answers "Network is unreachable", while
+the host↔guest bridge (`192.168.128.1`) answers and SSH works throughout; NAT, chosen explicitly,
+reached the internet (`.superpowers/sdd/PLAN/task-7-b2b-report.md` §9, AC-10;
+`docs/verification.md`). `doctor`'s `network:isolated:utm` row now says what was checked and when.
+
+What follows is why this **could not** be proven at the time this section was written, and is kept
+because the constraints are still true before an OS is installed:
 
 - `utmctl ip-address` / `query ip` require the QEMU guest agent and fail before install
   (**verified**: `The QEMU guest agent is not running or not installed on the guest`).
@@ -849,21 +856,21 @@ there is no installed guest OS yet:
   so the installer's own output never reaches the serial ptty and cannot be driven headlessly
   without editing that line.
 
-*Recipe for the later task that must verify AC-10:* install Kali once through the UTM window
-(spec §1 already allows a manual first install), then with `mode:host` check from inside the guest
-that there is no default route, that DNS fails, that `curl http://1.1.1.1` cannot connect and that
-`ping` to a LAN peer fails, while `ssh` from the host to the guest's `192.168.x.y` on the vmnet
-bridge succeeds — the same battery `docs/verification.md` already ran for the Tart path.
+*The recipe that verified AC-10, kept for re-verification:* install Kali once through the UTM
+window (spec §1 already allows a manual first install), then with `mode:host` check from inside the
+guest that there is no default route, that DNS fails, that `curl http://1.1.1.1` cannot connect and
+that `ping` to a LAN peer fails, while `ssh` from the host to the guest's `192.168.x.y` on the
+vmnet bridge succeeds — the same battery `docs/verification.md` already ran for the Tart path.
 Alternatively, append `console=ttyAMA0,115200` (arm64) / `console=ttyS0,115200` (x86_64) to the
 GRUB entry to get a serial-driven installer.
 
-*Rejection path required by FR-6 until that is done:* `isolated` is only offered for
+*Rejection path required by FR-6, unchanged by the verification:* `isolated` is only offered for
 `backend: utm` when the resolved network mode is `host`. If a profile or a host state makes `host`
 unavailable, refuse **before creating or starting anything**, name the requested mode, say why it
 is unavailable, and state that `--network nat` (UTM `shared`) is an explicit opt-in. Do not fall
-back automatically. Until the guest-side check above passes, `doctor --profile` should report UTM
-`isolated` as **"mechanism verified, guest isolation unverified"** rather than `ok`, and
-`AC-10` stays `unverified`.
+back automatically. `doctor --profile` still never reports UTM `isolated` as a plain `ok`: the row
+carries what was checked and when (`crates/wargame-utm/src/config.rs`'s
+`ISOLATED_NETWORK_DETAIL`).
 
 ### Isolated guests have no DNS, by design — and find that out slowly
 
@@ -1078,7 +1085,7 @@ All `wargame-t1-*` VMs created here were deleted (`utmctl list` empty at the end
 
 | # | Item | Owner task |
 |---|---|---|
-| 1 | Guest-side isolation for `mode:host` (AC-10) — needs an installed Kali | real-VM verification |
+| 1 | ~~Guest-side isolation for `mode:host` (AC-10)~~ — **done 2026-09-09** on an installed Kali guest (§5, `docs/verification.md` AC-10) | real-VM verification |
 | 2 | Windows 11 TPM/Secure Boot route (§6) — pick one of the three and verify end to end | Windows install task |
 | 3 | QEMU guest-agent install in Kali/Windows provisioning, so `ip-address`/`exec` work (FR-4) | provisioning task |
 | 4 | Port-forward fallback for the pre-guest-agent window, with per-session port allocation (FR-4) | adapter task |
