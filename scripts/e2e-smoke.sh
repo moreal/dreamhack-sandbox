@@ -22,6 +22,13 @@
 #
 # Requires (see README.md "Prerequisites"): tart, ssh, jq, cargo -- run this
 # from inside `nix develop` so all of them are on PATH.
+#
+# Cleanup contract: however this run ends, it must not leave a VM behind. It
+# snapshots the sessions that already exist in `$WARGAME_HOME` *before*
+# launching anything and arms an EXIT trap that deletes whatever appeared
+# since -- so a failure between "the VM is up" and "we know its id" still
+# takes the VM with it, and a session that was already here is never
+# touched.
 
 set -euo pipefail
 
@@ -45,19 +52,44 @@ done
 export WARGAME_HOME
 export WARGAME_PROVIDER=fixture
 
-SESSION_ID=""
-cleanup() {
-  if [ -n "$SESSION_ID" ]; then
-    "$BIN" delete "$SESSION_ID" --force >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
-
 echo "==> building wargame"
 cargo build -p wargame-cli
 BIN="$REPO_ROOT/target/debug/wargame"
 
 echo "==> WARGAME_HOME=$WARGAME_HOME"
+
+# Every session id already in this home, as a JSON array. This runs on the
+# *real* `$WARGAME_HOME` (see above), so everything that was here before we
+# started is somebody else's and must survive us.
+session_ids_json() {
+  "$BIN" sessions --json | jq -c '[.[].id]'
+}
+# Every session id that appeared since we started, newest first.
+sessions_we_created() {
+  "$BIN" sessions --json |
+    jq -r --argjson before "$SESSIONS_BEFORE" \
+      '.[] | select(.id as $id | $before | index($id) | not) | .id'
+}
+
+SESSIONS_BEFORE="$(session_ids_json)"
+
+# Armed *before* anything is launched and driven off that snapshot, not off
+# `$SESSION_ID`: a failure between "the VM is up" and "we know its id" must
+# still take the VM with it.
+cleanup() {
+  local ids id
+  if ! ids="$(sessions_we_created)"; then
+    echo "warning: could not list sessions to clean up; check \`wargame sessions\` yourself" >&2
+    return
+  fi
+  for id in $ids; do
+    echo "==> cleaning up $id"
+    "$BIN" delete "$id" --force >/dev/null 2>&1 ||
+      echo "warning: could not delete $id; run: wargame delete $id --force" >&2
+  done
+}
+trap cleanup EXIT
+
 echo "==> wargame doctor"
 "$BIN" doctor || true # informational: some checks (e.g. profile image) are
                        # expected to fail on a machine that hasn't built
@@ -65,12 +97,14 @@ echo "==> wargame doctor"
 
 NETWORK="${WARGAME_SMOKE_NETWORK:-nat}"
 echo "==> wargame launch fixture:1 --profile $PROFILE --network $NETWORK --yes"
-LAUNCH_OUT="$("$BIN" launch fixture:1 --profile "$PROFILE" --network "$NETWORK" --yes)"
-echo "$LAUNCH_OUT"
+"$BIN" launch fixture:1 --profile "$PROFILE" --network "$NETWORK" --yes
 
-SESSION_ID="$(echo "$LAUNCH_OUT" | sed -n 's/^session id: //p')"
+# The id comes from `sessions --json`, not from `launch`'s prose: the human
+# output is free to change wording, the JSON is the contract.
+SESSION_ID="$(sessions_we_created)"
+SESSION_ID="${SESSION_ID%%$'\n'*}" # newest first; ignore anything older
 if [ -z "$SESSION_ID" ]; then
-  echo "error: could not find a session id in launch output" >&2
+  echo "error: launch created no new session in $WARGAME_HOME" >&2
   exit 1
 fi
 echo "==> session: $SESSION_ID"
@@ -101,6 +135,5 @@ echo "==> guest file content verified: \"$CONTENT\""
 
 echo "==> wargame delete $SESSION_ID --force"
 "$BIN" delete "$SESSION_ID" --force
-SESSION_ID="" # already deleted; skip the cleanup trap's delete
 
 echo "==> smoke test passed"
