@@ -27,6 +27,11 @@ image:
   base: ""
 
 resources:
+  # Left as they are on purpose. Note that an emulated guest uses every core
+  # it is given: running this profile's install or build at the same time as
+  # another VM on the same host makes both crawl (a 10-core host running the
+  # two Kali profiles together logged guest soft-lockups and a load average
+  # of 24). Do them one at a time, or lower `cpu` here.
   cpu: 4
   memory_gib: 8
   disk_gib: 80

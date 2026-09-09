@@ -163,10 +163,16 @@ State transitions (anything else is a bug and returns `InvalidTransition`):
 
 ```
 Creating → Downloading → Booting → Provisioning → Ready → Running ⇄ Stopped
-any non-terminal → Failed
-Ready|Running|Stopped|Failed → Deleting → Deleted
+any state but Deleted → Failed
+any state but Deleted → Deleting → Deleted        (Deleting → Deleting is not a transition)
 Stopped → Booting (resume)
 ```
+
+`Deleting` is reachable from **every** state except `Deleted`, not only from the finished ones:
+`delete` is the last resort and has to work on whatever a crash left behind — a launch killed
+mid-`Booting` as much as a session that ran. A record that is already `Deleting` is an
+*interrupted* delete, so it is continued rather than re-entered (a same-state transition is
+rejected), which is what makes the recovery `prune` points at actually work.
 
 `Ready` means bootstrap finished; the VM is up. `Running` is the same VM after a resume; both count as "up" for `ssh`/`gui`. The record can drift when the VM stops without going through the CLI (the `gui` window is closed, the guest shuts down, the runner dies): every lifecycle read (`sessions`, `inspect`, `stop`, `resume`, `ssh`, `gui`) first reconciles an "up" record against the backend and moves it to `Stopped` when the VM is reported stopped. A `Stopped` session may be `gui`-started directly.
 

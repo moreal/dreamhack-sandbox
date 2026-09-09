@@ -10,6 +10,12 @@ Claims are marked **verified** (a command in this document produced the quoted o
 **unverified** (documented by UTM/Kali/Microsoft but not reproduced here) or **blocked**
 (attempted and prevented). Nothing is asserted without one of those labels.
 
+**Amended 2026-09-09 (Task 7 phase B2a)** with what the first real Kali installations proved and
+disproved: a drive-detach row and an input-automation *downgrade* in §2, and three console findings
+in §3. Every amendment says so where it stands and cites
+`.superpowers/sdd/PLAN/task-7-phase-a-report.md`, so the task-1 record and what came later stay
+tellable apart.
+
 ## 1. Host and versions
 
 | Item | Value | How |
@@ -116,6 +122,7 @@ Never match a sentence containing an apostrophe.
 | Attach ISO at create | **AS only** | `drives:{{removable:true, source:isoFile}}` | **verified**; `host size` of the drive comes back as the ISO size in MiB (3788 / 4580) |
 | Attach a *second* ISO | **AS only** | `set drives of c to (drives of c) & {{removable:true, source:isoFile}}` + `update configuration` | **verified**, transcript §2 — a third drive appears with `hostMiB=4580` (the amd64 ISO). Needed for the Windows guest-tools CD |
 | Replace an ISO | **AS only** | `set item 1 of drives of c to {id:i, source:isoFile}` + `update configuration` | **verified**, transcript §3 — drive 1's `hostMiB` goes 3788 → 4580 after pointing it at the other ISO |
+| **Detach** a drive (eject the installer CD) | **AS only** | build a list of the drives to keep as `{id:(id of d)}`, `set drives of c to <kept>` + `update configuration` | **verified on a real installed guest** (`.superpowers/sdd/PLAN/task-7-phase-a-report.md` §3): drives went 2 → 1 and the readback showed only `id=ED07E2A8-… removable=false iface=VirtIO hostMiB=2379`. There is no "remove drive" verb; the whole list is written back. A kept drive **must** echo its own `id`, or UTM adds a drive instead of keeping one. VM must be `stopped` (T9) |
 | Change any setting | **AS only** | `update configuration of vm with c` | **verified**; **VM must be `stopped`**, else `-2700 The virtual machine must be stopped before this operation can be performed` |
 | Add / remove display | **AS only** | `set displays of c to {{hardware:"virtio-ramfb"}}` / `set displays of c to {}` | **verified** |
 | Set network mode | **AS only** | `set item 1 of network interfaces of c to {index:n, mode:host}` | **verified** for all four modes (§5) |
@@ -142,8 +149,35 @@ Never match a sentence containing an apostrophe.
 | Guest exec | both | `utmctl exec <id> --cmd …` / `execute of vm at …` | **verified failure** pre-install, same reason |
 | Guest file push/pull | both | `utmctl file push\|pull` / `open file of vm at …` | **unverified** (needs the guest agent) |
 | USB attach | both | `utmctl usb …` / `connect device to vm` | **unverified**, not needed |
-| Input automation | **AS only** | `input scan code of vm codes {28, 156}`, `input keystroke of vm text "…"` | **verified**, transcript §9 (exit 0; separately, GRUB redrew in response to a scan code); QEMU backend only |
+| Input automation | **AS only** | `input scan code of vm codes {28, 156}`, `input keystroke of vm text "…"` | **unverified / unreliable — do not build on it.** Both return exit 0 and reach no guest on this host; see the note below the table |
 | Hide the UTM window | — | `utmctl … --hide` | **verified BROKEN**: emits `OSStatus error -10004` twice; see §4 |
+
+#### Input automation: exit 0 and nothing happens (downgraded 2026-09-09)
+
+Task 1 marked `input scan code` / `input keystroke` **verified** on the strength of "exit 0, and
+GRUB redrew around the same time". Task 7 phase A tried to *drive an installer* with them, against
+two real VMs, and got nothing at all — every attempt returned success and produced **zero** bytes
+of guest reaction on a serial console that was simultaneously showing live GRUB output, so the
+guest was awake and the console worked; only the injected input vanished
+(`.superpowers/sdd/PLAN/task-7-phase-a-report.md` §5 D6):
+
+| attempt | result |
+|---|---|
+| `input keystroke <vm> text "c"`, no display device | `typed 1 chars`, 0 bytes of guest reaction |
+| `input keystroke <vm> text "e"`, `virtio-ramfb` display, VM window open | `typed 1 chars`, 0 bytes |
+| same, after `tell application "UTM" to activate` | `typed 1 chars`, 0 bytes |
+| `input scan code <vm> codes {28,156}` (Enter) | `sent 2 codes`, 0 bytes |
+| `input scan code <vm> codes {224,80,224,208}` (Down) | exit 0, 0 bytes |
+
+The earlier "GRUB redrew" observation is now explained by §3's echo trap: the serial ptty was
+echoing GRUB's own output back at it. Treat this row as **unusable**. Anything that would depend on
+it — a scripted Windows install, unattended menu navigation — needs another mechanism (an
+unattended-install file baked into or served to the installer is what phase A used).
+
+**Trap for whoever writes the helper anyway:** an AppleScript local named `codes` collides with the
+command's own parameter name and fails to compile with `-2741 Expected expression but found
+parameter name`. Name the variable anything else. (The same class of collision is why the eject
+script in `wargame-utm` uses `kept`/`gone` rather than anything from the dictionary.)
 
 ### State machine: the `status` and `backend` enumerations
 
@@ -249,8 +283,42 @@ for.
   put a timeout on the call regardless.
 - **Verified:** the `serial ports` list of a *configuration record* reads back empty (T5), so the
   ptty path is only reachable through the VM element, never through the configuration.
-- **Verified:** the `serial ports` list of a *configuration record* reads back empty (T5), so the
-  ptty path is only reachable through the VM element, never through the configuration.
+
+### Trap: the ptty echoes the guest back at itself, and the fix has an ordering rule
+
+**Verified in task 7 phase A** (`.superpowers/sdd/PLAN/task-7-phase-a-report.md` §3), and the
+single largest cost of that run. The ptty comes up in the default line discipline — `icanon`,
+**`echo`** — so every byte QEMU writes to the master is echoed straight back as serial *input*. The
+guest keyboard-mashes itself: GRUB's own menu redraw pressed Enter and booted the default entry
+unprompted, and later GRUB's countdown never expired, because "input available" cancels it forever.
+This is also what made task 1's `input scan code` look like it worked.
+
+Turning echo off has an ordering trap of its own: **opening a pty slave that nobody currently holds
+resets its termios**, so an `stty -f "$SER" raw -echo` issued *before* the reader starts is undone
+the moment `cat` opens the device. The reader has to open it first:
+
+```bash
+utmctl start "$UUID"
+SER=$(osascript utm-serial.applescript "$UUID")   # empty while stopped; re-read after every start
+cat "$SER" >> serial.log &                        # 1. reader opens the ptty
+sleep 1
+stty -f "$SER" raw -echo                          # 2. only now is echo actually off
+```
+
+With that in place the ptty is a fully bidirectional console: `printf 'c' > $SER` reaches GRUB, and
+the whole Debian installer is drivable over it. §8's read-only `timeout 25 cat "$SER"` reproduction
+is unaffected — the trap only bites when something writes to the device as well.
+
+### Two more things only an installed guest could show
+
+- **Verified:** `utmctl ip-address <id>` on an installed guest answers with **three lines** — IPv4,
+  a global (ULA) IPv6 and a link-local `fe80::` — not one
+  (fixture `utmctl-ip-address-three-lines.txt`). A caller must select by kind (IPv4, else a
+  routable address); `lines[0]` is right by luck and wrong the moment the agent reorders them.
+- **Verified (Kali):** `systemctl is-enabled qemu-guest-agent` answers **`static`**, not `enabled`
+  — the unit has no `[Install]` section and is activated by udev. `is-active` is `active`. A
+  readiness check or a piece of guidance that insists on the literal string `enabled` calls every
+  correct Kali guest broken.
 
 ## 4. Defects and traps found (with evidence)
 

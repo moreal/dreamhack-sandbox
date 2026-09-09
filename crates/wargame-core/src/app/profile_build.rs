@@ -616,6 +616,13 @@ fn create_guidance(
             "   On Debian/Kali: `sudo apt install openssh-server qemu-guest-agent && sudo systemctl enable --now ssh qemu-guest-agent`."
                 .to_string(),
         );
+        // Kali's guest-agent unit has no [Install] section (it is activated
+        // by udev), so the obvious check reports something that looks like
+        // a failure and is not (task-7-phase-a-report.md §5 D8).
+        lines.push(
+            "   To check it afterwards use `systemctl is-active qemu-guest-agent`, not `is-enabled`: on Kali that unit is activated by udev and answers `static`, which is correct."
+                .to_string(),
+        );
     }
     // The baseline provisioning scripts need more than an account and a key,
     // and refuse without it. Asking here costs a paste; finding out at the
@@ -630,6 +637,14 @@ fn create_guidance(
     lines.push(format!(
         "6. Then build the reusable image:  wargame profile build {}",
         profile.name
+    ));
+    // The defaults are deliberately left alone -- lowering them silently
+    // would change what every existing profile builds -- but two installs
+    // at once on one host is what made phase A's emulated guest crawl, and
+    // that is worth one line here (task-7-phase-a-report.md §5 D8).
+    lines.push(format!(
+        "This profile asks for {} vCPU. An emulated guest uses every core it is given, so an install or build running at the same time as another one on this host will make both crawl -- do them one at a time, or lower `resources.cpu` in the profile.",
+        profile.resources.cpu
     ));
     lines
 }

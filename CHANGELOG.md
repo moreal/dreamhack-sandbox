@@ -85,6 +85,13 @@ To be released.
     `wargame prune`, and the installation VM is what the next rebuild starts
     from, so keep it.
 
+ -  The setup steps `wargame profile create` prints now also say that on
+    Kali the guest agent is checked with `systemctl is-active`, not
+    `is-enabled` — that unit is started by udev and reports `static`, which
+    looks like a failure and is not — and note that an emulated guest uses
+    every core it is given, so two installs or builds at once on one machine
+    make both crawl. The profiles' own defaults are unchanged.
+
  -  Windows 11 additionally wants TPM 2.0 and Secure Boot, which cannot be
     switched on for you; `wargame profile create` prints the one-time step to
     do by hand before you install. You supply the Windows installer and its

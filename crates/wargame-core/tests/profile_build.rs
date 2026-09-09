@@ -858,6 +858,42 @@ async fn create_refuses_a_missing_iso_before_any_vm_exists() {
     assert!(f.utm.calls().is_empty());
 }
 
+/// Kali's `qemu-guest-agent` unit has no `[Install]` section, so
+/// `systemctl is-enabled` answers `static`. A user who checks the wrong
+/// command reads a correct guest as broken (phase A, D8).
+#[tokio::test]
+async fn the_guest_setup_steps_say_that_static_is_the_right_answer_on_kali() {
+    let f = fixture();
+    let outcome = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let guidance = outcome.guidance.join("\n");
+    assert!(guidance.contains("static"), "{guidance}");
+    assert!(guidance.contains("is-active"), "{guidance}");
+}
+
+/// Two installs at once on one host starved the emulated guest (phase A's
+/// timings): the defaults are unchanged, and the user is told why they may
+/// want to change them.
+#[tokio::test]
+async fn create_says_that_concurrent_builds_compete_for_cores() {
+    let f = fixture();
+    let outcome = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let guidance = outcome.guidance.join("\n");
+    assert!(
+        guidance.contains("4 vCPU"),
+        "the profile's own ask: {guidance}"
+    );
+    assert!(
+        guidance.contains("one at a time") || guidance.contains("at the same time"),
+        "{guidance}"
+    );
+    // Nothing was quietly lowered.
+    assert_eq!(f.ctx.profiles.get("kali-arm64").unwrap().resources.cpu, 4);
+}
+
 // --- the free-space precondition (phase A, D1) -----------------------------
 //
 // A UTM disk is a *sparse* qcow2: a fresh one occupies nothing at all and a
