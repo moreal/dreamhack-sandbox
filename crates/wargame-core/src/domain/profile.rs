@@ -213,6 +213,34 @@ const EXPECTED_KIND: &str = "Profile";
 /// a VM the user made -- agree with it (spec.md §3 FR-5).
 pub const PROFILE_IMAGE_PREFIX: &str = "wargame-profile-";
 
+/// Refuses a `guest.user` that would not survive being pasted into a
+/// command line.
+///
+/// The value is interpolated into the sudoers line `profile create` tells
+/// the user to run **as root**
+/// (`echo '<user> ALL=(ALL) NOPASSWD:ALL' | sudo tee ...`), and into the
+/// `user@host` an `ssh` argv carries -- so a quote would break the root
+/// command's quoting and a leading `-` would become an `ssh` option. Real
+/// account names do not need any of that, so anything outside
+/// `[A-Za-z0-9._-]` (starting with a letter, digit or `_`) is refused when
+/// the profile is read, naming the field and the profile.
+fn validate_guest_user(profile: &str, user: &str) -> Result<()> {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    let starts_ok = user
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    if starts_ok && user.chars().all(allowed) {
+        return Ok(());
+    }
+    Err(WargameError::InvalidProfile {
+        name: profile.to_string(),
+        reason: format!(
+            "guest.user {user:?} is not a usable account name: use letters, digits, `.`, `_` or `-`, starting with a letter, digit or `_`"
+        ),
+    })
+}
+
 impl Profile {
     /// Parses a profile YAML document (DESIGN.md §6 schema).
     pub fn from_yaml(s: &str) -> Result<Profile> {
@@ -239,6 +267,7 @@ impl Profile {
                 ),
             });
         }
+        validate_guest_user(&raw.metadata.name, &raw.guest.user)?;
         Ok(Profile {
             name: raw.metadata.name,
             description: raw.metadata.description,
@@ -302,6 +331,46 @@ tools:
 workspace:
   root: /Users/admin/wargame
 "#;
+
+    /// `guest.user` is pasted into a sudoers line the user runs as root
+    /// (`profile create`'s step 4) and into the `user@host` an `ssh` argv
+    /// carries. A quote, a space or a leading `-` there would break that
+    /// root command line or turn into an `ssh` option, so the profile is
+    /// refused when it is read.
+    #[test]
+    fn a_guest_user_that_would_break_a_root_command_line_is_refused() {
+        for bad in [
+            "ad'min",
+            "ad\"min",
+            "ad min",
+            "admin; rm -rf /",
+            "-oProxyCommand=touch$IFS/tmp/pwn",
+            "admin$(id)",
+            "",
+        ] {
+            let yaml = SAMPLE.replace("user: admin", &format!("user: {bad:?}"));
+            let err = Profile::from_yaml(&yaml).expect_err("guest.user {bad:?} must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains("guest.user"), "{bad:?}: {msg}");
+            assert!(msg.contains("macos-re-arm64"), "{bad:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn ordinary_account_names_are_accepted() {
+        for good in [
+            "admin",
+            "kali",
+            "kali-user",
+            "user.name",
+            "_svc",
+            "IEUser11",
+        ] {
+            let yaml = SAMPLE.replace("user: admin", &format!("user: {good:?}"));
+            let p = Profile::from_yaml(&yaml).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+            assert_eq!(p.guest.user, good);
+        }
+    }
 
     #[test]
     fn parses_sample_and_converts_memory() {
