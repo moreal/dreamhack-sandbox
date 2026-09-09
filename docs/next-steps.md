@@ -1,7 +1,7 @@
 # Next steps (handoff for a fresh session)
 
-State on **2026-09-09**: the multi-OS feature is implemented on `feature/multi-os-vm` (HEAD `4b4d825`,
-53 commits on top of `main` `d547962`) and **not merged**. The MVP on `main` is untouched and still
+State on **2026-09-09**: the multi-OS feature is implemented on `feature/multi-os-vm` (HEAD `1998a92`,
+55 commits on top of `main` `d547962`) and **not merged**. The MVP on `main` is untouched and still
 works exactly as `docs/verification.md`'s first half records; the five open items that used to live in
 this file were all closed on 2026-09-06 and their evidence is in that record.
 
@@ -19,13 +19,17 @@ profile-driven backend/mode selection with no silent fallback, ISO-based `profil
 preservation, per-OS guest transports (POSIX and PowerShell), Kali and Windows profile templates, and
 the multi-OS lifecycle across mixed backends.
 
-Verified on real hardware: AC-01, AC-02 (Kali x86_64), AC-03, AC-05, AC-07, AC-10, AC-11, AC-12 — plus
-live per-verb proof that `delete` and every other AppleScript verb now touch exactly one VM.
+**Every acceptance criterion except the Windows rows now passes on real hardware.** AC-01 through AC-12
+were verified across three real-VM passes — the acceptance run, a second pair of Kali installs, and a
+targeted re-run that re-drove everything the acceptance run had left open (AC-04 on both architectures,
+AC-06, AC-08, AC-09) and re-confirmed nine of that run's ten defects fixed on live VMs, including the
+delete cascade and the installer-disc eject on installed guests.
 
-**Not verified, and not to be reported as done:** AC-04's x86_64 half, AC-06, AC-09's corrected-rebuild
-half (all three failed on defects that are now fixed but have not been re-run against a guest), AC-08's
-TUI half, and **everything Windows, end to end**. `docs/verification.md` marks each one and carries the
-placeholder `_(re-run pending — to be filled from task-7-rerun-report.md)_` where a re-run must fill it.
+**Not verified, and not to be reported as done:** **everything Windows, end to end** (no ISO on this
+host — it is user-provided by spec, and nothing was simulated); AC-06 on x86_64 (the custom-script
+rebuild ran on arm64 only); and AC-08's TUI half, which refuses to render non-interactively.
+`docs/verification.md` has the per-row detail and an "Explicitly unverified" list; three items the
+re-run opened (N1, N2, N3) are recorded there too.
 
 ## How to re-verify
 
@@ -46,10 +50,12 @@ nix develop -c scripts/e2e-multi-os.sh t7-kali-arm64
 nix develop -c scripts/e2e-multi-os.sh t7-kali-x86_64
 WARGAME_E2E_NETWORK=isolated nix develop -c scripts/e2e-multi-os.sh t7-kali-arm64
 
-# 4. the UTM adapter on its own (opt-in twice: #[ignore] plus two env vars)
+# 4. the UTM adapter on its own (opt-in twice: #[ignore] plus two env vars).
+#    --test-threads=1 is REQUIRED: concurrent osascript against one UTM collapses with -609,
+#    and one test's "the VM count did not change" invariant is global (open defect N1).
 WARGAME_E2E=1 WARGAME_E2E_UTM_PROFILE=t7-kali-arm64 \
-  nix develop -c cargo test -p wargame-utm --test e2e -- --ignored --nocapture
-# read-only first pass, creates nothing:
+  nix develop -c cargo test -p wargame-utm --test e2e -- --ignored --test-threads=1 --nocapture
+# read-only first pass, creates nothing (currently fails on defect N2, not on the product):
 WARGAME_E2E=1 WARGAME_E2E_UTM_PROFILE=t7-kali-arm64 \
   nix develop -c cargo test -p wargame-utm --test e2e \
     utm_reports_the_recorded_vms_read_only -- --ignored --nocapture
@@ -61,43 +67,53 @@ not `ready`, and prints `UNVERIFIED: <why>` for any check it cannot perform — 
 without checking the guest" never read the same.
 
 **The first OS install is not in any of those.** It is a manual step —
-`wargame profile create <p> --iso <path>` → `wargame profile console <p>` (install) →
-`wargame profile eject <p>` → `wargame profile build <p>` — and the method that worked here (unattended
-preseed over the UTM serial ptty, with every trap it hit) is recorded in `docs/verification.md`, "The
-ISO installs, as a separate manual step", and in full in
-`.superpowers/sdd/PLAN/task-7-phase-a-report.md`.
+`wargame profile create <p> --iso <path>` → `wargame profile console <p>` (install the OS, then shut the
+guest down from inside the installer) → `wargame profile eject <p>` **before it boots again** →
+`wargame profile build <p>`. That order matters: both real guests rebooted into the attached installer,
+and the x86_64 one started re-running an unattended install over the disk it had just written. Since
+`1998a92` the `profile create` checklist says so. The method that worked here (unattended preseed over
+the UTM serial ptty, with every trap it hit) is recorded in `docs/verification.md`, "The ISO installs, as
+a separate manual step", and in full in `.superpowers/sdd/PLAN/task-7-phase-a-report.md` and
+`task-7-phase-a2-report.md` — the second install repeats the recipe on the fixed CLI and takes
+**771 s (arm64) / 1 960 s (x86_64)** when run sequentially on an idle host.
 
 ## The dedicated verification home
 
 Every multi-OS command used `WARGAME_HOME="$HOME/Library/Application Support/wargame-vm-t7"` so the
 user's real home was never written. It holds:
 
-- profiles `t7-kali-arm64` (utm/virtualize), `t7-kali-x86_64` (utm/emulate) and `t7b-kali-arm64`, plus
-  their per-profile provisioning script copies and the four built-in templates. **`resources.disk_gib`
-  is 20 in these copies, not the templates' 80** — a deliberate edit for this host's free space; the
-  repository templates are untouched.
+- profiles `t7-kali-arm64` (utm/virtualize) and `t7-kali-x86_64` (utm/emulate) — re-created from the
+  templates for the second install, so they carry the shipped `disk_gib: 80` (each finished guest
+  occupies under 2 GiB of it). **`t7-kali-arm64.yaml` deliberately keeps the AC-06 additions**
+  (`profiles/scripts/custom/my-tools.sh` plus the `ltrace`/`strace` verify lines): its current image was
+  built from them, so reverting either makes the profile read `rebuild needed`.
 - `keys/id_ed25519(.pub)` — the key the installed guests trust in `~kali/.ssh/authorized_keys`. A fresh
   `WARGAME_HOME` would have a different key and could not log into those guests.
-- `builds/<profile>/record.json` and `logs/provision-<profile>.log`.
-- Session records left behind by the acceptance run, all pointing at VMs that no longer exist. Removing
-  the `sessions/` directory by hand is safe.
+- `builds/<profile>/record.json` (both `phase: ready`, `leaked_images: []`) and
+  `logs/provision-<profile>.log`.
+- No session records: the re-run deleted every session it made.
 
-The build records went **stale** when bug 20 destroyed every UTM VM; a reinstall of both Kali guests was
-under way when this was written (the ledger records arm64 finished, x86_64 in progress). Confirm with
-`utmctl list` and `wargame profiles` before trusting any `ready`/`missing` word, and expect to run
-`wargame profile create` again for any profile whose installation VM is gone.
+**Current end state**, and what a next session inherits: UTM holds exactly four stopped VMs — the two
+installation VMs (`wg-build-t7-kali-arm64` `9B71AC04-…`, `wg-build-t7-kali-x86_64` `4EE44988-…`) and the
+two published images (`…-arm64-62cc30` `890D47C7-…`, `…-x86_64-70bde9` `319AACC2-…`) — no orphan QEMU
+process, Tart untouched, 98 GiB free on `/` (the low-water mark during the re-run was 14 GiB). Guest
+login is `kali` with passwordless sudo and that key; guest IPs are DHCP and change between boots, so
+always re-read them with `utmctl ip-address <uuid>` (it prints three lines: IPv4, global IPv6,
+link-local).
 
 ## Open items, in suggested order
 
-1. **Finish the re-run on the reinstalled guests.** In order: `profile build` (an IPv4 address is waited
-   for, the first `scp` lands, the image publishes as `wg-build-image-<profile>-<hex>`); a **second**
-   `profile build` of the same profile (it publishes, the record swaps images, the previous image is
-   deleted only afterwards, `leaked_images` ends empty) — that closes AC-06 and AC-09; `launch` → `ssh`
-   → workspace → `stop` → `resume` → **`gui` with `uptime` unchanged** → `ssh`; two sessions from one
-   image on the isolated network (different MACs, different IPs, each `scp` landing in the right guest);
-   then `delete`/`prune` with the installation VM and the image present throughout. The x86_64 `launch`
-   is the AC-04 row that is still open. Write the results into `docs/verification.md` in place of the
-   `_(re-run pending …)_` placeholders.
+1. **Two open defects in the opt-in test surface** (neither is in the product; both found by the
+   re-run). **N1**: the gated UTM e2e suite cannot run in parallel — concurrent `osascript` against one
+   UTM collapses with `-609`, and `utm_never_deletes_a_vm_it_does_not_own`'s "the VM count did not
+   change" invariant is global, so another test's clone breaks it; the invocation in the file's own
+   module comment carries no `--test-threads=1`, so the documented command fails on a healthy host.
+   **N2**: `utm_reports_the_recorded_vms_read_only` can never pass since the D7 fix — the fixture builds
+   the provider without `.with_image_catalog(…)`, so `image_exists` asks a `NoBuildRecords` store and
+   always answers `false`; the fixture already loads the real `JsonBuildRepository` and just never hands
+   it over. Also worth watching: **N3**, one non-reproducible `pausing` → `stopped` right after the
+   first `gui` (five later calls did not reproduce it, and the code path cannot stop a VM — most likely
+   UTM-side; cause unverified).
 2. **Windows, end to end — the largest gap.** It needs a user-supplied Windows 11 ISO (the spec makes it
    user-provided; nothing was downloaded or simulated). Then: `profile create windows-x86_64 --iso …`,
    **do the printed manual step** — UTM 4.7.5's scripting dictionary has no TPM and no Secure Boot, so
@@ -106,12 +122,15 @@ under way when this was written (the ledger records arm64 finished, x86_64 in pr
    `profile build`, then a launch. This is the first execution of `guest/bootstrap.ps1` and the
    PowerShell transport anywhere, and the first exercise of `windows-x86_64.yaml`'s `tools.verify`
    (which currently ships empty). Expect to find things; budget for it.
-3. **Guest-side isolation is now verified** — no action, but worth knowing when reading older text:
+3. **Close AC-06 on x86_64** if you want the row complete: add a custom provisioning script and two
+   `tools.verify` lines to `t7-kali-x86_64` and rebuild. It is the same path already proven on arm64
+   (four rebuilds, no name collisions) and costs about six minutes under TCG.
+4. **Guest-side isolation is now verified** — no action, but worth knowing when reading older text:
    `doctor`'s `network:isolated:utm` row and earlier documents said "mechanism verified, guest isolation
    unverified". The acceptance run proved it from inside the guest (no default route, no DNS, no
    internet, the host's own LAN unreachable, host↔guest SSH working). Any remaining "unverified"
    wording about UTM isolation is stale.
-4. **Deferred minors that a user can notice**, from the ledger (`.superpowers/sdd/PLAN/progress.md`):
+5. **Deferred minors that a user can notice**, from the ledger (`.superpowers/sdd/PLAN/progress.md`):
    - **Tart has no "previous image preserved on failure".** `TartImageBuilder::prepare` deletes the
      image before cloning, so a failed Tart rebuild leaves the profile with no image (it fails loudly:
      `launch` → `ImageMissing`, `profiles`/`doctor` show it not built). UTM does preserve it. The fix is
@@ -129,8 +148,9 @@ under way when this was written (the ledger records arm64 finished, x86_64 in pr
    - Smaller: `prune` can never delete a VM whose session record is gone (it is reported as unmanaged
      forever — the price of record-based ownership); `doctor` exits 0 even when checks fail;
      `wargame inspect` is not a top-level alias for `wargame session inspect`; `profile console`'s
-     guidance offers `profile eject` for a `--from-vm` profile whose media state is `Unknown`.
-5. **Before merging:** re-read spec §9's checklist against `docs/verification.md`, enable
+     guidance offers `profile eject` for a `--from-vm` profile whose media state is `Unknown`; a guest
+     disk's `host size` reads 0 while its VM runs, so read it stopped.
+6. **Before merging:** re-read spec §9's checklist against `docs/verification.md`, enable
    `sacho.toml`'s `[check] paths` (left empty on purpose — it would fail `sacho check --base main`
    against this branch's existing commits), and decide whether an unverified Windows path blocks the
    merge or ships documented.

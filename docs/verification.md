@@ -133,7 +133,7 @@ No bugs found; the preflight/doctor/fail-fast work from `c61cb32` behaved as des
 
 # Multi-OS guests (2026-09-09 → …)
 
-Branch `feature/multi-os-vm` (`5f47ce1..4b4d825`, 53 commits), **not merged**. This section records the
+Branch `feature/multi-os-vm` (`5f47ce1..1998a92`, 55 commits), **not merged**. This section records the
 UTM/QEMU work — Kali arm64 `virtualize`, Kali x86_64 `emulate`, and the Windows path this host could not
 verify. Everything above it is the MVP/Tart record and is unchanged.
 
@@ -160,40 +160,83 @@ Kept at `~/Library/Application Support/wargame-vm/iso/`, never committed:
 | `kali-linux-2026.2-installer-amd64.iso` | 4 802 531 328 | `6dbefacc95e3b556c19c48e8bae39b8b505e2d3a1aba0bfb7ab62b036c3d2ba3` |
 
 Both digests match `https://cdimage.kali.org/current/SHA256SUMS` (committed as the fixture
-`kali-2026.2-installer-sha256sums.txt`) and were re-verified unchanged at the start and the end of
-phase A and of the acceptance run. Both ISOs took 342 s to fetch. The `SHA256SUMS.gpg` signature was
+`kali-2026.2-installer-sha256sums.txt`) and were re-verified unchanged at the start and the end of both
+installs and of the acceptance run. Both ISOs took 342 s to fetch. The `SHA256SUMS.gpg` signature was
 **not** checked — an open gap against FR-2's "사용자가 제공한 SHA-256은 검증한다".
 
 **Windows: no ISO exists on this host.** `mdfind -name '.iso'` found none and `~/Downloads` is not
 readable by the agent process; the spec makes the Windows ISO user-provided. Nothing was downloaded and
 **nothing about Windows was simulated**.
 
-## Acceptance criteria — verdicts at `4b4d825`
+## Acceptance criteria — verdicts at `f24d0f0`
 
-The acceptance run (`task-7-b2b-report.md`) drove the binary built from **`b06c46d`**. The defects it
-found were fixed afterwards in `7642e36`, `6db2e92`, `14e799c` and `4b4d825`, and **those fixes have not
-been re-run against a real guest** — the run's own critical defect destroyed both installed Kali guests
-(bug 20 below) and the reinstall takes ~1 h 20 m (arm64) / ~10 h (x86_64). Every row that a re-run must
-settle says so, and is **not** counted as verified.
+Three real-VM passes stand behind this table. The **acceptance run** (`task-7-b2b-report.md`) drove the
+binary built from `b06c46d` and found ten defects, one of which destroyed both installed Kali guests
+(bug 20). They were fixed in `7642e36`, `6db2e92`, `14e799c` and `4b4d825`; both guests were then
+**installed again** (`task-7-phase-a2-report.md`, binary `14e799c`); and a **targeted re-run**
+(`task-7-rerun-report.md`, binary `f24d0f0`) re-drove everything the acceptance run had left open.
+Rows carrying an acceptance-run verdict say which run they came from, so a verdict obtained before the
+fixes is never confused with one obtained after.
 
 | ID | Verdict | Evidence |
 |---|---|---|
 | **AC-01** existing macOS profiles + old sessions | **PASS** (real macOS VMs) | `task-7-ac01-report.md` §2–§4, binary pinned to `eadc3ba`. Both pre-branch macOS profiles launch on the default `isolated` network (Ready 19.9 s / 16.5 s), ssh → stop → resume → delete clean; both YAMLs stay byte-identical; the pre-branch session record loads as tart/arm64/virtualize/admin and its `metadata.json` hash is unchanged; `doctor --profile` shows no UTM row for either. |
 | **AC-02** Windows/Kali x86_64 with hypervisor off | **PASS for Kali x86_64 / UNVERIFIED for Windows** | `task-7-b2b-report.md` §3.2 (`logs/18`, `logs/13`): image built and published from the emulated guest in **257 s**; `hypervisor=false` in the AppleScript configuration readback, `-accel tcg,tb-size=2048 -cpu Skylake-Client -machine q35` in the live QEMU argv, `uname -m` = `x86_64` in the guest. **Windows: unverified** — no ISO on this host, user-provided by spec, not simulated. |
 | **AC-03** Kali arm64 virtualize | **PASS** | `task-7-b2b-report.md` §3.1 (`logs/11`): built and published in **58 s**; `hypervisor=true`, `-accel hvf -cpu host -machine virt`, `uname -m` = `aarch64`; the published image is a stopped clone with one non-removable drive (no CD inherited). |
-| **AC-04** ISO → install → build → reusable launch | **arm64 lifecycle PASS / x86_64 launch FAILED in the run → re-run pending / Windows UNVERIFIED** | `task-7-b2b-report.md` §4 (`logs/23`, `25`, `32`, `37`, `44`): arm64 launch → Ready in 27 s → ssh → workspace → stop (2 s) → resume (24 s) → gui → ssh all pass. x86_64 `launch` failed **3 of 3** (`logs/34`, `40`) on bugs 21/22, and one arm64 launch hit the same race (`logs/51`). Both are fixed in `7642e36` but **not yet re-run on a guest**: _(re-run pending — to be filled from task-7-rerun-report.md)_ |
-| **AC-05** clone a UTM VM, original preserved | **PASS** | `task-7-b2b-report.md` §5 (`logs/47`): `profile create t7b-kali-arm64 --from-vm <uuid>` cloned an installed guest, the source VM survived and stayed `stopped`, and the clone then built and published in 41 s (`logs/48`). B2c re-confirmed the copy path (`logs/04`, `10`): two copies of one source, source unchanged. |
-| **AC-06** add a user script → rebuild → verify | **FAILED in the run → re-run pending; Windows UNVERIFIED** | `task-7-b2b-report.md` §6 (`logs/49`): the custom script ran and both new `tools.verify` entries (`ltrace`, `strace`) passed in the guest, but `publish` died on bug 24 — no profile that already had an image could be rebuilt. Fixed in `6db2e92` (per-build image name, proven at the UTM level and against a fake that reproduces UTM's refusal) but **no real rebuild has run since**: _(re-run pending — to be filled from task-7-rerun-report.md)_ |
-| **AC-07** per-OS commands, paths, hashes, workspace | **PASS** | `task-7-b2b-report.md` §4.3 (`logs/26`, `27`): the guest's `sha256sum`, the `.wargame-sha256` sidecar, `.wargame.json`'s `download_sha256` and the host staging hash are all `03cb4114…c1c8`; `incoming/work/notes/output` present; extraction happened in the guest only; nothing was auto-executed. |
-| **AC-08** mixed backends + lifecycle after config change | **PARTIAL** | `task-7-b2b-report.md` §7 (`logs/42`, `43`): `sessions` renders UTM and Tart rows together with the right backend/mode/network, and `prune --dry-run` is correct on every point — neither installation VM nor either image is ever deletable, the running owned session is not listed, and **another home's** Tart VM is reported as ignored with a manual command rather than touched. **The TUI half is not verified**: `wargame` refuses to start without a terminal ("wargame's TUI needs an interactive terminal"), so it cannot be rendered non-interactively, and no pty driver was run this phase. |
-| **AC-09** failed build preserves the previous image | **PARTIAL** | `task-7-b2b-report.md` §8 (`logs/50`, `52`): a fault-injected `tools.verify` entry failed the build **at `Verifying`**, naming the command and exit 127; the record kept the previous ready image, `profiles` flipped to `rebuild needed`, and the preserved image is still launchable and **provably the older one** (`ltrace`/`strace` absent). The other half — "a corrected rebuild then succeeds" — could not run: it is blocked by bug 24, fixed in `6db2e92`: _(re-run pending — to be filled from task-7-rerun-report.md)_ |
+| **AC-04** ISO → install → build → reusable launch | **PASS on both Kali profiles / Windows UNVERIFIED** | `task-7-rerun-report.md` §2, §5. Both profiles built and published from their installed guests (69 s arm64, 383 s x86_64), then launched, answered SSH, carried a correct workspace, stopped, resumed, survived `gui` and were deleted leaving every other VM intact. **The x86_64 launch that failed 3 of 3 in B2b now succeeds** — Ready in **78 s** (`logs/28`) and twice more inside `scripts/e2e-multi-os.sh` (`logs/38`); arm64 Ready in **34 s** against a real Dreamhack challenge (`logs/15`). Lifecycle (`logs/18`–`22`, `27`, `30`, `31`): `stop` 3 s / 6 s, `resume` to SSH-ready 24 s / 58 s, `gui` ~1 s with the guest's boot time unchanged, `ssh` after each, `delete` removing exactly its own VM. **Windows: unverified** — no ISO on this host. |
+| **AC-05** clone a UTM VM, original preserved | **PASS** | `task-7-b2b-report.md` §5 (`logs/47`): `profile create t7b-kali-arm64 --from-vm <uuid>` cloned an installed guest, the source VM survived and stayed `stopped`, and the clone then built and published in 41 s (`logs/48`). B2c re-confirmed the copy path (`logs/04`, `10`): two copies of one source, source unchanged. Re-confirmed again in the re-run (§8, `logs/32`–`35`): a `--from-vm` clone, its source untouched, and the clone later deleted cleanly. |
+| **AC-06** add a user script → rebuild → verify | **PASS (arm64) / Windows UNVERIFIED** | `task-7-rerun-report.md` §4 (`logs/05`, `06`, `06c`, `07`, `11`): `scripts/custom/my-tools.sh` (installing `ltrace` + `strace`) and two `tools.verify` lines were added to `t7-kali-arm64`; the rebuild ran both scripts, passed 13/13 verify commands and published `wg-build-image-t7-kali-arm64-8df814` **while the previous image still existed**, deleting the previous one only afterwards (read out of the automation log, `logs/06c`), with `leaked_images` empty and no unrecorded VM left. A session cloned from the new image reports `ltrace 0.7.91` and `strace -- version 7.0`; a third build repeated it in 35 s. **The x86_64 half was not repeated** — the custom-script rebuild ran on arm64 only. |
+| **AC-07** per-OS commands, paths, hashes, workspace | **PASS** | `task-7-b2b-report.md` §4.3 (`logs/26`, `27`): the guest's `sha256sum`, the `.wargame-sha256` sidecar, `.wargame.json`'s `download_sha256` and the host staging hash are all `03cb4114…c1c8`; `incoming/work/notes/output` present; extraction happened in the guest only; nothing was auto-executed. Re-confirmed on both architectures in the re-run (§5.2, `logs/16`, `17`, `29`), including a real Dreamhack asset (`39fa7aa4…`) whose four independent digests agree and whose `chall` binary is present, executable and unrun. |
+| **AC-08** mixed backends + lifecycle after config change | **PASS** | `task-7-rerun-report.md` §7 (`logs/25`, `26`). With two installation VMs, two images and two session VMs present, `prune --dry-run` listed **nothing** deletable and never named an installation VM or an image, while the other home's Tart VM was reported as left alone. A session record removed by hand made its VM *unmanaged*, not deletable. A record left in `deleting` — the realistic leftover — made exactly that one VM an orphan, and the real `wargame prune` (not a dry run) deleted exactly it, 6 VMs → 5, settling the record; the running session, both installation VMs, both images and all of Tart survived. B2b §7 (`logs/42`, `43`) covers the mixed-backend `sessions` rendering. **The TUI is still not renderable non-interactively** (`wargame` refuses without a terminal), so that surface is unexercised here. |
+| **AC-09** failed build preserves the previous image | **PASS** | `task-7-rerun-report.md` §6 (`logs/08`, `10`, `13`): an injected `wargame-ac09-missing-tool --version` failed the build **at `Verifying`** with the guest's own `command not found` and exit 127; the record kept the previous image and recorded the failure, `profiles` flipped to `rebuild needed` while the other profile stayed `ready`, UTM was unchanged (4 VMs before and after), and the preserved image was **still launchable** — Ready in 38 s, with `ltrace` present, proving it was the AC-06 image and not a stale one. **Then the corrected rebuild succeeded** (the half B2b could not run at all): the bad line removed, `wg-build-image-t7-kali-arm64-62cc30` published in 35 s, `phase: ready`, `last_error: null`, `leaked_images: []`. B2b §8 has the first half's independent observation. |
 | **AC-10** isolated blocks, NAT is explicit | **PASS** | `task-7-b2b-report.md` §9 (`logs/38`, `41`). Isolated, from inside the guest: no default route, `getent hosts` fails, `curl 1.1.1.1` → exit 7, `curl https://kali.download` → could not resolve, the host's own LAN "Network is unreachable", while the host↔guest bridge (`192.168.128.1`) answers and SSH works throughout. This is what upgraded `doctor`'s `network:isolated:utm` from "mechanism verified, guest isolation unverified" to verified. NAT (explicitly chosen, `-y`): default route present, `http://1.1.1.1` → 301, `https://kali.download/…` → 200. No silent fallback was ever observed in either direction. |
 | **AC-11** archive escape / injection prevention | **PASS** | `task-7-b2b-report.md` §10 (`logs/39`): a `../` zip, a `../` tar and a symlink tar were each refused **by name with a reason**, left packed in `incoming/`, no destination directory created, the reasons written to `notes/archive-refusals.txt`, and no sentinel file anywhere under `/tmp` or `$HOME`. |
 | **AC-12** Nix build/fmt/lint/tests, no UTM needed | **PASS** | Three green gates on this branch: at `eadc3ba`, `cargo fmt --all --check` + `clippy --workspace --all-targets -D warnings` + `cargo test --workspace` → **497 passed, 0 failed, 1 ignored**, and `nix flake check` ✅ fmt/clippy/build/tests (`task-7-ac01-report.md` §4); at `14e799c`, **584 passed, 0 failed, 5 ignored** (the opt-in e2e tests), `nix flake check` ✅, `shellcheck scripts/*.sh profiles/scripts/*/*.sh` rc=0, `sacho fmt && sacho check` clean (`task-7-b2c-report.md` §1); at `4b4d825`, the same gate green with **589 tests**. Plain `cargo test` reaches neither UTM nor Tart — everything runs on `FakeRunner` and the in-memory fakes, and the real-VM tests are `#[ignore]`d *and* env-gated. |
 
-**"Re-run pending" is not a pass.** Those three rows were observed failing on real hardware; the fixes
-are covered by unit and fixture tests (including fixtures built from the exact live captures that
-showed the defect) but no guest has exercised them since. They stay open until a re-run says otherwise.
+### The fixes, confirmed live
+
+Nine of the acceptance run's ten defects were re-confirmed fixed **on real virtual machines** in the
+re-run; the tenth was a documentation decision and is unchanged by design
+(`task-7-rerun-report.md` §3, plus `task-7-phase-a2-report.md` §1 for the ones the reinstall exercised).
+
+| Defect (bug no. below) | Confirmed live by |
+|---|---|
+| Delete cascade (20) | Four separate delete paths each removed **exactly one** VM with running bystanders present — `wargame delete` on a started VM three times, a real `wargame prune`, and `wargame profile delete` (re-run §3.1, `logs/12`, `26`, `27`, `31`, `35`). `tart list` byte-identical around every one. |
+| IPv6 handed to `scp` (21) | Every `scp`/`ssh` of six builds and six launches used an IPv4 literal and landed (`logs/03c`, `04c`). The bracketing branch itself is now unreachable — the address gate never hands `scp` an IPv6-only address — so it stays covered by its unit test only. |
+| Address gate (22) | Caught in the act: five `utmctl ip-address` polls returning IPv6 only, the debug log stating why it kept waiting, then the DHCPv4 lease arriving and the build proceeding (`logs/03c`). This is the exact window that killed B2b's builds. |
+| Clone MAC (23) | Two sessions from one image, up at the same time on the isolated network: MACs `ea:2d:e0:e6:f2:5c` and `12:59:9b:c4:40:7b` (both locally administered, unicast), leases `.5` and `.6`, and **each guest holding only its own challenge** (re-run §5.3). |
+| Publish collision (24) | Four consecutive rebuilds of a profile that already had an image, each publishing under a fresh `-<hex>` name, the previous image deleted only after the record named the new one, `leaked_images` empty at every check (re-run §4). Six real builds, five publishes, **zero name collisions**. |
+| Disk check (17) | `disk-space:t7-kali-arm64 ✓ … free on the volume that holds …/com.utmapp.UTM/Data/Documents, less than this profile's 80 GiB disk — allowed, because a guest disk is sparse …` — a ✓ where B2b got a ✗. The prediction held: each finished guest occupies under 2 GiB of its nominal 80 (A2 §1, re-run §2.1). |
+| Stale `ready` (25) | A record naming an image UUID UTM does not have reads `missing` in `profiles`, in `--json` and as a `doctor` ✗ with `wargame profile build` as the hint, while the two real profiles in the same table still read `ready` (`logs/41`; A2 §1 saw the same against three records left by the destroyed VMs). |
+| `gui` reboot (26) | Six `gui` calls on running sessions: each returned in ~1 s, the VM stayed `started`, and the guest's boot time (`uptime -s`) was unchanged while `/proc/uptime` kept climbing; the debug log shows only a status read and `open -a UTM`. **One anomaly, N3 below** (re-run §5.4). |
+| "Not set up" hint (25) | The hint names `wargame profile console … then: wargame profile build …` and no longer sends the user to `profile create` (A2 §1, re-run §2.1). |
+| Installer-disc eject (18) | **The write branch, on real installed guests.** Drive readbacks before and after `wargame profile eject` on both VMs: arm64 `[removable=true 3788 MiB] + [removable=false]` → the non-removable disk alone with its id and `hostMiB` intact; x86_64 the same. Both then booted their installed OS from disk (A2 §1). B2c had proven the same branch on a throwaway VM; this is it on a VM whose surviving drive holds an OS. |
+| Isolated DNS (documented only) | Not re-tested by design — it was a decision, not a change. All four isolated launches worked without DNS, which is the documented contract. |
+
+### Three items the re-run opened
+
+None is in the product; all three are recorded rather than fixed.
+
+- **N1 — the gated UTM e2e suite cannot run in parallel, and nothing says so.** Under the default
+  four-thread harness against one UTM, three of four tests fail: UTM's AppleScript connection collapses
+  under concurrent `osascript` (`-609`), and `utm_never_deletes_a_vm_it_does_not_own`'s "the VM count
+  did not change" invariant is global, so another test's clone breaks it. With `--test-threads=1` three
+  of four pass. The invocation in the file's own module comment carries no `--test-threads=1`, so the
+  documented command fails on a healthy host (`task-7-rerun-report.md` N1, `logs/39`, `40`). **Open.**
+- **N2 — `utm_reports_the_recorded_vms_read_only` can never pass since the D7 fix.** The fixture builds
+  the provider without `.with_image_catalog(…)`, so `UtmProvider::images` is `NoBuildRecords`; the D7
+  change asks the record store first, which then always answers `false`, making the assertion
+  unsatisfiable. The fixture already loads the real `JsonBuildRepository` — it just never hands it to
+  the provider. A permanently red opt-in test, not a product defect
+  (`task-7-rerun-report.md` N2). **Open.**
+- **N3 — one non-reproducible stop of a running session at the first `gui`.** The command reported
+  success and the session then went `pausing` → `stopped`, so the next `ssh` failed. **Five further
+  `gui` calls did not reproduce it**, including one repeating the exact preceding sequence and three
+  back to back, and the verbose automation log of a clean call shows only a status read and
+  `open -a UTM` — a path that cannot stop a VM. Most likely UTM-side (the window `open -a UTM` brought
+  forward closing itself). **Cause unverified**; recorded because the symptom is severe (`gui` says
+  "SSH keeps working" and exits 0 while the guest goes down) and worth watching
+  (`task-7-rerun-report.md` N3, `logs/19`).
 
 ### Windows, end to end: unverified
 
@@ -230,7 +273,10 @@ Numbering continues from the MVP record above (1–13).
     VMs with the manual command for their backend — never deleted. The Tart provider gained the
     namespace floor UTM already had. `d2bbd6c` then made the advertised recovery work (`delete` can
     finish an interrupted delete and clean up a session stuck mid-launch) and settled records after a
-    prune. Help text corrected (`33f4d48`), README's ownership rule added (`8adc85c`).
+    prune. Help text corrected (`33f4d48`), README's ownership rule added (`8adc85c`). Confirmed live in
+    the re-run (AC-08): with everything present nothing was deletable, a hand-removed record made its VM
+    *unmanaged*, and a record left in `deleting` made exactly that VM an orphan, which a **real
+    `wargame prune`** then deleted and nothing else.
 15. **`scripts/e2e-smoke.sh` was broken and leaked a running VM when it broke.** It parsed
     `^session id: `, a line the 2026-09-08 usability pass (`eb5a329`, on `main`) had removed, and failed
     *after* the VM was up but *before* `SESSION_ID` was set, so its `EXIT` trap deleted nothing
@@ -267,7 +313,15 @@ Numbering continues from the MVP record above (1–13).
     latent data-loss path — `removable` cannot be changed after a drive is created, so a `--from-vm`
     VM can have its *boot disk* flagged removable and the eject would have detached the user's installed
     system — fixed in `0d9f44b`: the script refuses before either write when no drive would survive, and
-    a build from an adopted VM ejects nothing at all.
+    a build from an adopted VM ejects nothing at all. **Confirmed on both real installed guests** in the
+    second install: the removable drive goes, the disk survives with its id and `hostMiB` intact, and
+    both VMs then boot their installed OS (`task-7-phase-a2-report.md` §1). That install also showed
+    what the guidance still missed — both guests rebooted into the attached installer, and the x86_64
+    one, whose scratch disc was unattended, **started re-running the install over the disk it had just
+    written** (A2-D2). Fixed in `1998a92`: `profile create`'s checklist now says to shut the guest down
+    from inside the installer and `profile eject` before it boots again, with the reason, and the steps
+    are counted rather than typed so a `--from-vm` clone — which has no disc of ours — is not told to
+    eject one; `profile console` and the README carry the same order.
 19. **There was no CLI verb for the installation VM.** `profile console` starts it and nothing could
     stop, eject or delete it; every such action in phase A went through `utmctl` by hand
     (`task-7-phase-a-report.md` D4). Fixed in `ce18a55`: `profile stop` (the same `VmProvider::stop`
@@ -340,7 +394,12 @@ Numbering continues from the MVP record above (1–13).
     VM already exists, the one command that would refuse — it now points at `profile console`. A review
     round added the fourth case in `4b4d825`: a backend that *cannot answer* (denied Automation, an app
     that will not launch) was collapsed into `missing` plus "rebuild it"; it now reads `unknown` and
-    carries the backend's own message and `wargame doctor` as the hint.
+    carries the backend's own message and `wargame doctor` as the hint. A fifth followed from the second
+    install (A2-D1): `installer_media` was written and never read back, so two installed, SSH-verified
+    guests both read `awaiting-install` and were sent to the console to finish an install they had
+    finished. Fixed in `1998a92`: an ejected profile reads `media ejected (not built)` and `doctor`
+    offers `profile build`. The word stops at what ejecting proves — the disc is out — and does not
+    claim the OS was checked; a disc still in the drive is still `awaiting-install`.
 26. **`wargame gui` silently rebooted a running session's guest.** It took 22 s, printed "SSH keeps
     working", and the guest came back with `uptime` = 0 min — in-guest state lost without warning
     (`task-7-b2b-report.md` §2 D8, `logs/44`). Fixed in `14e799c`: `VmProvider::show_console` (default
@@ -362,66 +421,73 @@ on it* (`task-7-phase-a-report.md` D6, `b06c46d`).
 
 | | Kali arm64 — `virtualize` (HVF) | Kali x86_64 — `emulate` (TCG) |
 |---|---|---|
-| Unattended ISO install, boot → `finish-install` | ~4 810 s (**1 h 20 m**) | ~36 000 s (**10 h**) |
-| Power-on → guest-agent address (installed guest) | 23 s | 44–54 s |
-| Power-on → SSH ready (installed guest) | **25 s** | **48–68 s** |
-| Whole `wargame profile build` | **58 s** | **257 s** |
+| Unattended ISO install, **concurrent and starved** (phase A) | ~4 810 s (1 h 20 m) | ~36 000 s (10 h) |
+| Unattended ISO install, **sequential, host idle** (phase A2) | **771 s (12 m 51 s)** | **1 960 s (32 m 40 s)** |
+| Power-on → guest-agent IPv4 (installed guest) | **23 s** | **54 s** |
+| Power-on → SSH ready (installed guest) | **24 s** | **59 s** |
+| Whole `wargame profile build`, first publish | **58–69 s** | **257–383 s** |
 | — provisioning step alone | ~20 s (197 MB at 55.5 MB/s) | ~180 s (221 MB at 17.7 MB/s) |
-| `launch` → Ready (session from the image) | 27 s | not reached (bugs 21/22) |
-| `stop` / `resume` / `gui` | 2 s / 24 s / 22 s | — |
+| Rebuild of a profile that already has an image | 33–43 s (four of them) | not repeated |
+| `launch` → Ready (session from the image) | **34 s** (real Dreamhack asset) | **72–78 s** |
+| `stop` / `resume` to SSH-ready / `gui` | 3 s / 24 s / ~1 s | 6 s / 58 s / <1 s |
+| `profile stop` / `profile eject` | 1–4 s / 1 s | 2 s / 1 s |
 
-Both install figures are **pessimistic and starved**: the two installs ran concurrently on a 10-core
-host with 4 vCPU each, one of them TCG; both guests logged `soft lockup` warnings and the host load
-average peaked around 24. Run installs sequentially, or lower `resources.cpu`.
+**Running the installs one at a time is worth far more than it looks**: arm64 4 810 s → 771 s (6.2×) and
+x86_64 ~36 000 s → 1 960 s (18×), and phase A's guest `soft lockup` storms did not recur at all. The
+first pair ran concurrently on a 10-core host with 4 vCPU each, one of them TCG, with the host load
+average peaking around 24. The resource warning `profile create` prints is exactly this lesson.
 
-**The 1800 s `emulate` boot timeout is right and generous** — roughly 26× the measured boot; the 300 s
+**The 1800 s `emulate` boot timeout is right and generous** — roughly 30× the measured boot; the 300 s
 `virtualize` default has ~12× headroom. Phase A's worry that provisioning under TCG would be the long
-pole did not materialise (221 MB of packages in about three minutes). Neither number needs changing; the
-thing that actually broke these paths was bugs 21/22, which no timeout can fix.
+pole did not materialise: the whole emulated build, provisioning included, fits inside 383 s. Neither
+number needs changing; what actually broke these paths was bugs 21/22, which no timeout could fix.
 
 ## What is verified on real VMs, and what only fakes have seen
 
 | Exercised on real hardware | Only exercised against fakes / fixtures |
 |---|---|
-| Both macOS profiles end to end on real Tart VMs, incl. the pre-branch session record (AC-01) | `copy_in`'s IPv6 bracketing (bug 21) — a unit test, no guest |
-| Kali arm64 and x86_64 installed from ISO, `profile build`, publish, `uname -m`, `hypervisor` off (AC-02, AC-03) | `wait_ip`'s IPv4 wait (bug 22) — two fixtures carrying the exact live polls, no guest agent |
-| `profile create --iso` and `--from-vm`, `profile console`, source preservation (AC-05) | The rebuild/publish flow (bug 24) — a fake registry that reproduces UTM's `-2700`; no real second build |
-| `profile eject`: the no-op path, the read path, and the write branch on a throwaway VM with an ISO attached | `show_console` / `gui` not restarting a guest (bug 26) — a unit test, no session |
-| `delete`, `start`, `stop`, `duplicate`, `set_network_mode` each affecting exactly one VM, with a running bystander present (bug 20) | `prune`'s deletion paths and record settling — 19 lifecycle tests on in-memory fakes; a real `prune` was never run |
-| A clone getting its own MAC; three copies, three addresses (bug 23) | `guest.user` validation, `doctor`'s three-way Pass/Fail/NotSetUp, the `unknown` image state |
-| `doctor`'s disk row on the right volume; a record's image going `missing` when UTM loses it | Everything Windows: `guest/bootstrap.ps1`, the PowerShell transport, `-EncodedCommand`, the 3010 reboot path |
-| Guest-side isolation and NAT, from inside the guest (AC-10) | `scripts/e2e-multi-os.sh` stages 9–12 (guest SSH, `uname -m`, workspace, hashes, stop/resume/delete, source preservation) — a full `WARGAME_VM=fake` dry run proved control flow and cleanup only |
-| Guest file hashes against host staging (AC-07); archive-escape refusals in the guest (AC-11) | `crates/wargame-utm/tests/e2e.rs` beyond compiling, skipping and the delete test |
-| The gate: fmt, clippy, `cargo test --workspace`, `nix flake check`, `shellcheck`, `sacho check` (AC-12) | Tart's "previous image preserved on failure" exception (its `prepare` deletes the image before cloning) |
+| Both macOS profiles end to end on real Tart VMs, incl. the pre-branch session record (AC-01) | `copy_in`'s **IPv6 bracketing branch** (bug 21) — a unit test only, and now unreachable in practice: since the address gate waits for IPv4, no IPv6-only address ever reaches `scp` |
+| Kali arm64 and x86_64 installed from ISO twice, `profile build` six times, five publishes, `uname -m`, `hypervisor` off (AC-02, AC-03, AC-04) | `show_console`'s `false` branch — Tart's `gui`, which still stops and starts, is covered by the MVP record above, not by a multi-OS run |
+| `profile create --iso` and `--from-vm`, `profile console`, source preservation (AC-05) | `guest.user` validation, `doctor`'s three-way Pass/Fail/NotSetUp, the `unknown` image state (a backend that cannot answer) |
+| **`profile eject`'s write branch on both real installed guests** — the removable drive gone, the OS disk intact, the VM then booting from it — plus the no-op and read paths | Everything Windows: `guest/bootstrap.ps1`, the PowerShell transport, `-EncodedCommand`, the 3010 reboot path, `windows-x86_64.yaml`'s empty `tools.verify` |
+| `delete`, `start`, `stop`, `duplicate`, `set_network_mode` each affecting exactly one VM, with a running bystander present (bug 20); a **real `wargame prune`** deleting exactly one orphan (AC-08) | The `prune` branches no real leftover produced — the rest of the 19 lifecycle tests on in-memory fakes |
+| A clone getting its own MAC — two concurrent sessions from one image, distinct MACs and leases, each guest holding only its own challenge (bug 23) | Tart's "previous image preserved on failure" exception (its `prepare` deletes the image before cloning) |
+| Rebuilding a profile that already has an image, four times, with the previous image deleted only afterwards (bug 24, AC-06, AC-09) | The `EveryDriveRemovable` eject refusal — no VM could be contrived with only removable drives |
+| The IPv4 wait actually waiting through a live IPv6-only window (bug 22); every `scp` landing on an IPv4 literal (bug 21) | `crates/wargame-utm/tests/e2e.rs`'s `utm_reports_the_recorded_vms_read_only` — permanently red on a fixture defect (N2) |
+| `gui` leaving a running guest's boot time unchanged, six times (bug 26) | — |
+| `doctor`'s disk row on the right volume; a record's image going `missing` when UTM loses it | — |
+| Guest-side isolation and NAT, from inside the guest (AC-10) | — |
+| Guest file hashes against host staging on both architectures, incl. a real Dreamhack asset (AC-07); archive-escape refusals in the guest (AC-11) | — |
+| `scripts/e2e-multi-os.sh` end to end, three green runs, "nothing was left unverified"; the gated UTM suite serially, 3 of 4 passing incl. the exactly-one-delete test | — |
+| The gate: fmt, clippy, `cargo test --workspace`, `nix flake check`, `shellcheck`, `sacho check` (AC-12) | — |
 
 ## Explicitly unverified
 
 - **Windows, end to end.** No ISO on this host; see the Windows subsection above. The TPM/Secure Boot
   manual step is a printed instruction nobody has followed on this host.
-- **AC-04 (x86_64), AC-06 and AC-09's corrected-rebuild half after the fixes.**
-  _(re-run pending — to be filled from task-7-rerun-report.md)_
-- **Bugs 21, 22 and 26 live.** All three are covered by tests built from the live captures that showed
-  them, and none has met a guest since the fix.
-- **The eject write branch on a VM with an installed guest.** It is proven live on a throwaway VM
-  created from an ISO (drives 2 → 1, the non-removable drive surviving, every other VM untouched), but
-  not yet on a VM whose surviving disk holds an OS.
-  _(re-run pending — to be filled from task-7-rerun-report.md)_
+- **AC-06 on x86_64.** The custom-script rebuild was exercised on arm64 only; a second x86_64 build
+  costs about six minutes and was outside the re-run's brief.
+- **N3's cause.** One session stopped after the first `gui` and it never reproduced; whether UTM or
+  something else did it is unknown.
 - **The TUI on a multi-OS session.** It refuses to render non-interactively; no pty driver was run
   (AC-08).
 - **`STATUS_BODY`** is the one AppleScript template still reading through the loop variable (it reads
   two properties and acts on nothing); the by-id form for it has not been run against real UTM. The
   `suspend` verb has no adapter body at all.
 - **`SHA256SUMS.gpg`** signature verification for downloaded ISOs.
-- **A real `wargame prune` deletion** on a UTM host, and `delete`/`prune` with an installation VM and an
-  image present throughout.
+- **The isolated `resolv.conf` behaviour** was not re-measured in the re-run; it remains a documented
+  decision, not a change.
 - **UTM's `unavailable` backend state**, `--disposable`, `--recovery`, `stop --request`, guest file
   push/pull and USB attach — dictionary entries never exercised (`task-1-report.md`).
 
 ## The ISO installs, as a separate manual step
 
 The spec allows the first OS install to be manual and asks for it to be recorded with its own evidence.
-Full transcript, serial captures and the preseed file: **`.superpowers/sdd/PLAN/task-7-phase-a-report.md`**
-(raw logs were session scratch and are gone; the report quotes them).
+Both Kali guests were installed **twice** — the first pair in
+**`.superpowers/sdd/PLAN/task-7-phase-a-report.md`**, and, after bug 20 destroyed them, again in
+**`.superpowers/sdd/PLAN/task-7-phase-a2-report.md`** with the same recipe on the fixed CLI, which makes
+it a twice-verified procedure. Both reports carry the transcripts, serial captures and the preseed file
+(the raw logs were session scratch and are gone; the reports quote them).
 
 Method: **unattended Debian preseed**, with the boot line delivered over the UTM serial ptty. No human
 clicked anything — which mattered, because the graphical console was unreachable to the installing agent
@@ -434,19 +500,52 @@ clicked anything — which mattered, because the graphical console was unreachab
   `auto=true priority=critical preseed/url=http://<host>:8642/preseed.cfg … console=ttyAMA0,115200`,
   served by `python3 -m http.server` on the host's address **on the `vmnet-shared` bridge** (not
   `10.0.2.2`, which only exists in UTM's `emulated` mode).
-- amd64 only: the ISO's `grub.cfg` switches to `gfxterm`, so its menu is invisible on the serial line.
-  A scratch ISO with a two-line `grub.cfg` replacement was built with `xorriso`; the VM was pointed back
-  at the pristine ISO afterwards, and both original ISOs' hashes were re-verified unchanged.
+- amd64 only: the ISO's `grub.cfg` switches to `gfxterm`, so its menu is invisible on the serial line —
+  and the second install tested the other half deliberately: two blind inputs, at t+175 s and t+319 s
+  with QEMU demonstrably alive, produced **0 bytes** each, so serial *input* is lost as well. With UTM's
+  input automation a no-op and no Screen Recording grant, **the stock amd64 installer cannot be driven
+  by an agent at all** — a modified ISO is the route, not a convenience (A2-D3, recorded in
+  `docs/utm-compatibility.md` §3 by `1998a92`). A scratch ISO with a two-line `grub.cfg` replacement was
+  built with `xorriso`; the VM was pointed back at the pristine ISO afterwards (the second time,
+  `wargame profile eject` removed it), and both original ISOs' hashes were re-verified unchanged.
 - The preseed pins `kali.download` (not `http.kali.org`, whose HTTPS redirect fails against a target
   system with no CA bundle yet), installs no desktop, forces
   `grub-installer/force-efi-extra-removable`, and its `late_command` writes
   `/etc/sudoers.d/wargame` (passwordless sudo for `kali`), the host's public key into
   `~kali/.ssh/authorized_keys`, and enables `ssh` + `qemu-guest-agent`.
-- After the install the CD had to be detached by hand — the gap that became bug 18 and
-  `wargame profile eject`.
+- The first time, the CD had to be detached by hand — the gap that became bug 18. The second time every
+  stop and every detach went through the new CLI verbs (`wargame profile stop`, `wargame profile
+  eject`), and `utmctl` was used only to *verify* the result.
+- Two details from the second run worth keeping: a guest disk's `host size` reads `0` **while the VM is
+  running** and shows its real allocation only once stopped, so read it stopped (it is the only usable
+  cross-check that an OS was written); and the post-install reboot must be detected by counting
+  `BdsDxe: starting` lines in the serial capture, not by grepping for a GRUB banner the log already
+  contains — that mistake is what truncated phase A's x86_64 install.
 
-Both guests were then verified live: `utmctl status started`, an address from the guest agent, key-based
-SSH as `kali` with `BatchMode=yes`, `sudo -n true` exit 0, `sshd` enabled and active, the guest agent
-active, `uname -m` = `aarch64` / `x86_64`, `/etc/os-release` = Kali 2026.2, and `apt-get update` exit 0
-on both. **Both of those installs were destroyed by bug 20** (see above) and are being installed again;
-the re-run inherits that work.
+Both guests were verified live each time: `utmctl status started`, an address from the guest agent,
+key-based SSH as `kali` with `BatchMode=yes`, `sudo -n true` exit 0, `sshd` enabled and active, the guest
+agent `is-active` (Kali answers `static` to `is-enabled`, which is correct), `uname -m` = `aarch64` /
+`x86_64`, `/etc/os-release` = Kali 2026.2, `systemctl --failed` empty, and `apt-get update` exit 0. The
+second pair — `9B71AC04-…` (arm64) and `4EE44988-…` (x86_64), 80 GiB sparse disks holding under 2 GiB
+each — is the pair everything after phase A2 was verified against.
+
+## End state
+
+UTM holds exactly four VMs, all `stopped`: the two installation VMs (`wg-build-t7-kali-arm64`
+`9B71AC04-…`, `wg-build-t7-kali-x86_64` `4EE44988-…`) and the two current images
+(`wg-build-image-t7-kali-arm64-62cc30` `890D47C7-…`, `wg-build-image-t7-kali-x86_64-70bde9`
+`319AACC2-…`). Both build records read `phase: ready`, name exactly those VMs, and carry
+`previous_image: null`, `leaked_images: []`, `cleanup_failures: []`; `wargame profiles` shows both
+**ready**. Every session the re-run created was deleted — `wargame sessions` says *No sessions yet* — and
+`pgrep -fl 'qemu-.*-softmmu'` is empty. **Tart is untouched**: `tart list` is byte-identical to the start
+of every phase, with `kindle-vm`, both `wargame-profile-macos-*` images and the user's stopped session VM
+`wg-dh-sprout-base64-3edf2c` all present and never referenced by any command.
+
+The arm64 profile in the verification home deliberately keeps the AC-06 additions
+(`scripts/custom/my-tools.sh` plus the `ltrace`/`strace` verify lines): that is what its current image
+was built from, so reverting either would make the profile read `rebuild needed`.
+
+Disk on `/` through the re-run: 17 GiB free at the start, a low-water mark of **14 GiB** after the second
+image was published, and **98 GiB at the end** — the jump is macOS reclaiming purgeable space, not
+something the run deleted (a whole Kali image is under 2 GiB). Nothing was cleaned to get there: no
+`cargo clean`, no `nix store gc`.
