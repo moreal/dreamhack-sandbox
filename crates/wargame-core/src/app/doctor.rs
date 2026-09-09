@@ -8,25 +8,75 @@ use crate::domain::{GuestShell, NetworkMode, Profile};
 
 use super::AppContext;
 
+/// How one [`Check`] came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStatus {
+    /// Everything this check needs is there.
+    Pass,
+    /// A real problem: something is missing or broken.
+    Fail,
+    /// Nothing is broken -- this simply has not been set up here yet.
+    ///
+    /// A profile whose image was never built is the case that matters: a
+    /// macOS-only host is not faulty for shipping Kali and Windows
+    /// templates it has no installation ISO for, and three permanent `✗`
+    /// rows for them teach the reader to ignore `✗` (spec.md §6's error
+    /// UX). A build that was started and did not finish is *not* this: it
+    /// stays a failure.
+    NotSetUp,
+}
+
+impl CheckStatus {
+    fn from_ok(ok: bool) -> CheckStatus {
+        if ok {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        }
+    }
+
+    /// The word `doctor --json` prints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckStatus::Pass => "pass",
+            CheckStatus::Fail => "fail",
+            CheckStatus::NotSetUp => "not-set-up",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
     pub name: String,
-    pub ok: bool,
+    pub status: CheckStatus,
     pub detail: String,
     pub hint: Option<String>,
+}
+
+impl Check {
+    /// Whether the check is satisfied.
+    pub fn passed(&self) -> bool {
+        self.status == CheckStatus::Pass
+    }
+
+    /// Whether it found a real problem. A [`CheckStatus::NotSetUp`] row has
+    /// not: it is neither passed nor failed.
+    pub fn failed(&self) -> bool {
+        self.status == CheckStatus::Fail
+    }
 }
 
 fn binary_check(ctx: &AppContext, name: &str, program: &str, hint: Option<&str>) -> Check {
     match ctx.runner.which(program) {
         Some(path) => Check {
             name: name.to_string(),
-            ok: true,
+            status: CheckStatus::from_ok(true),
             detail: format!("found at {}", path.display()),
             hint: None,
         },
         None => Check {
             name: name.to_string(),
-            ok: false,
+            status: CheckStatus::from_ok(false),
             detail: format!("{program} not found on PATH"),
             hint: hint.map(str::to_string),
         },
@@ -42,7 +92,9 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
 
     checks.push(Check {
         name: "platform".to_string(),
-        ok: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+        status: CheckStatus::from_ok(
+            cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+        ),
         detail: format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH),
         hint: if cfg!(target_os = "macos") {
             None
@@ -58,7 +110,7 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
         checks.push(match &healthcheck {
             Ok(status) => Check {
                 name: format!("vm-backend:{}", vm.name()),
-                ok: status.available,
+                status: CheckStatus::from_ok(status.available),
                 detail: status
                     .version
                     .clone()
@@ -71,7 +123,7 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
             },
             Err(e) => Check {
                 name: format!("vm-backend:{}", vm.name()),
-                ok: false,
+                status: CheckStatus::from_ok(false),
                 detail: e.to_string(),
                 hint: e.hint(),
             },
@@ -104,7 +156,7 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
             let free_gib = free as f64 / (1024.0 * 1024.0 * 1024.0);
             Check {
                 name: "disk-space".to_string(),
-                ok: free_gib >= MIN_FREE_GIB,
+                status: CheckStatus::from_ok(free_gib >= MIN_FREE_GIB),
                 detail: format!("{free_gib:.1} GiB free at {}", ctx.dirs.root.display()),
                 hint: if free_gib >= MIN_FREE_GIB {
                     None
@@ -115,7 +167,7 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
         }
         Err(e) => Check {
             name: "disk-space".to_string(),
-            ok: false,
+            status: CheckStatus::from_ok(false),
             detail: e.to_string(),
             hint: None,
         },
@@ -129,7 +181,7 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
     }
     checks.push(Check {
         name: "wargame-home".to_string(),
-        ok: home_writable,
+        status: CheckStatus::from_ok(home_writable),
         detail: ctx.dirs.root.display().to_string(),
         hint: if home_writable {
             None
@@ -145,13 +197,13 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
     checks.push(match ctx.wargame.healthcheck().await {
         Ok(status) => Check {
             name: format!("provider:{}", ctx.wargame.name()),
-            ok: status.reachable,
+            status: CheckStatus::from_ok(status.reachable),
             detail: status.detail,
             hint: None,
         },
         Err(e) => Check {
             name: format!("provider:{}", ctx.wargame.name()),
-            ok: false,
+            status: CheckStatus::from_ok(false),
             detail: e.to_string(),
             hint: e.hint(),
         },
@@ -161,7 +213,7 @@ pub async fn doctor(ctx: &AppContext) -> Vec<Check> {
     let key_present = key_path.exists();
     checks.push(Check {
         name: "guest-key".to_string(),
-        ok: key_present,
+        status: CheckStatus::from_ok(key_present),
         detail: key_path.display().to_string(),
         hint: if key_present {
             None
@@ -181,19 +233,19 @@ fn isolated_network_check(backend: &str, status: Option<&crate::ports::BackendSt
     match status.map(|s| (s.isolated_network, s.detail.clone())) {
         Some((Some(true), detail)) => Check {
             name,
-            ok: true,
+            status: CheckStatus::from_ok(true),
             detail,
             hint: None,
         },
         Some((Some(false), detail)) => Check {
             name,
-            ok: false,
+            status: CheckStatus::from_ok(false),
             detail,
             hint: Some(crate::error::isolated_network_hint(None)),
         },
         _ => Check {
             name,
-            ok: true,
+            status: CheckStatus::from_ok(true),
             detail: "unknown".to_string(),
             hint: None,
         },
@@ -213,7 +265,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
         Err(e) => {
             return vec![Check {
                 name: format!("profile:{name}"),
-                ok: false,
+                status: CheckStatus::from_ok(false),
                 detail: e.to_string(),
                 hint: e.hint(),
             }]
@@ -228,7 +280,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
         Err(e) => {
             checks.push(Check {
                 name: format!("profile:{name}"),
-                ok: false,
+                status: CheckStatus::from_ok(false),
                 detail: e.to_string(),
                 hint: e.hint(),
             });
@@ -237,7 +289,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
     };
     checks.push(Check {
         name: format!("profile:{name}"),
-        ok: true,
+        status: CheckStatus::from_ok(true),
         detail: resolved.describe(),
         hint: None,
     });
@@ -248,7 +300,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
         Err(e) => {
             checks.push(Check {
                 name: format!("vm-backend:{}", resolved.backend),
-                ok: false,
+                status: CheckStatus::from_ok(false),
                 detail: e.to_string(),
                 hint: e.hint(),
             });
@@ -263,7 +315,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
     checks.push(match &healthcheck {
         Ok(status) => Check {
             name: format!("vm-backend:{}", vm.name()),
-            ok: status.available,
+            status: CheckStatus::from_ok(status.available),
             detail: status
                 .version
                 .clone()
@@ -276,7 +328,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
         },
         Err(e) => Check {
             name: format!("vm-backend:{}", vm.name()),
-            ok: false,
+            status: CheckStatus::from_ok(false),
             detail: e.to_string(),
             hint: e.hint(),
         },
@@ -284,7 +336,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
     for check in vm.diagnostics().await {
         checks.push(Check {
             name: check.name,
-            ok: check.ok,
+            status: CheckStatus::from_ok(check.ok),
             detail: check.detail,
             hint: check.hint,
         });
@@ -295,7 +347,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
     let mode_ok = capabilities.supports_mode(resolved.mode);
     checks.push(Check {
         name: format!("mode:{}:{}", resolved.mode, vm.name()),
-        ok: mode_ok,
+        status: CheckStatus::from_ok(mode_ok),
         detail: if mode_ok {
             format!("{} supports {}", vm.name(), resolved.mode)
         } else {
@@ -309,7 +361,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
     if !network_supported {
         checks.push(Check {
             name: format!("network:{network}:{}", vm.name()),
-            ok: false,
+            status: CheckStatus::from_ok(false),
             detail: format!("{} cannot configure {network} networking", vm.name()),
             hint: Some("Launch with --network nat, or pick another profile".to_string()),
         });
@@ -318,7 +370,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
     } else {
         checks.push(Check {
             name: format!("network:{network}:{}", vm.name()),
-            ok: true,
+            status: CheckStatus::from_ok(true),
             detail: format!("{} supports {network}", vm.name()),
             hint: None,
         });
@@ -334,7 +386,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
             let needed = profile.resources.disk_gib as f64;
             Check {
                 name: format!("disk-space:{name}"),
-                ok: free_gib >= needed,
+                status: CheckStatus::from_ok(free_gib >= needed),
                 detail: format!(
                     "{free_gib:.1} GiB free at {}, profile asks for {needed:.0} GiB",
                     ctx.dirs.root.display()
@@ -346,7 +398,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
         }
         Err(e) => Check {
             name: format!("disk-space:{name}"),
-            ok: false,
+            status: CheckStatus::from_ok(false),
             detail: e.to_string(),
             hint: None,
         },
@@ -359,7 +411,7 @@ pub async fn doctor_profile(ctx: &AppContext, name: &str) -> Vec<Check> {
     let transport = ctx.transports.for_shell(shell);
     checks.push(Check {
         name: format!("guest-shell:{shell}"),
-        ok: transport.is_ok(),
+        status: CheckStatus::from_ok(transport.is_ok()),
         detail: match &transport {
             Ok(_) => format!("{shell} transport wired for this guest"),
             Err(e) => e.to_string(),
@@ -378,21 +430,35 @@ async fn profile_image_check(ctx: &AppContext, profile: &Profile) -> Check {
     // The same overview `profiles` and the TUI's picker render: whether an
     // image is actually launchable is one decision, made in one place.
     let overview = crate::app::profiles::overview(ctx, profile).await;
-    let check = |ok: bool, detail: String, hint: Option<String>| Check {
+    let check = |status: CheckStatus, detail: String, hint: Option<String>| Check {
         name: format!("profile-image:{name}"),
-        ok,
+        status,
         detail,
         hint,
     };
     let Some(image) = overview.image() else {
+        // The backend could not answer at all: a real problem, not a
+        // profile nobody has set up.
         let (detail, hint) = overview.image_error().unwrap_or(("unknown", None));
-        return check(false, detail.to_string(), hint.map(str::to_string));
+        return check(
+            CheckStatus::Fail,
+            detail.to_string(),
+            hint.map(str::to_string),
+        );
+    };
+    // A profile nobody has built here is not a broken host -- it is one you
+    // have not set up. A build that *was* started and did not finish, or an
+    // image that has gone missing since, stays a failure.
+    let status = match (image.ready, image.never_built) {
+        (true, _) => CheckStatus::Pass,
+        (false, true) => CheckStatus::NotSetUp,
+        (false, false) => CheckStatus::Fail,
     };
     // Every row leads with what the profile resolved to, so `doctor` names
     // the guest OS, architecture, backend and execution mode next to the
     // image state rather than only the last of those (spec.md §3 FR-1).
     check(
-        image.ready,
+        status,
         format!(
             "{}, {} — {}",
             overview.guest_label(),
@@ -465,7 +531,7 @@ mod tests {
         let sshpass = checks.iter().find(|c| c.name == "sshpass").unwrap();
         // FakeRunner has nothing registered via `which`, so this should be a
         // (non-fatal) miss with a hint, never a panic or an early return.
-        assert!(!sshpass.ok);
+        assert!(!sshpass.passed());
         assert!(sshpass.hint.is_some());
     }
 
@@ -479,7 +545,7 @@ mod tests {
             .iter()
             .find(|c| c.name == "network:isolated:tart")
             .unwrap();
-        assert!(check.ok);
+        assert!(check.passed());
         assert!(check.hint.is_none());
     }
 
@@ -493,7 +559,7 @@ mod tests {
             .iter()
             .find(|c| c.name == "network:isolated:tart")
             .unwrap();
-        assert!(!check.ok);
+        assert!(!check.passed());
         assert!(check
             .hint
             .as_deref()
@@ -511,7 +577,7 @@ mod tests {
             .iter()
             .find(|c| c.name == "network:isolated:tart")
             .unwrap();
-        assert!(check.ok);
+        assert!(check.passed());
         assert_eq!(check.detail, "unknown");
     }
 
@@ -554,7 +620,77 @@ mod tests {
             .iter()
             .find(|c| c.name == "profile-image:macos-minimal-arm64")
             .unwrap();
-        assert!(!profile_check.ok);
+        assert!(!profile_check.passed());
+        // Nobody has built it, so it is not a *failure*: see
+        // `an_unbuilt_profile_is_not_set_up_rather_than_broken`.
+        assert_eq!(profile_check.status, CheckStatus::NotSetUp);
+    }
+
+    /// A macOS-only host is not faulty for shipping Kali and Windows
+    /// templates it has no ISO for. Those rows are informational, so the
+    /// `✗` rows that remain mean something (spec.md §6's error UX).
+    #[tokio::test]
+    async fn an_unbuilt_profile_is_not_set_up_rather_than_broken() {
+        let mut ctx = fixture();
+        ctx.backends = BackendRegistry::new(vec![
+            Arc::new(FakeVmProvider::new()) as Arc<dyn VmProvider>,
+            Arc::new(FakeVmProvider::with_backend("utm")) as Arc<dyn VmProvider>,
+        ]);
+        ctx.profiles = ProfileStore::new(vec![utm_profile()], tmp_path());
+
+        let checks = doctor(&ctx).await;
+        let row = checks
+            .iter()
+            .find(|c| c.name == "profile-image:kali-x86_64")
+            .unwrap();
+        assert_eq!(row.status, CheckStatus::NotSetUp, "{row:?}");
+        assert!(!row.failed());
+        // Still says what to do about it -- informational is not silent.
+        assert!(
+            row.hint.as_deref().unwrap().contains("profile create"),
+            "{row:?}"
+        );
+        assert!(
+            !checks
+                .iter()
+                .any(|c| c.failed() && c.name.starts_with("profile-image:")),
+            "no profile row is a failure on an untouched host: {checks:?}"
+        );
+    }
+
+    /// ...but a build that *was* started and whose image is not there is a
+    /// real problem, and stays one. Nothing is hidden.
+    #[tokio::test]
+    async fn a_built_profile_whose_image_went_missing_is_a_failure() {
+        use crate::domain::{BuildPhase, BuildRecord, BuildSource, PublishedImage};
+
+        let mut ctx = fixture();
+        let profile = utm_profile();
+        ctx.backends = BackendRegistry::new(vec![
+            Arc::new(FakeVmProvider::new()) as Arc<dyn VmProvider>,
+            Arc::new(FakeVmProvider::with_backend("utm")) as Arc<dyn VmProvider>,
+        ]);
+        ctx.profiles = ProfileStore::new(vec![profile.clone()], tmp_path());
+
+        let mut record = BuildRecord::new(
+            &profile,
+            "utm",
+            BuildSource::Iso {
+                path: "/tmp/kali.iso".into(),
+                sha256: None,
+                verified_sha256: false,
+            },
+        );
+        record.image = Some(PublishedImage::new("uuid-1", "wg-build-kali"));
+        record.set_phase(BuildPhase::Ready);
+        ctx.builds.save(&record).await.unwrap();
+
+        let checks = doctor(&ctx).await;
+        let row = checks
+            .iter()
+            .find(|c| c.name == "profile-image:kali-x86_64")
+            .unwrap();
+        assert_eq!(row.status, CheckStatus::Fail, "{row:?}");
     }
 
     /// Two wired backends must not collapse into one `network:isolated`
@@ -576,20 +712,16 @@ mod tests {
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"network:isolated:tart"), "{names:?}");
         assert!(names.contains(&"network:isolated:utm"), "{names:?}");
-        assert!(
-            checks
-                .iter()
-                .find(|c| c.name == "network:isolated:tart")
-                .unwrap()
-                .ok
-        );
-        assert!(
-            !checks
-                .iter()
-                .find(|c| c.name == "network:isolated:utm")
-                .unwrap()
-                .ok
-        );
+        assert!(checks
+            .iter()
+            .find(|c| c.name == "network:isolated:tart")
+            .unwrap()
+            .passed());
+        assert!(!checks
+            .iter()
+            .find(|c| c.name == "network:isolated:utm")
+            .unwrap()
+            .passed());
         // Every row name is unique, so a reader can look one up by name.
         let mut sorted = names.clone();
         sorted.sort_unstable();
@@ -724,7 +856,7 @@ mod tests {
             .iter()
             .find(|c| c.name == "vm-backend:utm")
             .expect("the unwired backend is reported");
-        assert!(!backend_row.ok);
+        assert!(!backend_row.passed());
         assert!(backend_row.detail.contains("utm"), "{backend_row:?}");
     }
 
@@ -733,7 +865,7 @@ mod tests {
         let ctx = fixture();
         let checks = doctor_profile(&ctx, "nope").await;
         assert_eq!(checks.len(), 1);
-        assert!(!checks[0].ok);
+        assert!(!checks[0].passed());
         assert_eq!(checks[0].name, "profile:nope");
     }
 }

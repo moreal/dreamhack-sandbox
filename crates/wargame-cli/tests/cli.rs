@@ -408,6 +408,49 @@ fn launch_then_sessions_then_delete_round_trip() {
     );
 }
 
+/// A macOS-only host is not broken for shipping Kali and Windows templates
+/// it has no ISO for: those rows are informational, so the ✗ rows that are
+/// left mean something (spec.md §6's error UX).
+#[test]
+fn doctor_reports_unbuilt_templates_as_not_set_up_rather_than_failures() {
+    let home = tempfile::tempdir().unwrap();
+    let out = fixture_fake_cmd(home.path())
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("not set up yet (nothing is wrong)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("wargame profile create kali-arm64"),
+        "an informational row still says what to do:\n{stdout}"
+    );
+
+    let out = fixture_fake_cmd(home.path())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let checks: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    let rows = checks.as_array().unwrap();
+    let kali = rows
+        .iter()
+        .find(|c| c["name"] == "profile-image:kali-arm64")
+        .expect("a profile-image check");
+    assert_eq!(kali["status"], "not-set-up");
+    // The macOS profiles are pre-built by the fake backend, so nothing about
+    // a profile is a failure on this host.
+    assert!(
+        !rows
+            .iter()
+            .any(|c| c["status"] == "fail"
+                && c["name"].as_str().unwrap().starts_with("profile-image:")),
+        "{rows:#?}"
+    );
+}
+
 #[test]
 fn doctor_json_is_an_array_and_exits_zero_even_without_tart() {
     let home = tempfile::tempdir().unwrap();

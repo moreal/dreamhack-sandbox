@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::domain::compat::ResolvedBackend;
-use crate::domain::Profile;
+use crate::domain::{BuildPhase, Profile};
 use crate::error::{Result, WargameError};
 
 use super::AppContext;
@@ -174,6 +174,12 @@ pub struct ImageReadiness {
     /// Nothing is published for this profile, so `profile create` comes
     /// before `profile build`.
     pub needs_create: bool,
+    /// Nothing has been built for this profile in this home yet, and no
+    /// build failed trying: there is no build record at all, or one that
+    /// has not got past the manual OS install. It means "you have not set
+    /// this up", not "something is broken" -- which is how `doctor` tells
+    /// an untouched Kali template apart from a build that fell over.
+    pub never_built: bool,
 }
 
 /// A profile plus the state spec.md §3 FR-1 asks every profile view to show:
@@ -293,6 +299,13 @@ async fn image_readiness(
     let status = super::profile_build::image_status(ctx, profile)
         .await
         .map_err(|e| (e.to_string(), e.hint()))?;
+    // "Nothing has been started here": no record at all, or one that is
+    // still waiting for the user to finish the OS install by hand -- which
+    // the domain calls a wait, not a failure.
+    let never_built = matches!(
+        status.phase,
+        None | Some(BuildPhase::Created) | Some(BuildPhase::AwaitingInstall)
+    );
     let Some(image) = &status.image else {
         return Ok(ImageReadiness {
             state: status
@@ -302,6 +315,7 @@ async fn image_readiness(
             detail: status.detail,
             ready: false,
             needs_create: true,
+            never_built,
         });
     };
     // A name is not an image: ask the backend whether it is actually there.
@@ -323,6 +337,10 @@ async fn image_readiness(
         },
         ready: exists && !status.rebuild_needed,
         needs_create: false,
+        // A Tart profile always has an image *name*, so "not built" here
+        // can equally mean "never built" or "built and then deleted"; the
+        // build record is what tells them apart.
+        never_built: !exists && never_built,
     })
 }
 

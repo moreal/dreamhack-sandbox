@@ -5,7 +5,7 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, Table};
 use serde::Serialize;
 use time::OffsetDateTime;
 
-use wargame_core::app::{Check, ProfileOverview};
+use wargame_core::app::{Check, CheckStatus, ProfileOverview};
 use wargame_core::domain::{Challenge, KeepPolicy, Profile, Session};
 use wargame_core::ports::SearchPage;
 
@@ -242,7 +242,12 @@ pub fn next_step_for(session: &Session) -> String {
 #[derive(Serialize)]
 struct CheckJson<'a> {
     name: &'a str,
+    /// Whether the check is satisfied. A `"not-set-up"` row is `false`
+    /// here too -- it is not satisfied -- but it is not a problem either;
+    /// `status` is what tells the two apart.
     ok: bool,
+    /// `"pass"`, `"fail"` or `"not-set-up"`.
+    status: &'a str,
     detail: &'a str,
     hint: Option<&'a str>,
 }
@@ -253,7 +258,8 @@ pub fn print_checks(checks: &[Check], json: bool) {
             .iter()
             .map(|c| CheckJson {
                 name: &c.name,
-                ok: c.ok,
+                ok: c.passed(),
+                status: c.status.as_str(),
                 detail: &c.detail,
                 hint: c.hint.as_deref(),
             })
@@ -265,19 +271,44 @@ pub fn print_checks(checks: &[Check], json: bool) {
     table.set_header(vec!["", "check", "detail"]);
     for c in checks {
         table.add_row(vec![
-            if c.ok { "✓" } else { "✗" }.to_string(),
+            match c.status {
+                CheckStatus::Pass => "✓",
+                CheckStatus::Fail => "✗",
+                // Deliberately not `✗`: nothing is wrong with a profile you
+                // have not set up, and a `✗` you are meant to ignore makes
+                // every other `✗` easier to ignore too (spec.md §6).
+                CheckStatus::NotSetUp => "·",
+            }
+            .to_string(),
             c.name.clone(),
             c.detail.clone(),
         ]);
     }
     println!("{table}");
-    let failing: Vec<&Check> = checks.iter().filter(|c| !c.ok).collect();
+    let failing: Vec<&Check> = checks.iter().filter(|c| c.failed()).collect();
+    let not_set_up: Vec<&Check> = checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::NotSetUp)
+        .collect();
+    // `not-set-up` rows are not checks that could pass or fail, so they are
+    // outside the count either way.
+    let decided = checks.len() - not_set_up.len();
     if failing.is_empty() {
-        println!("All {} checks passed.", checks.len());
+        println!("All {decided} checks passed.");
+    } else {
+        println!("{} of {decided} checks failed:", failing.len());
+        for c in failing {
+            match &c.hint {
+                Some(hint) => println!("  {}: {hint}", c.name),
+                None => println!("  {}: {}", c.name, c.detail),
+            }
+        }
+    }
+    if not_set_up.is_empty() {
         return;
     }
-    println!("{} of {} checks failed:", failing.len(), checks.len());
-    for c in failing {
+    println!("{} not set up yet (nothing is wrong):", not_set_up.len());
+    for c in not_set_up {
         match &c.hint {
             Some(hint) => println!("  {}: {hint}", c.name),
             None => println!("  {}: {}", c.name, c.detail),
