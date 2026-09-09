@@ -126,34 +126,49 @@ that install produced.
 $ wargame profile init kali-arm64 --name kali-custom     # your own copy, with its own scripts/
 $ wargame profile create kali-custom --iso ~/isos/kali-arm64-installer.iso
 $ wargame profile console kali-custom                    # install the OS in the window that opens
+#   ...when the installer finishes, shut the guest down from inside it
+$ wargame profile eject kali-custom                      # take the disc out BEFORE it boots again
+$ wargame profile console kali-custom                    # boot the installed system; set up SSH,
+#                                                          the guest agent and passwordless sudo
 $ wargame profile build kali-custom                      # provision + verify + publish the image
 $ wargame launch dreamhack:15 --profile kali-custom
 ```
+
+The eject step is not optional housekeeping: **the VM boots the disc before
+its own disk**, so a reboot with the installer still in it lands back in the
+installer — and an unattended disc simply starts the install over on the disk
+it has just written. Shut the guest down at the end of the install rather than
+taking the reboot the installer offers, run `profile eject`, and only then
+boot the installed system. (`profile build` ejects the disc too, before it
+boots the guest, so a skipped step is recoverable rather than fatal.)
 
 `profile init` copies a template under your own name and gives it its own
 `profiles/scripts/<name>/` directory, so your edits are never overwritten
 when a new binary re-seeds the built-in scripts. `profile create` makes one
 long-lived *installation VM* (a blank disk plus the installer ISO, or
 `--from-vm <utm-uuid>` to clone an already-installed VM, which is only ever
-copied) and prints its UUID plus what to prepare in the guest: your user
-account, an SSH server, the QEMU guest agent, this host's public key in
-`~/.ssh/authorized_keys`, and the elevated access the build needs — a
-`NOPASSWD` sudoers entry on Kali, membership of Administrators on Windows,
-since a build installing packages over a non-interactive SSH command cannot
-answer a password prompt. Re-running it with the same source re-prints that
-guidance and creates nothing; pointing it at a *different* source is an
-error rather than a silent second VM. `--sha256 <hex>` is checked against
-the ISO before anything is created.
+copied) and prints its UUID plus the whole checklist above: the shutdown and
+eject, then your user account, an SSH server, the QEMU guest agent, this
+host's public key in `~/.ssh/authorized_keys`, and the elevated access the
+build needs — a `NOPASSWD` sudoers entry on Kali, membership of
+Administrators on Windows, since a build installing packages over a
+non-interactive SSH command cannot answer a password prompt. Re-running it
+with the same source re-prints that guidance and creates nothing; pointing it
+at a *different* source is an error rather than a silent second VM.
+`--sha256 <hex>` is checked against the ISO before anything is created.
 
 `profile build` then boots that VM on NAT, waits for the guest agent and
 SSH (30 minutes by default for an emulated x86_64 guest —
 `[vm.utm].boot_timeout_secs`), runs the profile's scripts and `tools.verify`
 commands, shuts the guest down cleanly, and publishes the image as a stopped
 copy. Only that last step marks the profile ready: a guest that is still
-being installed stays in `awaiting-install`, and a failed build keeps the
-previous image launchable. The installation VM is never deleted — it is what
-the next rebuild starts from — and neither it nor the published image is
-touched by `wargame prune`.
+being installed stays in `awaiting-install`, one whose disc has been ejected
+but which has never been built reads `media ejected (not built)`, and a
+failed build keeps the previous image launchable. (Ejecting is all that
+readiness word claims — wargame checks that the media is out, not that an OS
+boots.) The installation VM is never deleted — it is what the next rebuild
+starts from — and neither it nor the published image is touched by
+`wargame prune`.
 
 Windows 11 additionally needs TPM 2.0 and Secure Boot, which UTM 4.7.5
 cannot set from a script; `profile create` prints the one-time manual step

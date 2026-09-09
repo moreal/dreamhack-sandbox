@@ -889,6 +889,97 @@ async fn the_guest_setup_steps_say_that_static_is_the_right_answer_on_kali() {
     assert!(guidance.contains("is-active"), "{guidance}");
 }
 
+/// **A2-D2.** The guidance used to go straight from "authorize the key" to
+/// `profile build`, so nothing told the user the machine still boots the
+/// disc. Both real Kali guests rebooted into the still-attached installer,
+/// and the x86_64 one -- whose disc was unattended -- started re-running the
+/// install over the disk it had just written
+/// (task-7-phase-a2-report.md §4 A2-D2).
+///
+/// The order is the fix, so the order is what is pinned: shut the guest
+/// down, eject, *then* prepare the guest, then build.
+#[tokio::test]
+async fn create_says_to_shut_the_guest_down_and_eject_before_it_boots_again() {
+    let f = fixture();
+    let outcome = profile_build::create(&f.ctx, "kali-arm64", iso_source(&f.iso))
+        .await
+        .unwrap();
+    let guidance = outcome.guidance.join("\n");
+
+    let at = |needle: &str| {
+        guidance
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is missing from:\n{guidance}"))
+    };
+    let shutdown = at("shut the guest down");
+    let eject = at("wargame profile eject kali-arm64");
+    let sudoers = at("/etc/sudoers.d/wargame");
+    let authorized = at("authorized_keys");
+    let build = at("wargame profile build kali-arm64");
+    assert!(
+        shutdown < eject && eject < sudoers && sudoers < authorized && authorized < build,
+        "the steps must read: shut down, eject, prepare the guest, build:\n{guidance}"
+    );
+
+    // And it has to say *why*, in one line: an unattended disc does not just
+    // waste a boot, it reinstalls over the finished system.
+    assert!(
+        guidance.contains("boots the disc before its own disk"),
+        "{guidance}"
+    );
+    assert!(guidance.contains("starts the install over"), "{guidance}");
+    // Skipping the eject is recoverable, and saying so keeps the step from
+    // reading as a trap.
+    assert!(
+        guidance.contains("The build takes the disc out too"),
+        "{guidance}"
+    );
+    // The numbering is generated, so it must still come out contiguous.
+    for (n, step) in ["1. ", "2. ", "3. ", "4. ", "5. ", "6. ", "7. ", "8. "]
+        .iter()
+        .enumerate()
+    {
+        assert!(
+            outcome.guidance.iter().any(|l| l.starts_with(step)),
+            "step {} is missing:\n{guidance}",
+            n + 1
+        );
+    }
+}
+
+/// A `--from-vm` clone has no disc of ours in it, so the two steps about
+/// taking one out are not printed -- and the numbering closes up rather than
+/// skipping 3 and 4.
+#[tokio::test]
+async fn create_from_an_adopted_vm_says_nothing_about_ejecting_a_disc() {
+    let f = fixture();
+    let outcome = profile_build::create(
+        &f.ctx,
+        "kali-arm64",
+        CreateSource::FromVm {
+            uuid: "C2222222-3333-4444-5555-666666666666".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let guidance = outcome.guidance.join("\n");
+
+    assert!(!guidance.contains("profile eject"), "{guidance}");
+    assert!(!guidance.contains("installer disc"), "{guidance}");
+    assert!(
+        guidance.contains("The clone already has an OS"),
+        "{guidance}"
+    );
+    assert!(
+        outcome.guidance.iter().any(|l| l.starts_with("6. ")),
+        "{guidance}"
+    );
+    assert!(
+        !outcome.guidance.iter().any(|l| l.starts_with("7. ")),
+        "two steps fewer than the ISO flow, with no gap:\n{guidance}"
+    );
+}
+
 /// Two installs at once on one host starved the emulated guest (phase A's
 /// timings): the defaults are unchanged, and the user is told why they may
 /// want to change them.

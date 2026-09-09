@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::domain::build::InstallerMedia;
 use crate::domain::compat::ResolvedBackend;
 use crate::domain::{BuildPhase, Profile};
 use crate::error::{Result, WargameError};
@@ -189,6 +190,13 @@ pub struct ImageReadiness {
     /// The installation VM this profile already owns, `<name> (<id>)`, when
     /// `profile create` has run and there is still an OS to install in it.
     pub installer_vm: Option<String>,
+    /// The installer disc has been taken out of that VM, which only happens
+    /// after an OS install: `profile eject` (or a build's own eject step)
+    /// wrote it down. It is *not* a claim that an OS is installed and
+    /// working -- ejecting proves only that the media is out -- but it is
+    /// enough to stop sending the user back to the console to finish an
+    /// install they already finished (task-7-phase-a2-report.md §4 A2-D1).
+    pub installer_ejected: bool,
     /// Nothing has been built for this profile in this home yet, and no
     /// build failed trying: there is no build record at all, or one that
     /// has not got past the manual OS install. It means "you have not set
@@ -332,13 +340,23 @@ async fn image_readiness(
         .installer_vm
         .as_ref()
         .map(|vm| format!("{} ({})", vm.name, vm.id));
+    // Only ever true after `profile eject` (or a build) took the disc out,
+    // which nobody does before the OS is in.
+    let installer_ejected = status.installer_media == InstallerMedia::Detached;
     let Some(image) = &status.image else {
         return Ok(ImageReadiness {
-            state: status
-                .phase
-                .as_ref()
-                .map(|p| p.as_str().to_string())
-                .unwrap_or_else(|| "not created".to_string()),
+            state: match &status.phase {
+                // "awaiting-install" is only honest while the disc is still
+                // in. Once it is out the wait is on `profile build`, and the
+                // word says what is actually known: the media is ejected and
+                // nothing has been built (A2-D1). It deliberately stops short
+                // of "installed" -- ejecting is not a check that an OS boots.
+                Some(BuildPhase::AwaitingInstall) if installer_ejected => {
+                    "media ejected (not built)".to_string()
+                }
+                Some(phase) => phase.as_str().to_string(),
+                None => "not created".to_string(),
+            },
             detail: match &installer_vm {
                 Some(vm) => format!("{} -- installation VM {vm}", status.detail),
                 None => status.detail,
@@ -348,6 +366,7 @@ async fn image_readiness(
             // refuses one that already has an installation VM.
             needs_create: status.phase.is_none(),
             installer_vm,
+            installer_ejected,
             never_built,
         });
     };
@@ -405,6 +424,7 @@ async fn image_readiness(
         ready: exists && !status.rebuild_needed,
         needs_create: false,
         installer_vm,
+        installer_ejected,
         // A Tart profile always has an image *name*, so "not built" here
         // can equally mean "never built" or "built and then deleted"; the
         // build record is what tells them apart.

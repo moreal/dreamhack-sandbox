@@ -311,6 +311,47 @@ With that in place the ptty is a fully bidirectional console: `printf 'c' > $SER
 the whole Debian installer is drivable over it. §8's read-only `timeout 25 cat "$SER"` reproduction
 is unaffected — the trap only bites when something writes to the device as well.
 
+### Trap: the stock Kali **amd64** ISO's GRUB loses serial **input** as well as output
+
+**Verified in task 7 phase A2** (`.superpowers/sdd/PLAN/task-7-phase-a2-report.md` §2). The arm64
+ISO's GRUB talks to the serial ptty and can be driven from it (§7, and the boot line quoted in that
+report). The amd64 ISO's cannot, and the reason is in its own `/boot/grub/grub.cfg`, which opens
+with `loadfont` / `insmod gfxterm` / `terminal_output gfxterm` — that takes GRUB off the serial
+line.
+
+Phase A recorded only the visible half: **output** disappears, so the menu never reaches the ptty.
+Phase A2 tested the other half deliberately. Two blind writes — `c`, then
+`terminal_output console` — at t+175 s and t+319 s after power-on, with QEMU at 195 % CPU so GRUB
+was demonstrably alive, produced **0 bytes** of response each time. So **input is lost too**: there
+is no "type blind and recover the console" fallback.
+
+- **Verified:** with no other input channel, the stock amd64 installer **cannot be agent-driven at
+  all.** The other two channels are gone as well — UTM's `input scan code` / `input keystroke` are
+  exit-0 no-ops on this host (`task-7-phase-a-report.md` D6; the ptty echo trap above is what made
+  them look like they worked in task 1), and `screencapture` needs a Screen Recording grant an agent
+  does not have. A human at the UTM window is unaffected; this is a statement about automation only.
+- **Verified:** the working route is a **modified ISO**, not a convenience. Phase A2 built a scratch
+  copy whose only change was a `grub.cfg` without the `gfxterm` preamble, `set timeout=5` and one
+  unattended entry:
+
+  ```bash
+  nix shell nixpkgs#xorriso -c xorriso \
+    -indev  .../kali-linux-2026.2-installer-amd64.iso \
+    -outdev .../kali-t7-amd64.iso \
+    -boot_image any replay -overwrite on \
+    -map grub-amd64.cfg /boot/grub/grub.cfg -commit -eject all
+  ```
+
+  The pristine ISO was never modified (its SHA-256 was re-verified unchanged afterwards), and the
+  scratch copy was removed from the VM by `wargame profile eject`. Editing the boot line by hand at
+  the graphical GRUB prompt is the same fix without the rebuild.
+- **Unverified:** whether a serial-friendly amd64 ISO exists upstream, and whether UEFI firmware
+  settings can force GRUB back onto the serial console before `grub.cfg` runs. Neither was tried.
+- **Consequence:** any future scripted install on a **non-arm64** guest — a Windows one included —
+  has to plan for "the boot loader may be unreachable over the serial line in both directions", and
+  budget either a prepared boot medium or a human at the console. Do not design a flow that assumes
+  blind keystrokes land.
+
 ### Two more things only an installed guest could show
 
 - **Verified:** `utmctl ip-address <id>` on an installed guest answers with **three lines** — IPv4,
@@ -976,6 +1017,11 @@ GNU GRUB  version 2.14-2+kali1
 The `no suitable video mode` lines are expected: this VM had no display device. **AC-02's
 "hypervisor off" half is satisfied at the configuration and command-line level**; the guest-side
 `/proc/cpuinfo` check still needs an installed OS.
+
+Note that this is as far as the serial line gets on amd64: the menu above is the *firmware's*, and
+the ISO's own GRUB then switches to `gfxterm` and stops both reading from and writing to the ptty.
+See §3's trap on the stock amd64 ISO — an install here needs a modified ISO or a human at the
+window.
 
 ### What was deliberately not done
 

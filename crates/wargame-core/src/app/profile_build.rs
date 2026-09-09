@@ -593,52 +593,86 @@ fn create_guidance(
                 .to_string(),
         );
     }
-    lines.push(format!(
-        "1. Open the console:  wargame profile console {}",
+    let mut steps = Checklist::default();
+    steps.step(format!(
+        "Open the console:  wargame profile console {}",
         profile.name
     ));
-    lines.push(match &record.source {
-        BuildSource::UtmVm { .. } => {
-            "2. The clone already has an OS. Log in through the console and make sure the guest is ready (below).".to_string()
-        }
-        _ => "2. Install the OS in that window. Create the account below; the installer's user must match the profile.".to_string(),
+    // A `--from-vm` clone has no installer disc of ours in it, so the two
+    // steps that take one out are not printed for it at all.
+    let installs_from_disc = !matches!(record.source, BuildSource::UtmVm { .. });
+    if installs_from_disc {
+        steps.step("Install the OS in that window. Create the account below; the installer's user must match the profile.");
+    } else {
+        steps.step("The clone already has an OS. Log in through the console and make sure the guest is ready (below).");
+    }
+    // The order of these two is the whole point of the finding: the disc has
+    // to come out *between* the install finishing and the machine booting
+    // again, which means the guest has to be shut down rather than rebooted
+    // (task-7-phase-a2-report.md §4 A2-D2).
+    let eject_step = installs_from_disc.then(|| {
+        steps.step(
+            "When the installer says it is finished, shut the guest down from inside it -- choose \"shut down\", not the reboot it offers.",
+        );
+        let step = steps.step(format!(
+            "Take the installer disc out before the machine boots again:  wargame profile eject {}",
+            profile.name
+        ));
+        steps.note(
+            "This VM boots the disc before its own disk, so a reboot with the disc still in lands back in the installer -- and an unattended disc starts the install over on the disk it has just written.",
+        );
+        step
     });
-    lines.push(format!(
-        "3. In the guest, prepare: user {:?}, an SSH server on port 22, and the QEMU guest agent (UTM reads the guest's address from it -- without it the build cannot find the VM).",
-        profile.guest.user
-    ));
+    steps.step(if installs_from_disc {
+        format!(
+            "Boot the installed system (wargame profile console {}) and prepare it: user {:?}, an SSH server on port 22, and the QEMU guest agent (UTM reads the guest's address from it -- without it the build cannot find the VM).",
+            profile.name, profile.guest.user
+        )
+    } else {
+        format!(
+            "In the guest, prepare: user {:?}, an SSH server on port 22, and the QEMU guest agent (UTM reads the guest's address from it -- without it the build cannot find the VM).",
+            profile.guest.user
+        )
+    });
     if profile.guest.os == GuestOs::Windows {
-        lines.push(
-            "   On Windows that is OpenSSH Server (Settings > Optional features) plus PowerShell as the SSH shell, and the UTM guest tools for the agent."
-                .to_string(),
+        steps.note(
+            "On Windows that is OpenSSH Server (Settings > Optional features) plus PowerShell as the SSH shell, and the UTM guest tools for the agent.",
         );
     } else {
-        lines.push(
-            "   On Debian/Kali: `sudo apt install openssh-server qemu-guest-agent && sudo systemctl enable --now ssh qemu-guest-agent`."
-                .to_string(),
+        steps.note(
+            "On Debian/Kali: `sudo apt install openssh-server qemu-guest-agent && sudo systemctl enable --now ssh qemu-guest-agent`.",
         );
         // Kali's guest-agent unit has no [Install] section (it is activated
         // by udev), so the obvious check reports something that looks like
         // a failure and is not (task-7-phase-a-report.md §5 D8).
-        lines.push(
-            "   To check it afterwards use `systemctl is-active qemu-guest-agent`, not `is-enabled`: on Kali that unit is activated by udev and answers `static`, which is correct."
-                .to_string(),
+        steps.note(
+            "To check it afterwards use `systemctl is-active qemu-guest-agent`, not `is-enabled`: on Kali that unit is activated by udev and answers `static`, which is correct.",
         );
     }
     // The baseline provisioning scripts need more than an account and a key,
     // and refuse without it. Asking here costs a paste; finding out at the
     // first `profile build` costs an install cycle (spec.md §6's "OS 설치
     // 미완료: 설치·SSH 준비·build 재개 명령 안내").
-    lines.extend(privilege_guidance(profile));
-    lines.push(format!(
-        "5. Authorize this host's key: append {} to ~{}/.ssh/authorized_keys in the guest.",
+    let (privilege, privilege_notes) = privilege_guidance(profile);
+    steps.step(privilege);
+    for note in privilege_notes {
+        steps.note(note);
+    }
+    steps.step(format!(
+        "Authorize this host's key: append {} to ~{}/.ssh/authorized_keys in the guest.",
         ctx.dirs.keys_dir().join("id_ed25519.pub").display(),
         profile.guest.user,
     ));
-    lines.push(format!(
-        "6. Then build the reusable image:  wargame profile build {}",
+    steps.step(format!(
+        "Then build the reusable image:  wargame profile build {}",
         profile.name
     ));
+    if let Some(step) = eject_step {
+        steps.note(format!(
+            "The build takes the disc out too, before it boots the guest, so it still works if you skipped step {step}."
+        ));
+    }
+    lines.extend(steps.lines);
     // The defaults are deliberately left alone -- lowering them silently
     // would change what every existing profile builds -- but two installs
     // at once on one host is what made phase A's emulated guest crawl, and
@@ -650,27 +684,58 @@ fn create_guidance(
     lines
 }
 
-/// Step 4 of [`create_guidance`]: the elevated access `profile build` needs
-/// in the guest, phrased for the guest's OS with the profile's own user
-/// already substituted.
+/// A numbered checklist whose numbers are counted rather than typed into the
+/// strings, so a step only some sources need -- taking out an installer disc
+/// a `--from-vm` clone never had -- can be left out without leaving a hole in
+/// the numbering or renumbering everything after it by hand.
+#[derive(Default)]
+struct Checklist {
+    lines: Vec<String>,
+    step: usize,
+}
+
+impl Checklist {
+    /// Adds `1.`, `2.`, … and answers the number it used, so a later step can
+    /// refer back to this one.
+    fn step(&mut self, text: impl std::fmt::Display) -> usize {
+        self.step += 1;
+        self.lines.push(format!("{}. {text}", self.step));
+        self.step
+    }
+
+    /// A continuation line under the step before it.
+    fn note(&mut self, text: impl std::fmt::Display) {
+        self.lines.push(format!("   {text}"));
+    }
+}
+
+/// The privilege step of [`create_guidance`] -- the elevated access `profile
+/// build` needs in the guest, phrased for the guest's OS with the profile's
+/// own user already substituted -- as `(step, continuation lines)` so the
+/// caller owns the numbering.
 ///
 /// A POSIX build runs `apt-get` through `sudo -n`, which cannot answer a
 /// password prompt over a non-interactive SSH command; a Windows build
 /// installs a Windows capability and writes the machine PATH, both of which
 /// need the elevated token OpenSSH grants a local administrator.
-fn privilege_guidance(profile: &Profile) -> Vec<String> {
+fn privilege_guidance(profile: &Profile) -> (String, Vec<String>) {
     let user = &profile.guest.user;
     match profile.guest.os {
-        GuestOs::Windows => vec![format!(
-            "4. Make {user:?} a local administrator (Computer Management > Local Users and Groups > Groups > Administrators). The build installs a Windows capability and edits the machine PATH, so an unelevated account is refused."
-        )],
-        _ => vec![
+        GuestOs::Windows => (
             format!(
-                "4. Give {user:?} passwordless sudo -- the build installs packages over a non-interactive SSH command, which cannot answer a password prompt. In the guest:"
+                "Make {user:?} a local administrator (Computer Management > Local Users and Groups > Groups > Administrators). The build installs a Windows capability and edits the machine PATH, so an unelevated account is refused."
             ),
-            format!("     echo '{user} ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/wargame"),
-            "     sudo chmod 0440 /etc/sudoers.d/wargame".to_string(),
-        ],
+            Vec::new(),
+        ),
+        _ => (
+            format!(
+                "Give {user:?} passwordless sudo -- the build installs packages over a non-interactive SSH command, which cannot answer a password prompt. In the guest:"
+            ),
+            vec![
+                format!("  echo '{user} ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/wargame"),
+                "  sudo chmod 0440 /etc/sudoers.d/wargame".to_string(),
+            ],
+        ),
     }
 }
 
@@ -723,8 +788,12 @@ fn console_guidance(profile: &str, record: &BuildRecord) -> Vec<String> {
     )];
     if record.installer_media != InstallerMedia::Detached {
         lines.push(format!(
-            "Once the OS is installed, take the installer disc out -- otherwise the machine boots the installer again, not the system you just installed:  wargame profile eject {profile}"
+            "Once the installer is finished, shut the guest down from inside it and take the installer disc out before it boots again:  wargame profile eject {profile}"
         ));
+        lines.push(
+            "   This VM boots the disc before its own disk, so a reboot with the disc still in lands back in the installer -- and an unattended disc starts the install over on the disk it has just written."
+                .to_string(),
+        );
     }
     lines.push(format!(
         "When the guest is ready (SSH, guest agent, the host key), build the image:  wargame profile build {profile}"
@@ -1028,6 +1097,14 @@ pub struct ProfileImageStatus {
     /// command is `profile create` or `profile console`/`profile build`
     /// (task-7-b2b-report.md D9).
     pub installer_vm: Option<VmRef>,
+    /// Whether that VM still has its installer disc in it.
+    ///
+    /// [`InstallerMedia::Detached`] is the only signal the app has that the
+    /// manual OS install is over: `profile eject` is run after an install,
+    /// never before. It proves the media is out and **not** that an OS was
+    /// verified installed, so everything built on it says "ejected", not
+    /// "installed" (task-7-phase-a2-report.md §4 A2-D1).
+    pub installer_media: InstallerMedia,
     /// One line for `doctor`/`profiles`.
     pub detail: String,
 }
@@ -1059,8 +1136,16 @@ pub async fn image_status(ctx: &AppContext, profile: &Profile) -> Result<Profile
             ),
             None => (
                 None,
-                match record.as_ref().map(|r| &r.phase) {
-                    Some(phase) => format!("not published yet ({phase})"),
+                match record.as_ref().map(|r| (&r.phase, r.installer_media)) {
+                    // The disc is out, so the wait is no longer on the user's
+                    // hands in a console window -- it is on a build. Saying
+                    // "awaiting-install" here is what sent a finished install
+                    // back to `profile console` (A2-D1).
+                    Some((BuildPhase::AwaitingInstall, InstallerMedia::Detached)) => {
+                        "not published yet (the installer media has been ejected, so the guest boots its own disk)"
+                            .to_string()
+                    }
+                    Some((phase, _)) => format!("not published yet ({phase})"),
                     None => "no build record: `wargame profile create` has not run".to_string(),
                 },
             ),
@@ -1071,6 +1156,10 @@ pub async fn image_status(ctx: &AppContext, profile: &Profile) -> Result<Profile
         backend: execution.backend,
         image,
         installer_vm: record.as_ref().and_then(|r| r.installer_vm.clone()),
+        installer_media: record
+            .as_ref()
+            .map(|r| r.installer_media)
+            .unwrap_or_default(),
         phase: record.map(|r| r.phase),
         rebuild_needed,
         detail: if rebuild_needed {

@@ -487,6 +487,13 @@ async fn profile_image_check(ctx: &AppContext, profile: &Profile) -> Check {
             image.detail
         ),
         (!image.ready).then(|| match (&image.installer_vm, image.needs_create) {
+            // A2-D1: the installer disc is out, which only happens *after*
+            // an install. Sending the user back to the console to "finish
+            // installing the OS" would be telling them to redo work that is
+            // done -- and it was the first line the next phase would read.
+            (Some(_), _) if image.never_built && image.installer_ejected => {
+                format!("wargame profile build {name}")
+            }
             // D9: this profile *has* its installation VM and the OS in it is
             // not finished. `profile create` would refuse with a source
             // conflict, so it is the one command not to suggest.
@@ -842,6 +849,69 @@ mod tests {
             "{hint}"
         );
         assert!(hint.contains("wargame profile build kali-x86_64"), "{hint}");
+    }
+
+    /// **A2-D1.** `profile eject` is only ever run after an OS install, so a
+    /// record whose installer media is `Detached` must stop saying "finish
+    /// installing the OS" -- the second real Kali install ended with two
+    /// installed, SSH-verified guests that both read `awaiting-install`
+    /// (task-7-phase-a2-report.md §4 A2-D1). Both states are pinned here,
+    /// and neither word claims the OS was verified: ejecting proves the
+    /// media is out, nothing more.
+    #[tokio::test]
+    async fn an_ejected_installer_disc_reads_as_ejected_and_points_at_the_build() {
+        use crate::domain::build::InstallerMedia;
+        use crate::domain::{BuildPhase, BuildRecord, BuildSource, VmRef};
+
+        let profile = utm_profile();
+        let mut ctx = fixture_with_vm(Arc::new(FakeVmProvider::with_backend("utm")));
+        ctx.profiles = ProfileStore::new(vec![profile.clone()], tmp_path());
+
+        let mut record = BuildRecord::new(
+            &profile,
+            "utm",
+            BuildSource::Iso {
+                path: "/tmp/kali.iso".into(),
+                sha256: None,
+                verified_sha256: false,
+            },
+        );
+        record.installer_vm = Some(VmRef {
+            backend: "utm".to_string(),
+            id: "6F78EF1A-5B93-4AFF-AAA1-775BE6C666BC".to_string(),
+            name: "wg-build-kali-x86_64".to_string(),
+        });
+        record.installer_media = InstallerMedia::Attached;
+        record.set_phase(BuildPhase::AwaitingInstall);
+        ctx.builds.save(&record).await.unwrap();
+
+        // 1. The disc is still in: the OS install really may be unfinished.
+        let overview = crate::app::profiles::overview(&ctx, &profile).await;
+        assert_eq!(overview.image_state(), Some("awaiting-install"));
+
+        // 2. `profile eject` took it out.
+        record.installer_media = InstallerMedia::Detached;
+        ctx.builds.save(&record).await.unwrap();
+
+        let overview = crate::app::profiles::overview(&ctx, &profile).await;
+        assert_eq!(overview.image_state(), Some("media ejected (not built)"));
+        let detail = &overview.image().expect("an image state").detail;
+        assert!(detail.contains("ejected"), "{detail}");
+        assert!(
+            !detail.contains("awaiting-install"),
+            "the phase word must not leak back in: {detail}"
+        );
+
+        let row = doctor_profile(&ctx, "kali-x86_64")
+            .await
+            .into_iter()
+            .find(|c| c.name == "profile-image:kali-x86_64")
+            .expect("an image row");
+        // Nothing is broken -- there is simply no image yet.
+        assert_eq!(row.status, CheckStatus::NotSetUp, "{row:?}");
+        let hint = row.hint.clone().unwrap_or_default();
+        assert_eq!(hint, "wargame profile build kali-x86_64", "{row:?}");
+        assert!(!hint.contains("finish installing"), "{hint}");
     }
 
     /// ...but a build that *was* started and whose image is not there is a
